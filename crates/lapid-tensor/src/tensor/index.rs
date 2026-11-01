@@ -5,7 +5,8 @@ use crate::bail;
 use crate::dtype::DType;
 use crate::error::Result;
 use crate::op::{BinaryOp, Op};
-use crate::tensor::Tensor;
+use crate::tensor::{Shape, Tensor};
+use smallvec::smallvec;
 use crate::tensor::check;
 
 impl Tensor {
@@ -49,7 +50,7 @@ impl Tensor {
         Ok(Tensor::from_op(
             Op::WriteSlice { axis, start },
             vec![self.clone(), src.clone()],
-            self.shape().to_vec(),
+            self.shape(),
             self.dtype(),
         ))
     }
@@ -75,7 +76,7 @@ impl Tensor {
         Ok(Tensor::from_op(
             Op::GatherAxis { axis },
             vec![self.clone(), indices.clone()],
-            indices.shape().to_vec(),
+            indices.shape(),
             self.dtype(),
         ))
     }
@@ -89,9 +90,9 @@ impl Tensor {
         if k == 0 || k > n {
             bail!("invalid_argument", "topk: k = {k} must be in 1..={n} (axis {axis} of {:?})", self.shape());
         }
-        let mut shape = self.shape().to_vec();
+        let mut shape = Shape::from_slice(self.shape());
         shape[axis] = k;
-        Ok(Tensor::from_op(Op::TopK { k, axis }, vec![self.clone()], shape, DType::I32))
+        Ok(Tensor::from_op(Op::TopK { k, axis }, smallvec![self.clone()], shape, DType::I32))
     }
 
     /// `(values, indices)` of the `k` largest values along `axis` (descending; values have

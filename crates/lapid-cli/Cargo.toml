@@ -29,6 +29,8 @@ lapid-cuda = { workspace = true, optional = true }
 half.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 lapid-metal = { workspace = true, optional = true }

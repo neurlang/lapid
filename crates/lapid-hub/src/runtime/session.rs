@@ -17,6 +17,12 @@ pub trait LmState: Send {
     fn offset(&self) -> usize;
     /// Tensors staged by the last graph build, evaluated with the step's outputs.
     fn staged(&self) -> Vec<&Tensor>;
+    /// Move the staged tensors out (same order as `staged`), leaving whatever `commit` /
+    /// `discard` still need, so the step graph can be freed before it runs. The default
+    /// clones them (the graph then lives until commit).
+    fn take_staged(&mut self) -> Vec<Tensor> {
+        self.staged().into_iter().cloned().collect()
+    }
     /// Store the realized staged tensors (same order) after `n_tokens` were fed.
     fn commit(&mut self, realized: Vec<Tensor>, n_tokens: usize) -> Result<()>;
     /// Drop staged tensors (committed state unchanged).
@@ -73,6 +79,15 @@ impl LmState for LmCache {
     fn staged(&self) -> Vec<&Tensor> {
         let mut v = self.kv.staged();
         v.extend(self.staged_slots.iter().map(|(_, t)| t));
+        v
+    }
+
+    fn take_staged(&mut self) -> Vec<Tensor> {
+        let mut v = self.kv.take_staged();
+        for (_, t) in &mut self.staged_slots {
+            let ph = Tensor::zeros(t.shape(), t.dtype());
+            v.push(std::mem::replace(t, ph));
+        }
         v
     }
 

@@ -22,7 +22,51 @@ const ROW_BLOCK: usize = 64;
 
 /// Quantize one f32 row to int8 per 32-element group. `x.len() == q.len() == 32 * s.len()`.
 pub(crate) fn quantize_row(x: &[f32], q: &mut [i8], s: &mut [f32]) {
-    for ((xg, qg), sg) in x.as_chunks::<GROUP>().0.iter().zip(q.as_chunks_mut::<GROUP>().0).zip(s.iter_mut()) {
+    quantize_row_sums(x, q, s, None);
+}
+
+/// `quantize_row`, plus `bs[g] = s[g] * sum(q[g])` (the K-quant min terms) when given.
+/// The NEON path rounds exactly like the scalar one (to nearest, ties to even).
+pub(crate) fn quantize_row_sums(x: &[f32], q: &mut [i8], s: &mut [f32], bs: Option<&mut [f32]>) {
+    let ng = s.len();
+    assert!(x.len() >= ng * GROUP && q.len() >= ng * GROUP && bs.as_ref().is_none_or(|b| b.len() >= ng));
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: lengths asserted above; NEON is part of the aarch64 baseline.
+    unsafe {
+        use std::arch::aarch64::*;
+        let bsp = bs.map(|b| b.as_mut_ptr());
+        for g in 0..ng {
+            let xp = x.as_ptr().add(g * GROUP);
+            let v: [float32x4_t; 8] = std::array::from_fn(|i| vld1q_f32(xp.add(4 * i)));
+            let m01 = vmaxq_f32(vmaxq_f32(vabsq_f32(v[0]), vabsq_f32(v[1])), vmaxq_f32(vabsq_f32(v[2]), vabsq_f32(v[3])));
+            let m23 = vmaxq_f32(vmaxq_f32(vabsq_f32(v[4]), vabsq_f32(v[5])), vmaxq_f32(vabsq_f32(v[6]), vabsq_f32(v[7])));
+            let amax = vmaxvq_f32(vmaxq_f32(m01, m23));
+            let d = amax / 127.0;
+            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+            *s.get_unchecked_mut(g) = d;
+            let r: [int32x4_t; 8] = std::array::from_fn(|i| vcvtnq_s32_f32(vmulq_n_f32(v[i], id)));
+            let h: [int16x8_t; 4] = std::array::from_fn(|i| vcombine_s16(vqmovn_s32(r[2 * i]), vqmovn_s32(r[2 * i + 1])));
+            let lim = vdupq_n_s8(127);
+            let neg = vdupq_n_s8(-127);
+            let b0 = vmaxq_s8(vminq_s8(vcombine_s8(vqmovn_s16(h[0]), vqmovn_s16(h[1])), lim), neg);
+            let b1 = vmaxq_s8(vminq_s8(vcombine_s8(vqmovn_s16(h[2]), vqmovn_s16(h[3])), lim), neg);
+            let qp = q.as_mut_ptr().add(g * GROUP);
+            vst1q_s8(qp, b0);
+            vst1q_s8(qp.add(16), b1);
+            if let Some(p) = bsp {
+                let sum = vaddlvq_s8(b0) as i32 + vaddlvq_s8(b1) as i32;
+                *p.add(g) = d * sum as f32;
+            }
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    quantize_row_scalar(x, q, s, bs);
+}
+
+/// Portable `quantize_row_sums` (the reference of the NEON path).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub(crate) fn quantize_row_scalar(x: &[f32], q: &mut [i8], s: &mut [f32], mut bs: Option<&mut [f32]>) {
+    for (g, ((xg, qg), sg)) in x.as_chunks::<GROUP>().0.iter().zip(q.as_chunks_mut::<GROUP>().0).zip(s.iter_mut()).enumerate() {
         let mut mx = [0f32; 8];
         for c in xg.as_chunks::<8>().0 {
             for l in 0..8 {
@@ -33,8 +77,13 @@ pub(crate) fn quantize_row(x: &[f32], q: &mut [i8], s: &mut [f32]) {
         let d = amax / 127.0;
         let id = if d > 0.0 { 1.0 / d } else { 0.0 };
         *sg = d;
+        let mut sum = 0i32;
         for (o, &v) in qg.iter_mut().zip(xg) {
             *o = (round_fast(v * id) as i32).clamp(-127, 127) as i8;
+            sum += *o as i32;
+        }
+        if let Some(b) = bs.as_deref_mut() {
+            b[g] = d * sum as f32;
         }
     }
 }
@@ -48,30 +97,29 @@ pub(crate) fn matmul(ctx: &Ctx, ws: &mut Workspace, a: &AOp, b: &QMat, d: &MatMu
     // 1. Quantize activations.
     let qa = grow(&mut ws.q, rows * k);
     let sa = grow(&mut ws.s, rows * kg);
-    let quant = |tmp: &mut Vec<f32>, r: usize, q: &mut [i8], s: &mut [f32]| {
-        let (bt, i) = (r / m, r % m);
-        a.src.load_contig(a.row(bt, i), &mut tmp[..k]);
-        quantize_row(&tmp[..k], q, s);
-    };
+    // K formats: per-group `da * sum(q)` for the min terms.
+    let bs = grow(&mut ws.pa_f, if b.is_k() { rows * kg } else { 0 });
+    let a_f32 = a.src.as_f32();
     {
-        let sp = SyncPtr(sa.as_mut_ptr());
-        par::chunks_mut(parallel && rows > 1, qa, k, || vec![0f32; k], |tmp, r, q| {
-            let p = sp;
-            // SAFETY: row r owns scales r*kg..(r+1)*kg exclusively.
-            let s = unsafe { std::slice::from_raw_parts_mut(p.0.add(r * kg), kg) };
-            quant(tmp, r, q, s);
+        let (sp, bp) = (SyncPtr(sa.as_mut_ptr()), SyncPtr(bs.as_mut_ptr()));
+        let has_bs = b.is_k();
+        par::chunks_mut(parallel && rows > 1, qa, k, || vec![0f32; if a_f32.is_some() { 0 } else { k }], |tmp, r, q| {
+            let (sp, bp) = (sp, bp);
+            // SAFETY: row r owns scales / sums r*kg..(r+1)*kg exclusively.
+            let s = unsafe { std::slice::from_raw_parts_mut(sp.0.add(r * kg), kg) };
+            let bsr = has_bs.then(|| unsafe { std::slice::from_raw_parts_mut(bp.0.add(r * kg), kg) });
+            let (bt, i) = (r / m, r % m);
+            let x: &[f32] = match a_f32 {
+                Some(f) => &f[a.row(bt, i)..a.row(bt, i) + k],
+                None => {
+                    a.src.load_contig(a.row(bt, i), &mut tmp[..k]);
+                    &tmp[..k]
+                }
+            };
+            quantize_row_sums(x, q, s, bsr);
         });
     }
-    // K formats: per-group `da * sum(q)` for the min terms.
-    let bsum = if b.is_k() {
-        let bs = grow(&mut ws.pa_f, rows * kg);
-        for (g, o) in bs.iter_mut().enumerate() {
-            *o = sa[g] * qa[g * GROUP..(g + 1) * GROUP].iter().map(|&v| v as i32).sum::<i32>() as f32;
-        }
-        Some(&*bs)
-    } else {
-        None
-    };
+    let bsum = if b.is_k() { Some(&*bs) } else { None };
     let qa = QA { q: qa, s: sa, k };
 
     // 2. Tiles.
@@ -86,6 +134,7 @@ pub(crate) fn matmul(ctx: &Ctx, ws: &mut Workspace, a: &AOp, b: &QMat, d: &MatMu
     let is_k = b.is_k();
     // SAFETY (both): forwarded contract of `Tile4` / `KTile4` (see the call sites).
     let t4 = |r: [usize; 4], c: [usize; 4]| unsafe { if is_k { (kkern.t4)(&ka, r, &km, c) } else { (kern.t4)(&qa, r, b, c) } };
+    let t2 = |r: [usize; 2], c: [usize; 4]| unsafe { if is_k { (kkern.t2)(&ka, r, &km, c) } else { (kern.t2)(&qa, r, b, c) } };
     let t1 = |r: [usize; 1], c: [usize; 4]| unsafe { if is_k { (kkern.t1)(&ka, r, &km, c) } else { (kern.t1)(&qa, r, b, c) } };
 
     par::for_each(parallel, row_blocks * col_blocks, || (vec![0f32; rb * nb], epi.regs()), |(cbuf, regs), t| {
@@ -109,6 +158,14 @@ pub(crate) fn matmul(ctx: &Ctx, ws: &mut Workspace, a: &AOp, b: &QMat, d: &MatMu
                     cbuf[o..o + valid].copy_from_slice(&row[..valid]);
                 }
                 r += 4;
+            }
+            if r + 2 <= r1 {
+                let out = t2([r, r + 1], cols);
+                for (q, row) in out.iter().enumerate() {
+                    let o = (r + q - r0) * ldc + (c - j0);
+                    cbuf[o..o + valid].copy_from_slice(&row[..valid]);
+                }
+                r += 2;
             }
             while r < r1 {
                 let out = t1([r], cols);
@@ -142,6 +199,13 @@ mod tests {
                 assert!((v - x[g * 32 + t]).abs() <= s[g] * 0.5 + 1e-6);
             }
         }
+        // NEON (if any) and portable paths agree exactly, sums included.
+        let x: Vec<f32> = (0..96).map(|i| ((i * 53) % 61) as f32 * 0.21 - 6.0 + if i % 32 == 5 { 0.5 } else { 0.0 }).collect();
+        let (mut q1, mut s1, mut b1) = (vec![0i8; 96], vec![0f32; 3], vec![0f32; 3]);
+        let (mut q2, mut s2, mut b2) = (vec![0i8; 96], vec![0f32; 3], vec![0f32; 3]);
+        quantize_row_sums(&x, &mut q1, &mut s1, Some(&mut b1));
+        quantize_row_scalar(&x, &mut q2, &mut s2, Some(&mut b2));
+        assert_eq!((q1, s1, b1), (q2, s2, b2));
         let z = vec![0f32; 32];
         let mut qz = vec![1i8; 32];
         let mut sz = vec![1f32; 1];

@@ -31,6 +31,15 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A graph keyed and planned, ready to run.
+struct Prepared {
+    key: GraphKey,
+    plan: Arc<Plan>,
+    hit: Option<Lookup>,
+    t0: Instant,
+    t_compile: Duration,
+}
+
 /// Live runtimes, used to share backends between `Device` handles and to find the owner
 /// of a foreign device buffer.
 static REGISTRY: Mutex<Vec<Weak<Runtime>>> = Mutex::new(Vec::new());
@@ -104,16 +113,40 @@ impl Runtime {
 
     /// Compile and run `outputs` together; see `Device::eval`.
     pub(crate) fn eval(&self, outputs: &[&Tensor]) -> Result<Vec<Tensor>> {
-        if outputs.is_empty() {
-            return Ok(Vec::new());
+        let _eval = tracing::trace_span!("eval").entered();
+        match self.prepare(outputs)? {
+            None => Ok(outputs.iter().map(|t| (*t).clone()).collect()),
+            Some(p) => self.execute(p),
         }
+    }
+
+    /// `eval` taking the outputs: once the schedule is known the handles are dropped, so a
+    /// graph nobody else holds is torn down before execution (while its nodes are still in
+    /// cache) instead of after it.
+    pub(crate) fn eval_owned(&self, outputs: Vec<Tensor>) -> Result<Vec<Tensor>> {
+        let _eval = tracing::trace_span!("eval").entered();
+        let prepared = {
+            let refs: Vec<&Tensor> = outputs.iter().collect();
+            self.prepare(&refs)?
+        };
+        match prepared {
+            None => Ok(outputs),
+            Some(p) => {
+                tracing::trace_span!("eval.release").in_scope(|| drop(outputs));
+                self.execute(p)
+            }
+        }
+    }
+
+    /// Key and plan of `outputs`; `None` when everything is already realized here.
+    fn prepare(&self, outputs: &[&Tensor]) -> Result<Option<Prepared>> {
         // Fast path: everything requested is already realized on this device.
-        if outputs.iter().all(|t| matches!(t.op(), Op::Device(d) if self.owns(d))) {
-            return Ok(outputs.iter().map(|t| (*t).clone()).collect());
+        if outputs.is_empty() || outputs.iter().all(|t| matches!(t.op(), Op::Device(d) if self.owns(d))) {
+            return Ok(None);
         }
         let debug = self.debug();
-        let profile = debug || self.profile.load(Ordering::Relaxed);
         let t0 = Instant::now();
+        let plan_span = tracing::trace_span!("eval.plan").entered();
         let key = GraphKey::new(outputs);
         let cached = lock(&self.plans).get(&key);
         let hit = cached.as_ref().map(|c| c.1);
@@ -139,6 +172,15 @@ impl Runtime {
             }
         };
         let t_compile = t0.elapsed();
+        drop(plan_span);
+        Ok(Some(Prepared { key, plan, hit, t0, t_compile }))
+    }
+
+    /// Run a prepared plan and wrap its outputs.
+    fn execute(&self, p: Prepared) -> Result<Vec<Tensor>> {
+        let Prepared { key, plan, hit, t0, t_compile } = p;
+        let debug = self.debug();
+        let profile = debug || self.profile.load(Ordering::Relaxed);
 
         let temps = self.pool.take_slots(&*self.backend, &plan.slot_bytes)?;
         let result = self.run(&plan, &key.leaves, &temps, debug);
@@ -211,6 +253,7 @@ impl Runtime {
         debug: bool,
     ) -> Result<(Vec<DeviceData>, Duration, Duration)> {
         let t0 = Instant::now();
+        let resolve_span = tracing::trace_span!("eval.resolve").entered();
         // Each distinct leaf is resolved once even if several buffers refer to it; weights
         // (file-backed host data) come from the plan's memo when it saw the same data.
         let mut leaf_bufs: Vec<Option<DeviceData>> = vec![None; leaves.len()];
@@ -236,6 +279,13 @@ impl Runtime {
                         Some(d) => d.clone(),
                         None => {
                             let d = match &leaves[*i] {
+                                // Nothing outside this eval holds the data (the graph was
+                                // released): it can never be passed again, so caching its
+                                // upload would only cost a cache entry.
+                                LeafRef::Host(h) if h.is_unique() => {
+                                    let b = h.bytes();
+                                    if b.is_empty() { self.backend.upload(&[0u8; 4])? } else { self.backend.upload(b)? }
+                                }
                                 LeafRef::Host(h) => {
                                     let pinned = crate::file::is_file_backed(h.key());
                                     let d = self.cache.get_or_upload(h, &*self.backend, pinned)?;
@@ -262,6 +312,8 @@ impl Runtime {
         }
         drop(memo);
         let t_resolve = t0.elapsed();
+        drop(resolve_span);
+        let _exec = tracing::trace_span!("eval.execute").entered();
 
         let t1 = Instant::now();
         if debug {
@@ -329,6 +381,21 @@ impl Runtime {
                 bail!("shape_mismatch", "host leaf is smaller than its shape {:?}", t.shape());
             };
             return convert::to_f32(bytes, t.dtype(), t.shape());
+        }
+        if let (Op::Device(d), DType::F32) = (t.op(), t.dtype())
+            && self.owns(d)
+        {
+            // Straight into the result (no intermediate byte vector).
+            let n = t.numel();
+            let mut v: Vec<f32> = Vec::with_capacity(n);
+            let out = v.spare_capacity_mut();
+            // SAFETY: f32 has no invalid bit patterns; viewing the uninitialized slots as
+            // uninitialized bytes is sound.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(), n * 4) };
+            self.backend.download_into(d, bytes)?;
+            // SAFETY: `download_into` initialized all `n * 4` bytes.
+            unsafe { v.set_len(n) };
+            return Ok(v);
         }
         convert::to_f32(&self.host_bytes(t)?, t.dtype(), t.shape())
     }

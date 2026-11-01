@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use lapid_compiler::{BufferSource, Launch, OutputSpec, Schedule};
 use lapid_tensor::fxhash::{FxHashMap, FxHasher};
+use lapid_tensor::walk::{MARK_MAX, Marker};
 use lapid_tensor::{DeviceData, HostData, Op, Tensor};
 
 use super::predict::{Line, Sample};
@@ -44,8 +45,50 @@ pub(crate) struct GraphKey {
     pub dims: Vec<u64>,
     /// Hash of `words`.
     pub hash: u64,
+    /// Hash of `dims`.
+    pub dims_hash: u64,
     pub leaves: Vec<LeafRef>,
     pub nodes: usize,
+}
+
+/// Hash of a word slice: four independent FxHash lanes (no serial multiply chain).
+fn hash_words(w: &[u64]) -> u64 {
+    const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+    let mut lanes = [1u64, 2, 3, 4];
+    let chunks = w.chunks_exact(4);
+    let rest = chunks.remainder();
+    for c in chunks {
+        for (h, &x) in lanes.iter_mut().zip(c) {
+            *h = (h.rotate_left(5) ^ x).wrapping_mul(K);
+        }
+    }
+    let mut h = FxHasher::default();
+    lanes.iter().chain(rest).for_each(|&x| h.write_u64(x));
+    h.write_u64(w.len() as u64);
+    h.finish()
+}
+
+thread_local! {
+    /// Word buffers of dropped keys, reused by the next key (no regrowth per eval).
+    static SPARE: std::cell::RefCell<Vec<Vec<u64>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_buf() -> Vec<u64> {
+    SPARE.try_with(|s| s.borrow_mut().pop()).ok().flatten().unwrap_or_else(|| Vec::with_capacity(16 << 10))
+}
+
+impl Drop for GraphKey {
+    fn drop(&mut self) {
+        for mut b in [std::mem::take(&mut self.words), std::mem::take(&mut self.dims)] {
+            b.clear();
+            let _ = SPARE.try_with(|s| {
+                let mut s = s.borrow_mut();
+                if s.len() < 4 && b.capacity() <= 1 << 22 {
+                    s.push(b);
+                }
+            });
+        }
+    }
 }
 
 fn op_code(op: &Op) -> u64 {
@@ -79,102 +122,151 @@ fn op_code(op: &Op) -> u64 {
     }
 }
 
+/// Walk positions of visited nodes: node marks (the common case) or a map when another
+/// thread is walking at the same time.
+trait Positions {
+    fn get(&self, t: &Tensor) -> Option<u64>;
+    fn set(&mut self, t: &Tensor, v: u64);
+}
+
+/// Mark value of a node pushed but not finished yet.
+const ON_STACK: u32 = MARK_MAX;
+
+impl Positions for Marker {
+    #[inline]
+    fn get(&self, t: &Tensor) -> Option<u64> {
+        Marker::get(self, t).map(|v| if v == ON_STACK { u64::MAX } else { v as u64 })
+    }
+    #[inline]
+    fn set(&mut self, t: &Tensor, v: u64) {
+        Marker::set(self, t, if v == u64::MAX { ON_STACK } else { v as u32 })
+    }
+}
+
+impl Positions for FxHashMap<u64, u64> {
+    #[inline]
+    fn get(&self, t: &Tensor) -> Option<u64> {
+        FxHashMap::get(self, &t.id()).copied()
+    }
+    #[inline]
+    fn set(&mut self, t: &Tensor, v: u64) {
+        self.insert(t.id(), v);
+    }
+}
+
 impl GraphKey {
     pub(crate) fn new(outputs: &[&Tensor]) -> GraphKey {
-        // Borrowed post-order DFS (same order as `lapid_tensor::toposort`), encoding each
-        // node as it is finished. `pos` doubles as the visited set (u64::MAX = on stack).
+        if let Some(mut m) = Marker::try_new() {
+            if let Some(k) = GraphKey::walk(outputs, &mut m, (ON_STACK - 1) as u64) {
+                return k;
+            }
+        }
         let mut pos: FxHashMap<u64, u64> = FxHashMap::default();
         pos.reserve(1024);
+        GraphKey::walk(outputs, &mut pos, u64::MAX - 1).expect("unbounded walk")
+    }
+
+    /// Encode the graph; `None` when it has more than `max_nodes` nodes.
+    fn walk(outputs: &[&Tensor], pos: &mut impl Positions, max_nodes: u64) -> Option<GraphKey> {
+        // Borrowed post-order DFS (same order as `lapid_tensor::toposort`), encoding each
+        // node as it is finished. `pos` doubles as the visited set (u64::MAX = on stack).
         let mut host_alias: FxHashMap<(usize, usize), u64> = FxHashMap::default();
         let mut dev_alias: FxHashMap<usize, u64> = FxHashMap::default();
-        let mut leaves = Vec::new();
-        let mut w: Vec<u64> = Vec::with_capacity(8192);
-        let mut dims: Vec<u64> = Vec::with_capacity(8192);
+        // Sized for a model's weights: no rehashing while the leaves are collected.
+        host_alias.reserve(512);
+        dev_alias.reserve(512);
+        let mut leaves = Vec::with_capacity(512);
+        let mut w = take_buf();
+        let mut dims = take_buf();
         let mut nodes = 0u64;
-        let mut stack: Vec<(&Tensor, bool)> = outputs.iter().rev().map(|t| (*t, false)).collect();
-        while let Some((t, expanded)) = stack.pop() {
-            if !expanded {
-                if pos.contains_key(&t.id()) {
-                    continue;
-                }
-                pos.insert(t.id(), u64::MAX);
-                stack.push((t, true));
-                for s in t.src().iter().rev() {
-                    if !pos.contains_key(&s.id()) {
-                        stack.push((s, false));
-                    }
-                }
+        // Post-order DFS with (node, next operand) entries: every node is pushed once.
+        let mut stack: Vec<(&Tensor, u32)> = Vec::with_capacity(256);
+        for out in outputs {
+            if pos.get(out).is_some() {
                 continue;
             }
-            pos.insert(t.id(), nodes);
-            nodes += 1;
-            let op = t.op();
-            w.push(op_code(op) | (t.dtype() as u64) << 8 | (t.rank() as u64) << 16 | (t.src().len() as u64) << 32);
-            dims.extend(t.shape().iter().map(|&d| d as u64));
-            for s in t.src() {
-                // Operands always precede their users in topological order.
-                w.push(pos.get(&s.id()).copied().unwrap_or(u64::MAX));
-            }
-            match op {
-                Op::Host(h) => {
-                    let next = leaves.len() as u64;
-                    let a = *host_alias.entry(h.key()).or_insert_with(|| {
-                        leaves.push(LeafRef::Host(h.clone()));
-                        next
-                    });
-                    dims.push(h.bytes().len() as u64);
-                    w.push(a);
+            pos.set(out, u64::MAX);
+            stack.push((*out, 0));
+            while let Some(top) = stack.last_mut() {
+                let (t, i) = *top;
+                if let Some(s) = t.src().get(i as usize) {
+                    top.1 += 1;
+                    if pos.get(s).is_none() {
+                        pos.set(s, u64::MAX);
+                        stack.push((s, 0));
+                    }
+                    continue;
                 }
-                Op::Device(d) => {
-                    let next = leaves.len() as u64;
-                    let key = Arc::as_ptr(d) as *const () as usize;
-                    let a = *dev_alias.entry(key).or_insert_with(|| {
-                        leaves.push(LeafRef::Device(d.clone()));
-                        next
-                    });
-                    dims.push(d.len() as u64);
-                    w.push(a);
+                stack.pop();
+                if nodes >= max_nodes {
+                    return None;
                 }
-                Op::Const(c) => w.push(c.to_bits()),
-                Op::Cast(dt) => w.push(*dt as u64),
-                Op::Unary(u) => w.push(*u as u64),
-                Op::Binary(b) => w.push(*b as u64),
-                Op::Reduce { op, axis, keepdim } => w.extend([*op as u64, *axis as u64, *keepdim as u64]),
-                Op::Permute(p) => w.extend(p.iter().map(|&a| a as u64)),
-                Op::Slice { axis, start, end } => {
-                    w.push(*axis as u64);
-                    dims.extend([*start as u64, *end as u64]);
+                pos.set(t, nodes);
+                nodes += 1;
+                let op = t.op();
+                w.push(op_code(op) | (t.dtype() as u64) << 8 | (t.rank() as u64) << 16 | (t.src().len() as u64) << 32);
+                dims.extend(t.shape().iter().map(|&d| d as u64));
+                for s in t.src() {
+                    // Operands always precede their users in topological order.
+                    w.push(pos.get(s).unwrap_or(u64::MAX));
                 }
-                Op::Pad { axis, before, after, value } => {
-                    w.extend([*axis as u64, value.to_bits()]);
-                    dims.extend([*before as u64, *after as u64]);
+                match op {
+                    Op::Host(h) => {
+                        let next = leaves.len() as u64;
+                        let a = *host_alias.entry(h.key()).or_insert_with(|| {
+                            leaves.push(LeafRef::Host(h.clone()));
+                            next
+                        });
+                        dims.push(h.len() as u64);
+                        w.push(a);
+                    }
+                    Op::Device(d) => {
+                        let next = leaves.len() as u64;
+                        let key = Arc::as_ptr(d) as *const () as usize;
+                        let a = *dev_alias.entry(key).or_insert_with(|| {
+                            leaves.push(LeafRef::Device(d.clone()));
+                            next
+                        });
+                        dims.push(d.len() as u64);
+                        w.push(a);
+                    }
+                    Op::Const(c) => w.push(c.to_bits()),
+                    Op::Cast(dt) => w.push(*dt as u64),
+                    Op::Unary(u) => w.push(*u as u64),
+                    Op::Binary(b) => w.push(*b as u64),
+                    Op::Reduce { op, axis, keepdim } => w.extend([*op as u64, *axis as u64, *keepdim as u64]),
+                    Op::Permute(p) => w.extend(p.iter().map(|&a| a as u64)),
+                    Op::Slice { axis, start, end } => {
+                        w.push(*axis as u64);
+                        dims.extend([*start as u64, *end as u64]);
+                    }
+                    Op::Pad { axis, before, after, value } => {
+                        w.extend([*axis as u64, value.to_bits()]);
+                        dims.extend([*before as u64, *after as u64]);
+                    }
+                    Op::Cat { axis } => w.push(*axis as u64),
+                    Op::MatMul { b_transposed } => w.push(*b_transposed as u64),
+                    Op::LayerNorm { eps } | Op::RmsNorm { eps } => w.push(eps.to_bits() as u64),
+                    Op::Attention { scale, causal, has_mask } => {
+                        w.extend([scale.to_bits() as u64, *causal as u64, *has_mask as u64])
+                    }
+                    Op::GatherAxis { axis } => w.push(*axis as u64),
+                    Op::TopK { k, axis } => {
+                        w.push(*axis as u64);
+                        dims.push(*k as u64);
+                    }
+                    Op::WriteSlice { axis, start } => {
+                        w.push(*axis as u64);
+                        dims.push(*start as u64);
+                    }
+                    Op::GatedDeltaNet { scale } => w.push(scale.to_bits() as u64),
+                    Op::Where | Op::Reshape | Op::Expand | Op::Contiguous | Op::Gather | Op::Softmax | Op::MatMulId => {}
                 }
-                Op::Cat { axis } => w.push(*axis as u64),
-                Op::MatMul { b_transposed } => w.push(*b_transposed as u64),
-                Op::LayerNorm { eps } | Op::RmsNorm { eps } => w.push(eps.to_bits() as u64),
-                Op::Attention { scale, causal, has_mask } => {
-                    w.extend([scale.to_bits() as u64, *causal as u64, *has_mask as u64])
-                }
-                Op::GatherAxis { axis } => w.push(*axis as u64),
-                Op::TopK { k, axis } => {
-                    w.push(*axis as u64);
-                    dims.push(*k as u64);
-                }
-                Op::WriteSlice { axis, start } => {
-                    w.push(*axis as u64);
-                    dims.push(*start as u64);
-                }
-                Op::GatedDeltaNet { scale } => w.push(scale.to_bits() as u64),
-                Op::Where | Op::Reshape | Op::Expand | Op::Contiguous | Op::Gather | Op::Softmax | Op::MatMulId => {}
             }
         }
         w.push(u64::MAX - outputs.len() as u64);
-        w.extend(outputs.iter().map(|t| pos.get(&t.id()).copied().unwrap_or(u64::MAX)));
-        let mut h = FxHasher::default();
-        for &x in &w {
-            h.write_u64(x);
-        }
-        GraphKey { hash: h.finish(), words: w, dims, leaves, nodes: nodes as usize }
+        w.extend(outputs.iter().map(|t| pos.get(t).unwrap_or(u64::MAX)));
+        Some(GraphKey { hash: hash_words(&w), dims_hash: hash_words(&dims), words: w, dims, leaves, nodes: nodes as usize })
     }
 
     fn leaf_index(&self) -> FxHashMap<(u8, usize, usize), usize> {
@@ -262,8 +354,8 @@ impl Plan {
 /// Plans of one graph structure.
 struct Entry {
     words: Vec<u64>,
-    /// Exactly compiled plans by dims (most recent last).
-    exact: VecDeque<(Vec<u64>, Arc<Plan>)>,
+    /// Exactly compiled plans by (dims hash, dims) (most recent last).
+    exact: VecDeque<(u64, Vec<u64>, Arc<Plan>)>,
     line: Option<Line>,
 }
 
@@ -293,7 +385,7 @@ impl PlanCache {
     /// An exact plan for `key`, else one predicted from earlier compiles of its structure.
     pub(crate) fn get(&mut self, key: &GraphKey) -> Option<(Arc<Plan>, Lookup)> {
         let e = self.map.get_mut(&key.hash)?.iter_mut().find(|e| e.words == key.words)?;
-        if let Some((_, p)) = e.exact.iter().rev().find(|(d, _)| *d == key.dims) {
+        if let Some((_, _, p)) = e.exact.iter().rev().find(|(h, d, _)| *h == key.dims_hash && *d == key.dims) {
             return Some((p.clone(), Lookup::Exact));
         }
         if predict_disabled() {
@@ -324,7 +416,7 @@ impl PlanCache {
             self.count -= 1;
         }
         self.count += 1;
-        e.exact.push_back((key.dims.clone(), plan.clone()));
+        e.exact.push_back((key.dims_hash, key.dims.clone(), plan.clone()));
         e.line = Some(Line::record(e.line.take(), Sample::new(key.dims.clone(), plan)));
     }
 

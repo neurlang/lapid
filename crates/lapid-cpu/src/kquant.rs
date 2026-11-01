@@ -7,8 +7,8 @@
 //! * q4_K / q5_K: `w = d*sc*q - dmin*m` → `d*sc*da*dot(q, a) - dmin*m*bs`;
 //! * q6_K: two 16-element halves with their own i8 scale: `d*da*(sc0*dot0 + sc1*dot1)`.
 //!
-//! Kernels: aarch64 `sdot` (dotprod) and portable scalar, both over R rows x 4 columns like
-//! the int8 / int4 tiles in `matmul/qkernels.rs`.
+//! Kernels: aarch64 `sdot` (dotprod, `matmul/kdot.rs`) and portable scalar, both over R rows
+//! x 4 columns like the int8 / int4 tiles in `matmul/qkernels.rs`.
 
 use lapid_quant::Format;
 
@@ -33,7 +33,7 @@ pub(crate) fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
 
 /// Per 32-group multipliers of a q4_K / q5_K block: `(d*sc[g], dmin*m[g])`.
 #[inline(always)]
-fn group_scales_k4(b: &[u8]) -> ([f32; 8], [f32; 8]) {
+pub(crate) fn group_scales_k4(b: &[u8]) -> ([f32; 8], [f32; 8]) {
     let (d, dmin) = (f16_at(b, 0), f16_at(b, 2));
     let mut s = [0f32; 8];
     let mut m = [0f32; 8];
@@ -149,25 +149,28 @@ impl<'a> KMat<'a> {
 /// Row indices < rows of `KA`, column indices < rows of `KMat`, `KA.k == KMat.cols`, and the
 /// kernel's ISA must be available (guaranteed by `select`).
 pub(crate) type KTile1 = unsafe fn(&KA, [usize; 1], &KMat, [usize; 4]) -> [[f32; 4]; 1];
+pub(crate) type KTile2 = unsafe fn(&KA, [usize; 2], &KMat, [usize; 4]) -> [[f32; 4]; 2];
 pub(crate) type KTile4 = unsafe fn(&KA, [usize; 4], &KMat, [usize; 4]) -> [[f32; 4]; 4];
 
 #[derive(Clone, Copy)]
 pub(crate) struct KKernels {
     pub t1: KTile1,
+    pub t2: KTile2,
     pub t4: KTile4,
 }
 
 pub(crate) fn select(isa: &crate::Isa, fmt: Format) -> KKernels {
     #[cfg(target_arch = "aarch64")]
     if isa.dotprod {
+        use crate::matmul::kdot::tile;
         return match fmt {
-            Format::Q4K => KKernels { t1: tile_sdot::<1, 4>, t4: tile_sdot::<4, 4> },
-            Format::Q5K => KKernels { t1: tile_sdot::<1, 5>, t4: tile_sdot::<4, 5> },
-            _ => KKernels { t1: tile_sdot::<1, 6>, t4: tile_sdot::<4, 6> },
+            Format::Q4K => KKernels { t1: tile::<1, 4>, t2: tile::<2, 4>, t4: tile::<4, 4> },
+            Format::Q5K => KKernels { t1: tile::<1, 5>, t2: tile::<2, 5>, t4: tile::<4, 5> },
+            _ => KKernels { t1: tile::<1, 6>, t2: tile::<2, 6>, t4: tile::<4, 6> },
         };
     }
     let _ = (isa, fmt);
-    KKernels { t1: tile_scalar::<1>, t4: tile_scalar::<4> }
+    KKernels { t1: tile_scalar::<1>, t2: tile_scalar::<2>, t4: tile_scalar::<4> }
 }
 
 /// Portable kernel (also the reference of the SIMD ones).
@@ -213,102 +216,6 @@ pub(crate) unsafe fn tile_scalar<const R: usize>(a: &KA, rows: [usize; R], b: &K
         }
     }
     acc
-}
-
-/// `F` = 4 (q4_K), 5 (q5_K) or 6 (q6_K).
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon,dotprod")]
-unsafe fn tile_sdot<const R: usize, const F: u8>(a: &KA, rows: [usize; R], b: &KMat, cols: [usize; 4]) -> [[f32; 4]; R] {
-    use std::arch::aarch64::*;
-    let k = a.k;
-    let kg = k / 32;
-    // SAFETY: indices validated by the caller (see `KTile1`); every load stays inside a
-    // block / an activation row.
-    unsafe {
-        let zero = vdupq_n_s32(0);
-        let m0f = vdupq_n_u8(0x0f);
-        let mut acc = [[vdupq_n_f32(0.0); 4]; R];
-        let mut accm = [[0f32; 4]; R];
-        for c in 0..4 {
-            for blk in 0..k / QK {
-                let bb = b.block(cols[c], blk);
-                let p = bb.as_ptr();
-                // 8 groups x 2 vectors of 16 signed quants.
-                let mut w = [[vdupq_n_s8(0); 2]; 8];
-                let mut sc = [[0f32; 2]; 8];
-                let mut mins = [0f32; 8];
-                if F == 6 {
-                    let d = f16_at(bb, 208);
-                    let m3 = vdupq_n_u8(3);
-                    let m32 = vdupq_n_s8(32);
-                    for n in 0..2 {
-                        let ql = p.add(n * 64);
-                        let qh = p.add(128 + n * 32);
-                        let (l0, l1, l2, l3) = (vld1q_u8(ql), vld1q_u8(ql.add(16)), vld1q_u8(ql.add(32)), vld1q_u8(ql.add(48)));
-                        let (h0, h1) = (vld1q_u8(qh), vld1q_u8(qh.add(16)));
-                        let mk = |lo: uint8x16_t, h: uint8x16_t| -> int8x16_t {
-                            vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(lo, vshlq_n_u8::<4>(vandq_u8(h, m3)))), m32)
-                        };
-                        w[n * 4] = [mk(vandq_u8(l0, m0f), h0), mk(vandq_u8(l1, m0f), h1)];
-                        w[n * 4 + 1] = [mk(vandq_u8(l2, m0f), vshrq_n_u8::<2>(h0)), mk(vandq_u8(l3, m0f), vshrq_n_u8::<2>(h1))];
-                        w[n * 4 + 2] = [mk(vshrq_n_u8::<4>(l0), vshrq_n_u8::<4>(h0)), mk(vshrq_n_u8::<4>(l1), vshrq_n_u8::<4>(h1))];
-                        w[n * 4 + 3] = [mk(vshrq_n_u8::<4>(l2), vshrq_n_u8::<6>(h0)), mk(vshrq_n_u8::<4>(l3), vshrq_n_u8::<6>(h1))];
-                        for g in 0..4 {
-                            sc[n * 4 + g] = [d * (bb[192 + n * 8 + 2 * g] as i8) as f32, d * (bb[192 + n * 8 + 2 * g + 1] as i8) as f32];
-                        }
-                    }
-                } else {
-                    let (s, m) = group_scales_k4(bb);
-                    mins = m;
-                    let qs = if F == 5 { p.add(48) } else { p.add(16) };
-                    let (h0, h1) = if F == 5 { (vld1q_u8(p.add(16)), vld1q_u8(p.add(32))) } else { (vdupq_n_u8(0), vdupq_n_u8(0)) };
-                    let sixteen = vdupq_n_u8(16);
-                    for j in 0..4 {
-                        let (v0, v1) = (vld1q_u8(qs.add(j * 32)), vld1q_u8(qs.add(j * 32 + 16)));
-                        let mut lo = [vandq_u8(v0, m0f), vandq_u8(v1, m0f)];
-                        let mut hi = [vshrq_n_u8::<4>(v0), vshrq_n_u8::<4>(v1)];
-                        if F == 5 {
-                            let (u1, u2) = (vdupq_n_u8(1 << (2 * j)), vdupq_n_u8(2 << (2 * j)));
-                            lo[0] = vorrq_u8(lo[0], vandq_u8(vtstq_u8(h0, u1), sixteen));
-                            lo[1] = vorrq_u8(lo[1], vandq_u8(vtstq_u8(h1, u1), sixteen));
-                            hi[0] = vorrq_u8(hi[0], vandq_u8(vtstq_u8(h0, u2), sixteen));
-                            hi[1] = vorrq_u8(hi[1], vandq_u8(vtstq_u8(h1, u2), sixteen));
-                        }
-                        w[2 * j] = [vreinterpretq_s8_u8(lo[0]), vreinterpretq_s8_u8(lo[1])];
-                        w[2 * j + 1] = [vreinterpretq_s8_u8(hi[0]), vreinterpretq_s8_u8(hi[1])];
-                        sc[2 * j] = [s[2 * j]; 2];
-                        sc[2 * j + 1] = [s[2 * j + 1]; 2];
-                    }
-                }
-                for r in 0..R {
-                    let ap = a.q.as_ptr().add(rows[r] * k + blk * QK);
-                    let go = rows[r] * kg + blk * 8;
-                    for g in 0..8 {
-                        let da = *a.s.get_unchecked(go + g);
-                        let a0 = vld1q_s8(ap.add(g * 32));
-                        let a1 = vld1q_s8(ap.add(g * 32 + 16));
-                        if F == 6 {
-                            let i0 = vdotq_s32(zero, a0, w[g][0]);
-                            let i1 = vdotq_s32(zero, a1, w[g][1]);
-                            acc[r][c] = vfmaq_n_f32(acc[r][c], vcvtq_f32_s32(i0), sc[g][0] * da);
-                            acc[r][c] = vfmaq_n_f32(acc[r][c], vcvtq_f32_s32(i1), sc[g][1] * da);
-                        } else {
-                            let i = vdotq_s32(vdotq_s32(zero, a0, w[g][0]), a1, w[g][1]);
-                            acc[r][c] = vfmaq_n_f32(acc[r][c], vcvtq_f32_s32(i), sc[g][0] * da);
-                            accm[r][c] += mins[g] * *a.bs.get_unchecked(go + g);
-                        }
-                    }
-                }
-            }
-        }
-        let mut out = [[0f32; 4]; R];
-        for r in 0..R {
-            for c in 0..4 {
-                out[r][c] = vaddvq_f32(acc[r][c]) - accm[r][c];
-            }
-        }
-        out
-    }
 }
 
 #[cfg(test)]
@@ -438,6 +345,11 @@ mod tests {
                     let tol = 1e-3 * want.abs().max(1.0);
                     assert!((want - got).abs() <= tol, "{fmt:?} r{r} c{col}: {want} vs {got}");
                     assert!((want - got_s).abs() <= tol, "{fmt:?} scalar r{r} c{col}: {want} vs {got_s}");
+                }
+                let got2 = unsafe { (fast.t2)(&a, [1, 4], &b, cols) };
+                let want2 = unsafe { tile_scalar::<2>(&a, [1, 4], &b, cols) };
+                for r in 0..2 {
+                    assert!((got2[r][ci] - want2[r][ci]).abs() <= 1e-3 * want2[r][ci].abs().max(1.0));
                 }
                 let got4 = unsafe { (fast.t4)(&a, [0, 1, 3, 4], &b, cols) };
                 let want4 = unsafe { tile_scalar::<4>(&a, [0, 1, 3, 4], &b, cols) };

@@ -23,26 +23,43 @@ pub(crate) const PAR_MIN_WORK: usize = 1 << 15;
 /// Element count above which elementwise-style kernels go parallel.
 pub(crate) const PAR_MIN_ELEMS: usize = 1 << 14;
 
+/// Estimated work (elements x per-element cost, see `kcache::expr_cost`; a plain copy costs
+/// 2 per element) above which an expression kernel goes parallel: a fork-join costs ~2 us,
+/// about what a serial thread needs for this much work.
+pub(crate) const PAR_MIN_COST: usize = 1 << 15;
+
 type Body = dyn Fn() + Sync + 'static;
 
+/// Keeps a value on its own cache line pair (no false sharing between the line every
+/// spinning worker polls and the lines that get written per job).
+#[repr(align(128))]
+struct Pad<T>(T);
+
+/// Per-worker join state, written only by its worker.
+struct Slot {
+    /// Epoch the worker last tried to enter.
+    entered: AtomicU64,
+    /// Epoch the worker last left (== `entered` when it is outside any job).
+    done: AtomicU64,
+}
+
 struct Shared {
-    /// Incremented for every published job.
-    epoch: AtomicU64,
+    /// Incremented for every published job (polled by spinning workers; written once per job).
+    epoch: Pad<AtomicU64>,
     /// Body of the current job; written only while no worker is inside a job.
-    job: UnsafeCell<Option<*const Body>>,
-    /// Workers currently inside (or about to enter) the job body.
-    active: AtomicUsize,
+    job: Pad<UnsafeCell<Option<*const Body>>>,
     /// Set once the caller finished its share: late workers must not enter.
-    closed: AtomicBool,
-    sleepers: AtomicUsize,
+    closed: Pad<AtomicBool>,
+    slots: Vec<Pad<Slot>>,
+    sleepers: Pad<AtomicUsize>,
     lock: Mutex<()>,
     cv: Condvar,
     shutdown: AtomicBool,
     spin: Duration,
 }
 
-// SAFETY: `job` is only written by the single caller between jobs (no worker active, see
-// `Pool::run`) and read by workers after they registered in `active` for the current epoch.
+// SAFETY: `job` is only written by the single caller between jobs (no worker inside one,
+// see `Pool::run`) and read by workers after they registered for the current epoch.
 unsafe impl Sync for Shared {}
 unsafe impl Send for Shared {}
 
@@ -62,21 +79,22 @@ impl Pool {
     /// Pool with `threads` participants (the caller + `threads - 1` workers).
     pub(crate) fn new(threads: usize) -> Pool {
         let spin_us = std::env::var("LAPID_SPIN_US").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1000);
+        let nw = threads.max(1) - 1;
         let shared = Arc::new(Shared {
-            epoch: AtomicU64::new(0),
-            job: UnsafeCell::new(None),
-            active: AtomicUsize::new(0),
-            closed: AtomicBool::new(true),
-            sleepers: AtomicUsize::new(0),
+            epoch: Pad(AtomicU64::new(0)),
+            job: Pad(UnsafeCell::new(None)),
+            closed: Pad(AtomicBool::new(true)),
+            slots: (0..nw).map(|_| Pad(Slot { entered: AtomicU64::new(0), done: AtomicU64::new(0) })).collect(),
+            sleepers: Pad(AtomicUsize::new(0)),
             lock: Mutex::new(()),
             cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
             spin: Duration::from_micros(spin_us),
         });
         let mut workers = Vec::new();
-        for i in 1..threads.max(1) {
+        for i in 0..nw {
             let sh = shared.clone();
-            match std::thread::Builder::new().name(format!("lapid-cpu-{i}")).spawn(move || worker(&sh)) {
+            match std::thread::Builder::new().name(format!("lapid-cpu-{}", i + 1)).spawn(move || worker(&sh, i)) {
                 Ok(h) => workers.push(h),
                 Err(_) => break,
             }
@@ -103,6 +121,11 @@ impl Pool {
 
     /// Run `body` on the caller and every available worker; returns when all participants
     /// left the body. `body` must itself distribute work (e.g. via an atomic counter).
+    ///
+    /// Join protocol (Dekker-style, all SeqCst): a worker stores `entered = e`, then checks
+    /// `closed` and `epoch`; the caller stores `closed = true`, then waits for every worker
+    /// whose `entered != done`. Either the caller sees the worker's `entered` (and waits for
+    /// it) or the worker sees `closed` (and does not run the body).
     fn run(&self, body: &(dyn Fn() + Sync + '_)) {
         let Ok(_guard) = self.running.try_lock() else {
             body();
@@ -110,14 +133,14 @@ impl Pool {
         };
         let sh = &*self.shared;
         // SAFETY: lifetime erasure; the pointer is dereferenced only by workers registered
-        // in `active`, and we wait for `active == 0` before returning (body outlives that).
+        // for this epoch, and we wait for all of them before returning (body outlives that).
         let ptr: *const Body = unsafe { std::mem::transmute::<&(dyn Fn() + Sync + '_), &'static Body>(body) };
-        // SAFETY: no worker is inside a job (previous run waited for active == 0, late
-        // joiners re-check `closed`/`epoch` before reading `job`).
-        unsafe { *sh.job.get() = Some(ptr) };
-        sh.closed.store(false, Ordering::SeqCst);
-        sh.epoch.fetch_add(1, Ordering::SeqCst);
-        if sh.sleepers.load(Ordering::SeqCst) > 0 {
+        // SAFETY: no worker is inside a job (the previous run waited for every registered
+        // worker; late ones re-check `closed` / `epoch` before reading `job`).
+        unsafe { *sh.job.0.get() = Some(ptr) };
+        sh.closed.0.store(false, Ordering::SeqCst);
+        sh.epoch.0.fetch_add(1, Ordering::SeqCst);
+        if sh.sleepers.0.load(Ordering::SeqCst) > 0 {
             let _g = sh.lock.lock().unwrap_or_else(|e| e.into_inner());
             sh.cv.notify_all();
         }
@@ -125,9 +148,16 @@ impl Pool {
         let prev = CURRENT.with(|c| c.replace(std::ptr::null()));
         body();
         CURRENT.with(|c| c.set(prev));
-        sh.closed.store(true, Ordering::SeqCst);
-        while sh.active.load(Ordering::SeqCst) != 0 {
-            std::hint::spin_loop();
+        sh.closed.0.store(true, Ordering::SeqCst);
+        for slot in &sh.slots {
+            let slot = &slot.0;
+            loop {
+                let en = slot.entered.load(Ordering::SeqCst);
+                if slot.done.load(Ordering::Acquire) == en {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
         }
     }
 }
@@ -145,22 +175,21 @@ impl Drop for Pool {
     }
 }
 
-fn worker(sh: &Shared) {
+fn worker(sh: &Shared, w: usize) {
+    let slot = &sh.slots[w].0;
     let mut seen = 0u64;
     while let Some(e) = wait_epoch(sh, seen) {
         seen = e;
-        sh.active.fetch_add(1, Ordering::SeqCst);
-        if sh.closed.load(Ordering::SeqCst) || sh.epoch.load(Ordering::SeqCst) != e {
-            sh.active.fetch_sub(1, Ordering::SeqCst);
-            continue;
+        slot.entered.store(e, Ordering::SeqCst);
+        if !sh.closed.0.load(Ordering::SeqCst) && sh.epoch.0.load(Ordering::SeqCst) == e {
+            // SAFETY: registered for a published, still open job (see `Pool::run`).
+            if let Some(job) = unsafe { *sh.job.0.get() } {
+                // A panicking kernel must not leave the slot registered forever.
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*job)() }));
+                drop(r);
+            }
         }
-        // SAFETY: registered in `active` for a published, still open job (see `Pool::run`).
-        if let Some(job) = unsafe { *sh.job.get() } {
-            // A panicking kernel must not leave `active` raised forever.
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*job)() }));
-            drop(r);
-        }
-        sh.active.fetch_sub(1, Ordering::SeqCst);
+        slot.done.store(e, Ordering::Release);
     }
 }
 
@@ -169,7 +198,7 @@ fn wait_epoch(sh: &Shared, seen: u64) -> Option<u64> {
     let start = Instant::now();
     let mut i = 0u32;
     loop {
-        let e = sh.epoch.load(Ordering::Acquire);
+        let e = sh.epoch.0.load(Ordering::Acquire);
         if e != seen {
             return Some(e);
         }
@@ -183,9 +212,9 @@ fn wait_epoch(sh: &Shared, seen: u64) -> Option<u64> {
         }
     }
     let mut g = sh.lock.lock().unwrap_or_else(|e| e.into_inner());
-    sh.sleepers.fetch_add(1, Ordering::SeqCst);
+    sh.sleepers.0.fetch_add(1, Ordering::SeqCst);
     let r = loop {
-        let e = sh.epoch.load(Ordering::SeqCst);
+        let e = sh.epoch.0.load(Ordering::SeqCst);
         if e != seen {
             break Some(e);
         }
@@ -194,7 +223,7 @@ fn wait_epoch(sh: &Shared, seen: u64) -> Option<u64> {
         }
         g = sh.cv.wait(g).unwrap_or_else(|e| e.into_inner());
     };
-    sh.sleepers.fetch_sub(1, Ordering::SeqCst);
+    sh.sleepers.0.fetch_sub(1, Ordering::SeqCst);
     r
 }
 
@@ -237,8 +266,8 @@ where
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     // Grab several tiny tasks at once so the shared counter does not become the bottleneck
-    // (e.g. 18000 row copies); ~16 grabs per participant keep the load balanced.
-    let grab = (n / (pool.threads() * 16)).max(1);
+    // (e.g. 18000 row copies); ~8 grabs per participant keep the load balanced.
+    let grab = (n / (pool.threads() * 8)).max(1);
     let body = || {
         let mut i = next.fetch_add(grab, Ordering::Relaxed);
         if i >= n {

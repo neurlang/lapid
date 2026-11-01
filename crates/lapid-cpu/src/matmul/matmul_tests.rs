@@ -80,8 +80,54 @@ fn quantized_large_m_matches_dequantized_f32() {
                 be.execute(&l, &bufs).unwrap();
                 let got: Vec<f32> = bytemuck::pod_collect_to_vec(&be.download(&bufs[ni]).unwrap());
                 let e = rel_err(&got, &want);
-                // bf16 operands (`qbf16`, BF16 CPUs) for m >= 16, else exact f32.
-                assert!(e <= 5e-3, "{fmt:?} batch={batch} m={m} n={n} k={k}: rel err {e}");
+                // bf16 hi + lo activations x exact integer weights (`qbf16`), or f32.
+                assert!(e <= 2e-5, "{fmt:?} batch={batch} m={m} n={n} k={k}: rel err {e}");
+            }
+        }
+    }
+}
+
+/// K-quant weights with many rows (`qbf16` exact path on BF16 CPUs, `qdeq` elsewhere) and
+/// few rows (int8 activations): products against the dequantized f32 matrix.
+#[test]
+fn kquant_matmul_matches_dequantized_f32() {
+    let bes = [CpuBackend::with_threads(4), CpuBackend::build(1, Isa::default())];
+    let mut seed = 50;
+    for fmt in [Format::Q4K, Format::Q5K, Format::Q6K] {
+        let dt = super::kbench_tests::dtype(fmt);
+        for &(m, n, k, pad) in &[(1, 37, 512, 0), (3, 20, 256, 4), (6, 9, 256, 0), (20, 45, 256, 3), (130, 70, 512, 0), (33, 300, 1024, 0)] {
+            seed += 1;
+            let w = rnd(n * k, seed);
+            let bytes = lapid_quant::quantize(fmt, &w, n, k);
+            let deq = lapid_quant::dequantize(fmt, &bytes, n, k);
+            let rs = k + pad;
+            let a = rnd(m * rs, seed + 7);
+            let mut want = vec![0f64; m * n];
+            for r in 0..m {
+                for j in 0..n {
+                    want[r * n + j] = (0..k).map(|p| a[r * rs + p] as f64 * deq[j * k + p] as f64).sum();
+                }
+            }
+            let spec = Arc::new(MatMulSpec { a_dtype: DType::F32, b_dtype: dt, b_transposed: true, extra_dtypes: vec![], out_dtype: DType::F32, epilogue: None });
+            let dims = MatMulDims {
+                batch: 1,
+                m,
+                n,
+                k,
+                a: MatView { offset: 0, batch_stride: 0, row_stride: rs },
+                b: MatView { offset: 0, batch_stride: 0, row_stride: k },
+                extra_views: vec![],
+                out: MatView::contiguous(m, n),
+            };
+            for (bi, be) in bes.iter().enumerate() {
+                let bufs = [be.upload(bytemuck::cast_slice(&a)).unwrap(), be.upload(&bytes).unwrap(), be.alloc(m * n * 4).unwrap()];
+                let l = [Launch { kernel: Kernel::MatMul(spec.clone(), dims.clone()), inputs: vec![0, 1], output: 2 }];
+                be.execute(&l, &bufs).unwrap();
+                let got: Vec<f32> = bytemuck::pod_collect_to_vec(&be.download(&bufs[2]).unwrap());
+                let e = rel_err(&got, &want);
+                // m <= 8: int8 activations; else exact (bf16 hi + lo split or f32).
+                let tol = if m <= 8 { 2e-2 } else { 2e-5 };
+                assert!(e <= tol, "{fmt:?} backend {bi} m={m} n={n} k={k}: rel err {e}");
             }
         }
     }

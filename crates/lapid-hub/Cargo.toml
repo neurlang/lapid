@@ -13,6 +13,7 @@ default = ["download"]
 download = ["lapid-convert/download"]
 
 [dependencies]
+tracing.workspace = true
 lapid.workspace = true
 lapid-nn.workspace = true
 lapid-convert.workspace = true

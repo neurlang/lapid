@@ -17,6 +17,7 @@ metal = ["dep:lapid-metal"]
 webgpu = ["dep:lapid-webgpu"]
 
 [dependencies]
+tracing.workspace = true
 lapid-tensor.workspace = true
 lapid-compiler.workspace = true
 lapid-cpu.workspace = true

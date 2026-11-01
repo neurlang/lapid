@@ -1,15 +1,29 @@
 //! Host-side logits processing and sampling: greedy, temperature, top-k, top-p, repetition
 //! penalty, with a seeded pure-Rust RNG (xoshiro256**), so runs are reproducible.
 
-/// Index of the maximum value (first one on ties; NaN never wins).
+/// Index of the maximum value (first one on ties; NaN never wins; all NaN gives the last).
 pub fn argmax(v: &[f32]) -> usize {
-    let mut best = 0;
-    for (i, &x) in v.iter().enumerate() {
-        if x > v[best] || v[best].is_nan() {
-            best = i;
+    // Two vectorizable passes: the max over non-NaN values (`f32::max` ignores NaN), then
+    // the first index holding it.
+    const L: usize = 32;
+    let mut acc = [f32::NEG_INFINITY; L];
+    let chunks = v.chunks_exact(L);
+    let rest = chunks.remainder();
+    for c in chunks {
+        let c: &[f32; L] = c.try_into().unwrap_or(&[f32::NEG_INFINITY; L]);
+        for i in 0..L {
+            // Compare-select (NaN never wins): vectorizes, unlike a `max` reduction chain.
+            acc[i] = if c[i] > acc[i] { c[i] } else { acc[i] };
         }
     }
-    best
+    let m = rest.iter().chain(&acc).fold(f32::NEG_INFINITY, |a, &x| if x > a { x } else { a });
+    // First index of `m`: a branch-free test per block, a scan only in the block that has it.
+    for (b, c) in v.chunks(64).enumerate() {
+        if c.iter().fold(0u32, |f, &x| f | (x == m) as u32) != 0 {
+            return b * 64 + c.iter().position(|&x| x == m).unwrap_or(0);
+        }
+    }
+    v.len().saturating_sub(1)
 }
 
 /// log(sum(exp(v))), computed stably (all -inf gives -inf).
@@ -148,8 +162,14 @@ impl Sampler {
     /// penalty). Order as in HF: penalty, temperature, top-k, top-p.
     pub fn sample(&mut self, logits: &[f32], history: &[u32]) -> u32 {
         let p = &self.params;
-        let mut l = logits.to_vec();
-        apply_repetition_penalty(&mut l, history, p.repetition_penalty);
+        // Copy only when the penalty edits the logits.
+        let l: std::borrow::Cow<'_, [f32]> = if p.repetition_penalty == 1.0 {
+            logits.into()
+        } else {
+            let mut l = logits.to_vec();
+            apply_repetition_penalty(&mut l, history, p.repetition_penalty);
+            l.into()
+        };
         if p.temperature <= 0.0 || l.len() <= 1 {
             return argmax(&l) as u32;
         }
@@ -157,10 +177,14 @@ impl Sampler {
         let mut cand: Vec<(u32, f32)> =
             l.iter().enumerate().filter(|(_, x)| !x.is_nan()).map(|(i, &x)| (i as u32, x * inv_t)).collect();
         if p.top_k > 0 || p.top_p < 1.0 {
-            cand.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-            if p.top_k > 0 {
-                cand.truncate(p.top_k.max(1));
+            // Total order (ties by lower id), so selecting the top k first and sorting only
+            // them gives exactly the prefix of the full sort.
+            let order = |a: &(u32, f32), b: &(u32, f32)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
+            if p.top_k > 0 && p.top_k < cand.len() {
+                cand.select_nth_unstable_by(p.top_k - 1, order);
+                cand.truncate(p.top_k);
             }
+            cand.sort_unstable_by(order);
         }
         let max = cand.iter().map(|c| c.1).fold(f32::NEG_INFINITY, f32::max);
         if max == f32::NEG_INFINITY {
@@ -213,11 +237,91 @@ mod tests {
         assert_eq!((&x[..], y[0]), (&z[..3], z[4]));
     }
 
+    /// The original scalar argmax (reference semantics).
+    fn argmax_ref(v: &[f32]) -> usize {
+        let mut best = 0;
+        for (i, &x) in v.iter().enumerate() {
+            if x > v[best] || v[best].is_nan() {
+                best = i;
+            }
+        }
+        best
+    }
+
     #[test]
     fn argmax_first_max_and_nan() {
         assert_eq!(argmax(&[1.0, 3.0, 3.0, -1.0]), 1);
         assert_eq!(argmax(&[f32::NAN, 0.5, 2.0]), 2);
         assert_eq!(argmax(&[f32::NEG_INFINITY, f32::NEG_INFINITY]), 0);
+        let mut r = Rng::new(5);
+        let specials = [f32::NAN, f32::NEG_INFINITY, f32::INFINITY, 0.0, -0.0, 1.0];
+        for n in [0usize, 1, 2, 15, 16, 17, 33, 100, 1000] {
+            for _ in 0..200 {
+                let v: Vec<f32> = (0..n)
+                    .map(|_| {
+                        let u = r.next_u64();
+                        if u % 5 == 0 { specials[(u >> 8) as usize % specials.len()] } else { ((u >> 16) % 7) as f32 }
+                    })
+                    .collect();
+                assert_eq!(argmax(&v), argmax_ref(&v), "{v:?}");
+            }
+        }
+        assert_eq!(argmax(&[f32::NAN; 3]), argmax_ref(&[f32::NAN; 3]));
+    }
+
+    #[test]
+    fn top_k_matches_full_sort() {
+        let mut r = Rng::new(11);
+        let logits: Vec<f32> = (0..5000).map(|_| (r.next_u64() % 50) as f32 * 0.1).collect();
+        for k in [1usize, 2, 20, 4999, 5000, 9000] {
+            for top_p in [1.0f32, 0.9] {
+                let params = SamplingParams { temperature: 0.8, top_k: k, top_p, seed: 7, ..Default::default() };
+                let (mut a, mut b) = (Sampler::new(params.clone()), Sampler::new(params.clone()));
+                for _ in 0..50 {
+                    assert_eq!(a.sample(&logits, &[]), sample_full_sort(&mut b, &logits));
+                }
+            }
+        }
+    }
+
+    /// The original sampler (full sort), for equivalence checks.
+    fn sample_full_sort(s: &mut Sampler, l: &[f32]) -> u32 {
+        let p = s.params.clone();
+        let inv_t = 1.0 / p.temperature;
+        let mut cand: Vec<(u32, f32)> =
+            l.iter().enumerate().filter(|(_, x)| !x.is_nan()).map(|(i, &x)| (i as u32, x * inv_t)).collect();
+        cand.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        if p.top_k > 0 {
+            cand.truncate(p.top_k.max(1));
+        }
+        let max = cand.iter().map(|c| c.1).fold(f32::NEG_INFINITY, f32::max);
+        let mut probs: Vec<f64> = cand.iter().map(|c| ((c.1 - max) as f64).exp()).collect();
+        let total: f64 = probs.iter().sum();
+        probs.iter_mut().for_each(|x| *x /= total);
+        if p.top_p < 1.0 {
+            let mut acc = 0.0;
+            let mut keep = probs.len();
+            for (i, &x) in probs.iter().enumerate() {
+                acc += x;
+                if acc >= p.top_p as f64 {
+                    keep = i + 1;
+                    break;
+                }
+            }
+            probs.truncate(keep);
+            cand.truncate(keep);
+            let total: f64 = probs.iter().sum();
+            probs.iter_mut().for_each(|x| *x /= total);
+        }
+        let u = s.rng.next_f64();
+        let mut acc = 0.0;
+        for (c, &x) in cand.iter().zip(&probs) {
+            acc += x;
+            if u < acc {
+                return c.0;
+            }
+        }
+        cand.last().map_or(0, |c| c.0)
     }
 
     #[test]

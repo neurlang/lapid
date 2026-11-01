@@ -1338,6 +1338,7 @@ dependencies = [
  "lapid-vulkan",
  "lapid-webgpu",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -1366,6 +1367,8 @@ dependencies = [
  "lapid-server",
  "lapid-vulkan",
  "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1401,6 +1404,7 @@ dependencies = [
  "lapid-compiler",
  "lapid-quant",
  "lapid-tensor",
+ "tracing",
 ]
 
 [[package]]
@@ -1439,6 +1443,7 @@ dependencies = [
  "memmap2",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -1464,6 +1469,7 @@ dependencies = [
  "rustfft",
  "serde_json",
  "tokenizers",
+ "tracing",
 ]
 
 [[package]]
@@ -1508,6 +1514,7 @@ dependencies = [
  "lapid-quant",
  "serde",
  "serde_json",
+ "smallvec",
 ]
 
 [[package]]

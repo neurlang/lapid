@@ -45,7 +45,7 @@ const CHEAP_RECOMPUTE_OPS: usize = 8;
 const CHEAP_EXPAND_OPS: usize = 4;
 
 pub(crate) fn compile(outputs: &[Tensor], opts: &CompileOptions) -> Result<Schedule> {
-    let order = lapid_tensor::toposort(outputs);
+    let order = creation_order(lapid_tensor::toposort(outputs));
     let mut lw = Lowerer::new(opts, outputs);
     lw.users.reserve(order.len());
     lw.vals.reserve(order.len());
@@ -63,6 +63,18 @@ pub(crate) fn compile(outputs: &[Tensor], opts: &CompileOptions) -> Result<Sched
     }
     let outs = lw.finish_outputs(outputs)?;
     Ok(memory::plan(lw.bufs, lw.launches, outs))
+}
+
+/// Lower nodes in creation order (ids grow with creation, so it is topological): a side
+/// output such as a recurrent state slice is then materialized right after its producer,
+/// while the producer's buffer is still hot in cache and before it would otherwise stay
+/// alive (pinning a temp slot) until the end of the graph. Every leaf also precedes every
+/// op. Falls back to the DFS order if some node has a src with a larger id.
+fn creation_order(mut order: Vec<Tensor>) -> Vec<Tensor> {
+    if order.iter().all(|t| t.src().iter().all(|s| s.id() < t.id())) {
+        order.sort_unstable_by_key(|t| t.id());
+    }
+    order
 }
 
 // ------------------------------------------------------------------ buffers / pending

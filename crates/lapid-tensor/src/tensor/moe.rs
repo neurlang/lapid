@@ -5,7 +5,8 @@ use crate::bail;
 use crate::dtype::DType;
 use crate::error::Result;
 use crate::op::Op;
-use crate::tensor::Tensor;
+use crate::tensor::{Srcs, Tensor};
+use smallvec::smallvec;
 use crate::tensor::check;
 
 impl Tensor {
@@ -45,7 +46,7 @@ impl Tensor {
         if e == 0 && t * r > 0 {
             bail!("invalid_argument", "matmul_id with an empty expert stack");
         }
-        let srcs = vec![self.clone(), w.clone(), ids.clone()];
+        let srcs: Srcs = smallvec![self.clone(), w.clone(), ids.clone()];
         Ok(Tensor::from_op(Op::MatMulId, srcs, vec![t, r, n], self.dtype()))
     }
 
@@ -93,7 +94,7 @@ impl Tensor {
         if !scale.is_finite() {
             bail!("invalid_argument", "gated_delta_net scale must be finite, got {scale}");
         }
-        let srcs = vec![q.clone(), k.clone(), v.clone(), g.clone(), beta.clone(), state.clone()];
+        let srcs: Srcs = smallvec![q.clone(), k.clone(), v.clone(), g.clone(), beta.clone(), state.clone()];
         Ok(Tensor::from_op(Op::GatedDeltaNet { scale }, srcs, vec![b, h, t + dk, dv], DType::F32))
     }
 }

@@ -4,7 +4,8 @@ use crate::bail;
 use crate::dtype::DType;
 use crate::error::Result;
 use crate::op::Op;
-use crate::tensor::Tensor;
+use crate::tensor::{Shape, Srcs, Tensor};
+use smallvec::smallvec;
 use crate::tensor::check::{self, broadcast_shapes};
 
 impl Tensor {
@@ -47,7 +48,7 @@ impl Tensor {
         let b_batch = &b.shape()[..br - 2];
         let batch = broadcast_shapes(a_batch, b_batch)?;
 
-        let with_batch = |tail: &[usize]| -> Vec<usize> {
+        let with_batch = |tail: &[usize]| -> Shape {
             let mut s = batch.clone();
             s.extend_from_slice(tail);
             s
@@ -55,7 +56,7 @@ impl Tensor {
         let a2 = a.broadcast_to(&with_batch(&a.shape()[ar - 2..]))?;
         let b2 = if br == 2 { b.clone() } else { b.broadcast_to(&with_batch(&b.shape()[br - 2..]))? };
         let shape = with_batch(&[m, n]);
-        Ok(Tensor::from_op(Op::MatMul { b_transposed }, vec![a2, b2], shape, a.dtype()))
+        Ok(Tensor::from_op(Op::MatMul { b_transposed }, smallvec![a2, b2], shape, a.dtype()))
     }
 
     pub(super) fn gather_impl(&self, indices: &Tensor) -> Result<Tensor> {
@@ -68,9 +69,9 @@ impl Tensor {
         if indices.dtype() != DType::I32 {
             bail!("unsupported_dtype", "gather indices must be i32, got {}", indices.dtype().name());
         }
-        let mut shape = indices.shape().to_vec();
+        let mut shape = Shape::from_slice(indices.shape());
         shape.push(self.shape()[1]);
-        Ok(Tensor::from_op(Op::Gather, vec![self.clone(), indices.clone()], shape, DType::F32))
+        Ok(Tensor::from_op(Op::Gather, smallvec![self.clone(), indices.clone()], shape, DType::F32))
     }
 
     pub(super) fn softmax_impl(&self) -> Result<Tensor> {
@@ -78,7 +79,7 @@ impl Tensor {
         if self.rank() == 0 {
             bail!("invalid_argument", "softmax of a rank-0 tensor");
         }
-        Ok(Tensor::from_op(Op::Softmax, vec![self.clone()], self.shape().to_vec(), self.dtype()))
+        Ok(Tensor::from_op(Op::Softmax, smallvec![self.clone()], self.shape(), self.dtype()))
     }
 
     pub(super) fn rms_norm_impl(&self, weight: &Tensor, eps: f32) -> Result<Tensor> {
@@ -94,8 +95,8 @@ impl Tensor {
         if !eps.is_finite() || eps < 0.0 {
             bail!("invalid_argument", "rms_norm eps must be finite and >= 0, got {eps}");
         }
-        let srcs = vec![self.clone(), weight.clone()];
-        Ok(Tensor::from_op(Op::RmsNorm { eps }, srcs, self.shape().to_vec(), self.dtype()))
+        let srcs: Srcs = smallvec![self.clone(), weight.clone()];
+        Ok(Tensor::from_op(Op::RmsNorm { eps }, srcs, self.shape(), self.dtype()))
     }
 
     pub(super) fn layer_norm_impl(&self, weight: &Tensor, bias: &Tensor, eps: f32) -> Result<Tensor> {
@@ -125,8 +126,8 @@ impl Tensor {
         if !eps.is_finite() || eps < 0.0 {
             bail!("invalid_argument", "layer_norm eps must be finite and >= 0, got {eps}");
         }
-        let srcs = vec![self.clone(), weight.clone(), bias.clone()];
-        Ok(Tensor::from_op(Op::LayerNorm { eps }, srcs, self.shape().to_vec(), self.dtype()))
+        let srcs: Srcs = smallvec![self.clone(), weight.clone(), bias.clone()];
+        Ok(Tensor::from_op(Op::LayerNorm { eps }, srcs, self.shape(), self.dtype()))
     }
 }
 
@@ -172,15 +173,15 @@ pub(super) fn attention(
     if !scale.is_finite() {
         bail!("invalid_argument", "attention scale must be finite, got {scale}");
     }
-    let mut srcs = vec![q.clone(), k.clone(), v.clone()];
+    let mut srcs: Srcs = smallvec![q.clone(), k.clone(), v.clone()];
     if let Some(m) = mask {
         check::float_dtype(m, "attention mask")?;
         let full = [b, h, sq, sk];
-        if broadcast_shapes(m.shape(), &full)? != full {
+        if broadcast_shapes(m.shape(), &full)?[..] != full[..] {
             bail!("shape_mismatch", "attention mask {:?} is not broadcastable to {full:?}", m.shape());
         }
         srcs.push(m.broadcast_to(&full)?);
     }
     let op = Op::Attention { scale, causal, has_mask: mask.is_some() };
-    Ok(Tensor::from_op(op, srcs, q.shape().to_vec(), q.dtype()))
+    Ok(Tensor::from_op(op, srcs, q.shape(), q.dtype()))
 }

@@ -11,3 +11,4 @@ serde.workspace = true
 serde_json.workspace = true
 half.workspace = true
 bytemuck.workspace = true
+smallvec = { version = "1.13", features = ["union", "const_generics"] }

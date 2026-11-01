@@ -23,11 +23,13 @@ pub(crate) struct QA<'a> {
 /// Row indices must be < rows of `QA`, column indices < rows of `QMat`, `QA.k == QMat.cols`,
 /// and the kernel's ISA must be available (guaranteed by `select`).
 pub(crate) type Tile1 = unsafe fn(&QA, [usize; 1], &QMat, [usize; 4]) -> [[f32; 4]; 1];
+pub(crate) type Tile2 = unsafe fn(&QA, [usize; 2], &QMat, [usize; 4]) -> [[f32; 4]; 2];
 pub(crate) type Tile4 = unsafe fn(&QA, [usize; 4], &QMat, [usize; 4]) -> [[f32; 4]; 4];
 
 #[derive(Clone, Copy)]
 pub(crate) struct QKernels {
     pub t1: Tile1,
+    pub t2: Tile2,
     pub t4: Tile4,
 }
 
@@ -36,22 +38,22 @@ pub(crate) fn select(isa: &Isa, fmt: Format) -> QKernels {
     #[cfg(target_arch = "aarch64")]
     if isa.dotprod {
         return if i4 {
-            QKernels { t1: tile_sdot::<1, true>, t4: tile_sdot::<4, true> }
+            QKernels { t1: tile_sdot::<1, true>, t2: tile_sdot::<2, true>, t4: tile_sdot::<4, true> }
         } else {
-            QKernels { t1: tile_sdot::<1, false>, t4: tile_sdot::<4, false> }
+            QKernels { t1: tile_sdot::<1, false>, t2: tile_sdot::<2, false>, t4: tile_sdot::<4, false> }
         };
     }
     #[cfg(target_arch = "x86_64")]
     if isa.avx2 && isa.fma {
         return if i4 {
-            QKernels { t1: tile_avx2::<1, true>, t4: tile_avx2::<4, true> }
+            QKernels { t1: tile_avx2::<1, true>, t2: tile_avx2::<2, true>, t4: tile_avx2::<4, true> }
         } else {
-            QKernels { t1: tile_avx2::<1, false>, t4: tile_avx2::<4, false> }
+            QKernels { t1: tile_avx2::<1, false>, t2: tile_avx2::<2, false>, t4: tile_avx2::<4, false> }
         };
     }
     let _ = isa;
     let _ = i4;
-    QKernels { t1: tile_scalar::<1>, t4: tile_scalar::<4> }
+    QKernels { t1: tile_scalar::<1>, t2: tile_scalar::<2>, t4: tile_scalar::<4> }
 }
 
 /// Portable kernel.
@@ -227,6 +229,13 @@ mod tests {
             unsafe {
                 let want4 = tile_scalar::<4>(&a, [0, 1, 2, 4], &b, cols);
                 let got4 = (fast.t4)(&a, [0, 1, 2, 4], &b, cols);
+                let want2 = tile_scalar::<2>(&a, [4, 0], &b, cols);
+                let got2 = (fast.t2)(&a, [4, 0], &b, cols);
+                for c in 0..4 {
+                    for r in 0..2 {
+                        assert!((want2[r][c] - got2[r][c]).abs() <= 1e-3 * want2[r][c].abs().max(1.0));
+                    }
+                }
                 let want1 = tile_scalar::<1>(&a, [3], &b, cols);
                 let got1 = (fast.t1)(&a, [3], &b, cols);
                 for c in 0..4 {

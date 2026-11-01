@@ -12,10 +12,13 @@
 mod attention;
 mod attention_vec;
 mod buffer;
+mod delta;
 mod elementwise;
 mod expr;
 mod expr_int;
+mod fuse;
 mod index;
+mod kcache;
 mod kquant;
 mod math;
 mod matmul;
@@ -29,6 +32,8 @@ mod view;
 
 #[cfg(test)]
 mod bench_tests;
+#[cfg(test)]
+mod bench_ops;
 #[cfg(test)]
 mod tests;
 
@@ -113,6 +118,8 @@ impl Isa {
 #[derive(Default)]
 pub(crate) struct ProgramCache {
     map: Mutex<HashMap<ProgramKey, Arc<Program>>>,
+    /// Per-spec launch data (see `kcache`).
+    specs: kcache::SpecCache,
 }
 
 /// Expression + raw-input mask.
@@ -150,10 +157,6 @@ pub(crate) struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    pub(crate) fn program(&self, e: &Expr) -> Arc<Program> {
-        self.programs.get(e)
-    }
-
     /// Program for a kernel expression over inputs of `in_dtypes`; `raw` marks the inputs
     /// that are bound as raw words (see `expr_int::raw_inputs`).
     pub(crate) fn program_typed(&self, e: &Expr, in_dtypes: &[DType], raw: &[bool]) -> Arc<Program> {
@@ -249,6 +252,18 @@ impl Backend for CpuBackend {
         Ok(unsafe { b.bytes() }.to_vec())
     }
 
+    fn download_into(&self, buf: &DeviceData, out: &mut [std::mem::MaybeUninit<u8>]) -> Result<()> {
+        let b = as_cpu(buf)?;
+        // SAFETY: execute is synchronous, no kernel is writing this buffer now.
+        let src = unsafe { b.bytes() };
+        if src.len() < out.len() {
+            return Err(lapid_tensor::Error::new("backend", format!("cpu: buffer has {} bytes, {} requested", src.len(), out.len())));
+        }
+        // SAFETY: `src` has at least `out.len()` initialized bytes; distinct allocations.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), out.as_mut_ptr().cast::<u8>(), out.len()) };
+        Ok(())
+    }
+
     fn prepare(&self, launches: &[Launch]) -> Result<()> {
         for l in launches {
             match &l.kernel {
@@ -285,9 +300,28 @@ impl Backend for CpuBackend {
         let ctx = Ctx { threads: self.threads, isa: self.isa, programs: &self.programs };
         let profile = self.profile.as_ref();
         let run = move || -> Result<()> {
+            // Launches taken over by an earlier one (see `fuse`).
+            let mut skip: Vec<bool> = Vec::new();
             for (li, l) in launches.iter().enumerate() {
+                if skip.get(li).copied().unwrap_or(false) {
+                    continue;
+                }
                 let t0 = profile.map(|_| std::time::Instant::now());
-                run_launch(&ctx, ws, l, &bufs).map_err(|e| {
+                let _k = tracing::trace_span!("cpu", kind = profile_kind(&l.kernel)).entered();
+                let copies = match l.kernel {
+                    Kernel::GatedDeltaNet(..) => {
+                        let c = fuse::gdn_copies(launches, li, &bufs);
+                        for (j, _) in c.state.iter().chain(c.o.iter()) {
+                            if skip.is_empty() {
+                                skip = vec![false; launches.len()];
+                            }
+                            skip[*j] = true;
+                        }
+                        c
+                    }
+                    _ => fuse::GdnCopies::default(),
+                };
+                run_launch(&ctx, ws, l, &bufs, &copies).map_err(|e| {
                     Error::new(e.code, format!("launch {li} ({}): {}", l.kernel.kind(), e.message))
                 })?;
                 if let (Some(p), Some(t0)) = (profile, t0) {
@@ -314,11 +348,17 @@ fn profile_kind(k: &Kernel) -> &'static str {
             (false, false) => "matmul.f.gemm",
         },
         Kernel::Attention(_, d) if d.sq == 1 => "attention.sq1",
+        Kernel::Elementwise(_, d) => match d.shape.iter().product::<usize>() {
+            n if n < 1 << 10 => "elementwise.<1k",
+            n if n < 1 << 14 => "elementwise.<16k",
+            n if n < 1 << 17 => "elementwise.<128k",
+            _ => "elementwise.big",
+        },
         k => k.kind(),
     }
 }
 
-fn run_launch(ctx: &Ctx, ws: &mut Workspace, l: &Launch, bufs: &[&CpuBuffer]) -> Result<()> {
+fn run_launch(ctx: &Ctx, ws: &mut Workspace, l: &Launch, bufs: &[&CpuBuffer], copies: &fuse::GdnCopies) -> Result<()> {
     let get = |id: BufId| {
         bufs.get(id).copied().ok_or_else(|| {
             Error::new("invalid_launch", format!("buffer id {id} out of range ({} buffers)", bufs.len()))
@@ -353,21 +393,17 @@ fn run_launch(ctx: &Ctx, ws: &mut Workspace, l: &Launch, bufs: &[&CpuBuffer]) ->
         Kernel::Elementwise(spec, dims) => {
             expect(spec.in_dtypes.len())?;
             // Raw-word inputs / outputs are bound as f32 lanes holding the bit patterns.
-            let raw = expr_int::raw_inputs(&spec.expr, &spec.in_dtypes);
-            let dts: Vec<DType> =
-                spec.in_dtypes.iter().zip(&raw).map(|(&d, &r)| if r { DType::F32 } else { d }).collect();
-            let inputs = srcs(&dts, 0)?;
+            let c = ctx.compiled_ew(spec);
+            let inputs = srcs(&c.dts, 0)?;
             let int_root = spec.out_dtype == DType::I32 && spec.expr.ty() == Some(ExprType::Int);
             let out_dt = if int_root { DType::F32 } else { spec.out_dtype };
-            elementwise::run(ctx, spec, dims, &inputs, &out_buf.dst(out_dt)?, &raw)
+            elementwise::run(ctx, spec, dims, &inputs, &out_buf.dst(out_dt)?, &c)
         }
         Kernel::Reduce(spec, dims) => {
             expect(spec.in_dtypes.len())?;
-            let raw = expr_int::raw_inputs(&spec.expr, &spec.in_dtypes);
-            let dts: Vec<DType> =
-                spec.in_dtypes.iter().zip(&raw).map(|(&d, &r)| if r { DType::F32 } else { d }).collect();
-            let inputs = srcs(&dts, 0)?;
-            reduce::run(ctx, spec, dims, &inputs, &out_buf.dst(spec.out_dtype)?, &raw)
+            let c = ctx.compiled_reduce(spec);
+            let inputs = srcs(&c.dts, 0)?;
+            reduce::run(ctx, spec, dims, &inputs, &out_buf.dst(spec.out_dtype)?, &c)
         }
         Kernel::MatMul(spec, dims) => {
             expect(2 + spec.extra_dtypes.len())?;
@@ -432,7 +468,23 @@ fn run_launch(ctx: &Ctx, ws: &mut Workspace, l: &Launch, bufs: &[&CpuBuffer]) ->
         Kernel::GatedDeltaNet(spec, dims) => {
             expect(6)?;
             let inputs = srcs(&[DType::F32; 6], 0)?;
-            moe::gated_delta_net(ctx, dims, &inputs, &out_buf.dst(spec.out_dtype)?)
+            // The state destination may be the state input itself (the runtime recycles a
+            // dropped state buffer as the new one): every element is read before the same
+            // task overwrites it at the same position.
+            let xdst = |c: Option<(usize, BufId)>, may_alias: Option<usize>| -> Result<Option<typed::Dst>> {
+                let Some((_, id)) = c else { return Ok(None) };
+                let b = get(id)?;
+                let alias = ins.iter().position(|i| i.as_ptr() == b.as_ptr()).filter(|&k| Some(k) != may_alias);
+                if b.as_ptr() == out_buf.as_ptr() || alias.is_some() {
+                    return Err(Error::new(
+                        "buffer_aliasing",
+                        format!("cpu gated_delta_net: copy destination b{id} aliases the output or input {alias:?}"),
+                    ));
+                }
+                b.dst(DType::F32).map(Some)
+            };
+            let extra = delta::Extra { state: xdst(copies.state, Some(5))?, o: xdst(copies.o, None)? };
+            delta::gated_delta_net(ctx, dims, &inputs, &out_buf.dst(spec.out_dtype)?, &extra)
         }
         Kernel::Attention(spec, dims) => {
             expect(3 + spec.mask_dtype.is_some() as usize)?;

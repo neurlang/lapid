@@ -31,6 +31,20 @@ fn f32_to_i32(v: f32) -> i32 {
     v as i32
 }
 
+/// `out[t] = f(s[base + t * stride])` without per-element bounds checks.
+///
+/// # Safety
+/// The whole run must lie inside `s`.
+#[inline(always)]
+unsafe fn strided<T: Copy>(s: &[T], base: usize, stride: isize, out: &mut [f32], f: impl Fn(T) -> f32) {
+    let mut p = s.as_ptr().wrapping_add(base);
+    for o in out.iter_mut() {
+        // SAFETY: in bounds per the caller.
+        *o = f(unsafe { *p });
+        p = p.wrapping_offset(stride);
+    }
+}
+
 /// Read-only typed view of a buffer.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Src<'a> {
@@ -127,26 +141,13 @@ impl<'a> Src<'a> {
 
     fn load_strided(&self, base: usize, stride: isize, out: &mut [f32]) {
         check_run(base, stride, out.len(), self.len());
-        match self {
-            Src::F32(s) => {
-                for (t, o) in out.iter_mut().enumerate() {
-                    *o = s[at(base, stride, t)];
-                }
-            }
-            Src::F16(s) => {
-                for (t, o) in out.iter_mut().enumerate() {
-                    *o = f16_bits_to_f32(s[at(base, stride, t)].to_bits());
-                }
-            }
-            Src::BF16(s) => {
-                for (t, o) in out.iter_mut().enumerate() {
-                    *o = bf16_bits_to_f32(s[at(base, stride, t)].to_bits());
-                }
-            }
-            Src::I32(s) => {
-                for (t, o) in out.iter_mut().enumerate() {
-                    *o = s[at(base, stride, t)] as f32;
-                }
+        // SAFETY: the run is in bounds (checked above).
+        unsafe {
+            match self {
+                Src::F32(s) => strided(s, base, stride, out, |v| v),
+                Src::F16(s) => strided(s, base, stride, out, |v| f16_bits_to_f32(v.to_bits())),
+                Src::BF16(s) => strided(s, base, stride, out, |v| bf16_bits_to_f32(v.to_bits())),
+                Src::I32(s) => strided(s, base, stride, out, |v| v as f32),
             }
         }
     }
@@ -202,6 +203,11 @@ impl Dst {
 
     pub fn dtype(&self) -> DType {
         self.dtype
+    }
+
+    /// Base pointer as f32 (callers check the dtype and bounds themselves).
+    pub(crate) fn f32_ptr(&self) -> *mut f32 {
+        self.ptr as *mut f32
     }
 
     /// Mutable f32 slice of the output (dtype must be F32).
@@ -355,8 +361,11 @@ unsafe fn copy_t<T: Copy>(s: &[T], sb: usize, ss: isize, d: *mut T, db: usize, d
                 *d.add(at(db, ds, t)) = v;
             }
         } else {
-            for t in 0..n {
-                *d.add(at(db, ds, t)) = s[at(sb, ss, t)];
+            let (mut sp, mut dp) = (s.as_ptr().wrapping_add(sb), d.wrapping_add(db));
+            for _ in 0..n {
+                *dp = *sp;
+                sp = sp.wrapping_offset(ss);
+                dp = dp.wrapping_offset(ds);
             }
         }
     }

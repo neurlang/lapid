@@ -15,6 +15,18 @@ pub trait Backend: Send + Sync {
     fn upload(&self, bytes: &[u8]) -> Result<DeviceData>;
     /// Copy back to host (waits for pending work).
     fn download(&self, buf: &DeviceData) -> Result<Vec<u8>>;
+    /// Copy the first `out.len()` bytes back into `out` (waits for pending work), e.g. into
+    /// a typed host vector without an intermediate copy. Default: through `download`.
+    fn download_into(&self, buf: &DeviceData, out: &mut [std::mem::MaybeUninit<u8>]) -> Result<()> {
+        let v = self.download(buf)?;
+        let Some(src) = v.get(..out.len()) else {
+            return Err(lapid_tensor::Error::new("backend", format!("downloaded {} bytes, expected {}", v.len(), out.len())));
+        };
+        for (o, &b) in out.iter_mut().zip(src) {
+            o.write(b);
+        }
+        Ok(())
+    }
     /// Compile / cache everything the launches need. Optional (execute must also work cold).
     fn prepare(&self, _launches: &[Launch]) -> Result<()> {
         Ok(())

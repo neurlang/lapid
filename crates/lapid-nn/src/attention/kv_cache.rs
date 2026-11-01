@@ -178,6 +178,20 @@ impl KvCache {
         self.staged.iter().flatten().flat_map(|s| [&s.k, &s.v]).collect()
     }
 
+    /// Move the staged tensors out (same order as [`staged`](Self::staged)), leaving
+    /// graph-free placeholders of the same shape, so evaluating them with
+    /// `Device::eval_owned` can free the step graph before it runs. Commit / discard as usual.
+    pub fn take_staged(&mut self) -> Vec<Tensor> {
+        let mut out = Vec::with_capacity(2 * self.staged.len());
+        for s in self.staged.iter_mut().flatten() {
+            for t in [&mut s.k, &mut s.v] {
+                let ph = Tensor::zeros(t.shape(), t.dtype());
+                out.push(std::mem::replace(t, ph));
+            }
+        }
+        out
+    }
+
     /// Store the realized tensors (same order as [`staged`](Self::staged)) and advance the
     /// offset by the staged token count.
     pub fn commit(&mut self, realized: Vec<Tensor>) -> Result<()> {

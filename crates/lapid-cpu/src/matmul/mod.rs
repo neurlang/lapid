@@ -16,6 +16,8 @@
 mod gemm;
 mod gemv;
 mod hgemv;
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod kdot;
 pub(crate) mod kernels;
 mod qbf16;
 mod qdeq;
@@ -43,6 +45,8 @@ pub(crate) use kernels::{MR, MicroFn, NR};
 const SMALL_M: usize = 8;
 
 #[cfg(test)]
+mod kbench_tests;
+#[cfg(test)]
 mod matmul_tests;
 
 /// `LAPID_CPU_INT8_ACT=1`: keep int8-quantized activations for quantized matmuls with many
@@ -65,9 +69,8 @@ pub(crate) struct Workspace {
     pub psb: Vec<f32>,
     /// Per-group activation sums of the K-quant paths.
     pub pa_f: Vec<f32>,
-    /// bf16 operand pairs of `qbf16`.
+    /// bf16 activation pairs of `qbf16` (weight panels are per thread).
     pub ha: Vec<u16>,
-    pub hb: Vec<u16>,
     /// Quantized B with few rows still takes the float-activation path (set by MatMulId for
     /// prefill-sized launches).
     pub float_act: bool,
@@ -232,6 +235,8 @@ pub(crate) fn run(
 
     match b {
         BInput::Quant(q) => {
+            // Per format / shape (only with `LAPID_TRACE`): `qmm[(Q4K, m, n, k)]`.
+            let _s = tracing::trace_span!("qmm", kind = ?(q.fmt, batch * m, n, k)).entered();
             if !spec.b_transposed || d.b.offset != 0 || d.b.batch_stride != 0 {
                 return Err(Error::new(
                     "invalid_launch",

@@ -12,6 +12,7 @@ use lapid::{Error, Result};
 
 mod kernels;
 mod suite;
+mod trace;
 
 #[derive(Parser)]
 #[command(name = "lapid", version, about = "lapid developer tooling: devices, model files, verification, benchmarks")]
@@ -191,7 +192,12 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match run(cli) {
+    let traced = trace::init();
+    let result = run(cli);
+    if traced {
+        trace::report();
+    }
+    match result {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
         Err(e) => {

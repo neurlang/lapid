@@ -98,6 +98,7 @@ where
             self.done = true;
             return Some(Err(Error::new("invalid_argument", "generate: step returned no logits")));
         }
+        let _sample = tracing::trace_span!("sample").entered();
         if let Some(p) = &mut self.processor {
             p(&mut logits, &self.tokens);
         }

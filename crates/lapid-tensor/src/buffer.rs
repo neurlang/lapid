@@ -8,15 +8,20 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct HostData {
     bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    /// `key()`, cached: identity checks of graph leaves (every eval, every weight) need no
+    /// trip through the shared allocation.
+    key: (usize, usize),
 }
 
 impl HostData {
     pub fn new(bytes: Arc<dyn AsRef<[u8]> + Send + Sync>) -> Self {
-        HostData { bytes }
+        let b = (*bytes).as_ref();
+        let key = (b.as_ptr() as usize, b.len());
+        HostData { bytes, key }
     }
 
     pub fn from_vec(v: Vec<u8>) -> Self {
-        HostData { bytes: Arc::new(v) }
+        HostData::new(Arc::new(v))
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -25,8 +30,21 @@ impl HostData {
 
     /// Stable identity of the underlying allocation (pointer + len), used as upload cache key.
     pub fn key(&self) -> (usize, usize) {
-        let b = self.bytes();
-        (b.as_ptr() as usize, b.len())
+        self.key
+    }
+
+    /// True when this handle is the only one to the data (no other `HostData` clone exists).
+    pub fn is_unique(&self) -> bool {
+        Arc::strong_count(&self.bytes) == 1
+    }
+
+    /// Byte length (no trip through the shared allocation).
+    pub fn len(&self) -> usize {
+        self.key.1
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.key.1 == 0
     }
 }
 

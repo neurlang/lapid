@@ -285,6 +285,7 @@ impl Iterator for TokenStream<'_> {
             self.finish = Some(FinishReason::Cancelled);
             return None;
         }
+        let _token = tracing::trace_span!("token").entered();
         let id = match self.inner.next() {
             None => {
                 self.finish = Some(FinishReason::Length);
@@ -296,6 +297,7 @@ impl Iterator for TokenStream<'_> {
             }
             Some(Ok(id)) => id,
         };
+        let _detok = tracing::trace_span!("detok").entered();
         let now = Instant::now();
         self.first.get_or_insert(now);
         self.last = Some(now);

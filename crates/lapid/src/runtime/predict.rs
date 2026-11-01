@@ -23,17 +23,21 @@ use super::plan::{Plan, PlanSrc};
 /// Visit every numeric (dims-dependent) field of `plan` in a fixed order. Spec fields,
 /// f32-bit fields (scale, eps), buffer ids and slot numbers are structure, not visited.
 fn walk(plan: &mut Plan, f: &mut dyn FnMut(&mut i64)) {
-    fn u(x: &mut usize, f: &mut dyn FnMut(&mut i64)) {
-        let mut v = *x as i64;
-        f(&mut v);
-        *x = v as usize;
+    // SAFETY: every pointer is a live, exclusively borrowed usize / isize field of `plan`
+    // (8 bytes, same layout as i64; the bit casts are the plain `as` conversions).
+    walk_ptrs(plan, &mut |p| f(unsafe { &mut *p }));
+}
+
+/// `walk` handing out raw pointers to the fields (see `Fields`).
+fn walk_ptrs(plan: &mut Plan, f: &mut dyn FnMut(*mut i64)) {
+    const _: () = assert!(size_of::<usize>() == 8 && size_of::<isize>() == 8);
+    fn u(x: &mut usize, f: &mut dyn FnMut(*mut i64)) {
+        f(x as *mut usize as *mut i64)
     }
-    fn i(x: &mut isize, f: &mut dyn FnMut(&mut i64)) {
-        let mut v = *x as i64;
-        f(&mut v);
-        *x = v as isize;
+    fn i(x: &mut isize, f: &mut dyn FnMut(*mut i64)) {
+        f(x as *mut isize as *mut i64)
     }
-    fn view(v: &mut View, f: &mut dyn FnMut(&mut i64)) {
+    fn view(v: &mut View, f: &mut dyn FnMut(*mut i64)) {
         u(&mut v.offset, f);
         v.strides.iter_mut().for_each(|s| i(s, f));
     }
@@ -145,8 +149,9 @@ impl Sample {
 /// (a line), `verified` once a third compile on the line matched the extrapolation.
 pub(crate) enum Line {
     One(Sample),
-    /// `scratch`: the last predicted plan, patched in place when nobody holds it any more.
-    Two { a: Sample, b: Sample, verified: bool, scratch: Option<Arc<Plan>> },
+    /// `scratch`: the last predicted plan with pointers to its moving fields, patched in
+    /// place when nobody holds it any more. `moving`: the fields that differ between a and b.
+    Two { a: Sample, b: Sample, verified: bool, scratch: Option<(Arc<Plan>, Fields)>, moving: Option<Moving> },
 }
 
 /// `t = num / den` such that `dims = a + t (b - a)` component-wise, if any.
@@ -156,14 +161,15 @@ fn param(a: &[u64], b: &[u64], dims: &[u64]) -> Option<(i128, i128)> {
     }
     let mut t: Option<(i128, i128)> = None;
     for ((&x, &y), &z) in a.iter().zip(b).zip(dims) {
-        let (x, y, z) = (x as i128, y as i128, z as i128);
-        let (d, n) = (y - x, z - x);
-        if d == 0 {
-            if n != 0 {
+        if x == y {
+            // Most dims are fixed: plain compare, no wide math.
+            if z != x {
                 return None;
             }
             continue;
         }
+        let (x, y, z) = (x as i128, y as i128, z as i128);
+        let (d, n) = (y - x, z - x);
         match t {
             None => t = Some((n, d)),
             Some((tn, td)) => {
@@ -220,27 +226,94 @@ fn assign(p: &mut Plan, vals: &[i64]) {
     p.slot_bytes = slots;
 }
 
+/// Indices of the numeric fields that differ between the two samples of a line.
+pub(crate) struct Moving {
+    idx: Vec<usize>,
+}
+
+impl Moving {
+    fn new(a: &[i64], b: &[i64]) -> Moving {
+        Moving { idx: a.iter().zip(b).enumerate().filter(|(_, (x, y))| x != y).map(|(i, _)| i).collect() }
+    }
+}
+
+/// `extrapolate` restricted to the moving fields (the others equal both samples).
+fn extrapolate_moving(a: &[i64], b: &[i64], idx: &[usize], t: (i128, i128)) -> Option<Vec<i64>> {
+    let xs: Vec<i64> = idx.iter().map(|&i| a[i]).collect();
+    let ys: Vec<i64> = idx.iter().map(|&i| b[i]).collect();
+    extrapolate(&xs, &ys, t)
+}
+
+/// Raw pointers to the moving numeric fields of a plan (valid while the plan is neither
+/// moved out of its `Arc` nor resized; `assign` and `set_fields` only overwrite values).
+pub(crate) struct Fields(Vec<*mut i64>);
+
+// SAFETY: the pointers target the plan stored next to them in the same `Line`, which is only
+// accessed under the plan-cache lock.
+unsafe impl Send for Fields {}
+
+/// Pointers to the fields of `plan` at `idx` (walk order). Every numeric field is a
+/// usize / isize, stored as 8 bytes.
+fn field_ptrs(plan: &mut Plan, idx: &[usize]) -> Fields {
+    let mut out = Vec::with_capacity(idx.len());
+    let mut k = 0usize;
+    let mut next = idx.iter().peekable();
+    walk_ptrs(plan, &mut |p| {
+        if next.peek() == Some(&&k) {
+            out.push(p);
+            next.next();
+        }
+        k += 1;
+    });
+    Fields(out)
+}
+
+/// Write `vals` through `fields` (of `p`, which the caller holds exclusively).
+fn set_fields(p: &mut Plan, fields: &Fields, vals: &[i64]) {
+    for (&f, &v) in fields.0.iter().zip(vals) {
+        // SAFETY: `f` points into `p` (see `Fields`), which is borrowed mutably here.
+        unsafe { *f = v };
+    }
+    let mut slots = vec![0usize; p.slot_bytes.len()];
+    for b in &p.bufs {
+        if let PlanSrc::Temp(s) = b.src
+            && let Some(x) = slots.get_mut(s)
+        {
+            *x = (*x).max(b.bytes);
+        }
+    }
+    p.slot_bytes = slots;
+}
+
 impl Line {
     /// Predicted plan for `dims`, if this line is verified and `dims` lies on it.
     pub(crate) fn predict(&mut self, dims: &[u64]) -> Option<Arc<Plan>> {
-        let Line::Two { a, b, verified: true, scratch } = self else { return None };
+        let Line::Two { a, b, verified: true, scratch, moving } = self else { return None };
         let t = param(&a.dims, &b.dims, dims)?;
-        let vals = extrapolate(&a.nums, &b.nums, t)?;
-        if let Some(p) = scratch.as_mut().and_then(Arc::get_mut) {
-            assign(p, &vals);
+        let moving = moving.get_or_insert_with(|| Moving::new(&a.nums, &b.nums));
+        let vals = extrapolate_moving(&a.nums, &b.nums, &moving.idx, t)?;
+        if let Some((p, fields)) = scratch.as_mut().and_then(|(p, f)| Some((Arc::get_mut(p)?, f))) {
+            // Only the moving fields differ from the last prediction (same skeleton).
+            set_fields(p, fields, &vals);
         } else {
             let mut p = b.plan.clone_shallow();
-            assign(&mut p, &vals);
-            *scratch = Some(Arc::new(p));
+            let mut all = nums(&p);
+            for (&i, &v) in moving.idx.iter().zip(&vals) {
+                all[i] = v;
+            }
+            assign(&mut p, &all);
+            let fields = field_ptrs(&mut p, &moving.idx);
+            *scratch = Some((Arc::new(p), fields));
+            return scratch.as_ref().map(|(p, _)| p.clone());
         }
-        scratch.clone()
+        scratch.as_ref().map(|(p, _)| p.clone())
     }
 
     /// Record a freshly compiled sample.
     pub(crate) fn record(line: Option<Line>, s: Sample) -> Line {
         let pair = |b: Sample, s: Sample| {
             if b.dims != s.dims && same_skeleton(&skeleton(&b.plan), &skeleton(&s.plan)) {
-                Line::Two { a: b, b: s, verified: false, scratch: None }
+                Line::Two { a: b, b: s, verified: false, scratch: None, moving: None }
             } else {
                 Line::One(s)
             }
@@ -254,7 +327,7 @@ impl Line {
                     .and_then(|t| extrapolate(&a.nums, &b.nums, t))
                     .is_some_and(|v| v == s.nums && same_skeleton(&skeleton(&b.plan), &skeleton(&s.plan)));
                 if exact {
-                    Line::Two { a, b, verified: true, scratch: None }
+                    Line::Two { a, b, verified: true, scratch: None, moving: None }
                 } else {
                     // Off the line (the direction changed) or a mismatch: restart from the
                     // last two samples.

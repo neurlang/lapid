@@ -3,7 +3,7 @@
 use crate::bail;
 use crate::dtype::DType;
 use crate::error::Result;
-use crate::tensor::Tensor;
+use crate::tensor::{Shape, Tensor};
 
 /// Resolve `axis` (negative counts from the end) against `rank`.
 pub(crate) fn resolve_axis(axis: isize, rank: usize) -> Result<usize> {
@@ -16,9 +16,12 @@ pub(crate) fn resolve_axis(axis: isize, rank: usize) -> Result<usize> {
 }
 
 /// Numpy broadcast of two shapes (aligned at the trailing dim).
-pub(crate) fn broadcast_shapes(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
+pub(crate) fn broadcast_shapes(a: &[usize], b: &[usize]) -> Result<Shape> {
+    if a == b {
+        return Ok(Shape::from_slice(a));
+    }
     let rank = a.len().max(b.len());
-    let mut out = vec![0usize; rank];
+    let mut out = Shape::from_elem(0, rank);
     for i in 0..rank {
         let da = if i < rank - a.len() { 1 } else { a[i - (rank - a.len())] };
         let db = if i < rank - b.len() { 1 } else { b[i - (rank - b.len())] };
@@ -33,14 +36,15 @@ pub(crate) fn broadcast_shapes(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
 }
 
 /// Resolve a reshape target with at most one `usize::MAX` ("infer") dim.
-pub(crate) fn infer_shape(numel: usize, from: &[usize], to: &[usize]) -> Result<Vec<usize>> {
-    let mut shape = to.to_vec();
-    let inferred: Vec<usize> = (0..shape.len()).filter(|&i| shape[i] == usize::MAX).collect();
-    if inferred.len() > 1 {
+pub(crate) fn infer_shape(numel: usize, from: &[usize], to: &[usize]) -> Result<Shape> {
+    let mut shape = Shape::from_slice(to);
+    let mut inferred = (0..shape.len()).filter(|&i| shape[i] == usize::MAX);
+    let first = inferred.next();
+    if inferred.next().is_some() {
         bail!("invalid_argument", "reshape {to:?}: at most one dim may be inferred");
     }
     let known: usize = shape.iter().filter(|&&d| d != usize::MAX).product();
-    if let Some(&i) = inferred.first() {
+    if let Some(i) = first {
         if known == 0 || !numel.is_multiple_of(known) {
             bail!("shape_mismatch", "reshape {from:?} -> {to:?}: cannot infer dim");
         }

@@ -119,10 +119,17 @@ pub trait CausalLm: Sized + Send + Sync + 'static {
 
 /// Evaluate `outputs` with the staged state and commit it (`n` tokens fed).
 pub(crate) fn eval_commit<S: LmState>(device: &Device, outputs: &[&Tensor], state: &mut S, n: usize) -> Result<Vec<Tensor>> {
-    let mut outs: Vec<&Tensor> = outputs.to_vec();
-    outs.extend(state.staged());
-    let mut realized = match device.eval(&outs) {
-        Ok(r) if r.len() == outs.len() => r,
+    eval_commit_owned(device, outputs.iter().map(|t| (*t).clone()).collect(), state, n)
+}
+
+/// [`eval_commit`] taking the outputs: with the staged state moved out too, nothing else
+/// holds the step graph, so it is freed before it runs (`Device::eval_owned`).
+pub(crate) fn eval_commit_owned<S: LmState>(device: &Device, mut outs: Vec<Tensor>, state: &mut S, n: usize) -> Result<Vec<Tensor>> {
+    let n_out = outs.len();
+    outs.extend(state.take_staged());
+    let n_all = outs.len();
+    let mut realized = match device.eval_owned(outs) {
+        Ok(r) if r.len() == n_all => r,
         Ok(_) => {
             state.discard();
             return Err(Error::new("backend", "eval returned the wrong number of outputs"));
@@ -132,7 +139,7 @@ pub(crate) fn eval_commit<S: LmState>(device: &Device, outputs: &[&Tensor], stat
             return Err(e);
         }
     };
-    let st = realized.split_off(outputs.len());
+    let st = realized.split_off(n_out);
     state.commit(st, n)?;
     Ok(realized)
 }
@@ -145,7 +152,9 @@ pub fn step<M: CausalLm>(model: &M, device: &Device, ids: &[u32], state: &mut M:
     let chunks: Vec<&[u32]> = ids.chunks(model.prefill_chunk().max(1)).collect();
     let last = chunks.len() - 1;
     for (ci, chunk) in chunks.into_iter().enumerate() {
+        let _step = tracing::trace_span!("lm.step").entered();
         let rows = if ci == last { Rows::Last } else { Rows::None };
+        let build = tracing::trace_span!("lm.build").entered();
         let out = match model.forward(chunk, state, rows, &mut Taps::off()) {
             Ok(o) => o,
             Err(e) => {
@@ -153,11 +162,14 @@ pub fn step<M: CausalLm>(model: &M, device: &Device, ids: &[u32], state: &mut M:
                 return Err(e);
             }
         };
-        let outputs: Vec<&Tensor> = out.iter().collect();
-        let realized = eval_commit(device, &outputs, state, chunk.len())?;
+        drop(build);
+        let realized = eval_commit_owned(device, out.into_iter().collect(), state, chunk.len())?;
         if ci == last {
             let logits = realized.first().ok_or_else(|| Error::new("backend", "no logits realized"))?;
-            return device.to_vec_f32(logits);
+            let v = tracing::trace_span!("lm.read").in_scope(|| device.to_vec_f32(logits));
+            let _drop = tracing::trace_span!("lm.drop").entered();
+            drop(realized);
+            return v;
         }
     }
     Err(Error::new("internal", "prefill produced no logits"))

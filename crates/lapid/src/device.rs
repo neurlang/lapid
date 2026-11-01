@@ -155,6 +155,13 @@ impl Device {
         self.rt.eval(outputs)
     }
 
+    /// [`eval`](Self::eval) taking ownership of the output handles: they are released as
+    /// soon as the graph is planned, so a graph held by nothing else is freed before it runs
+    /// (cheaper than tearing it down afterwards, when its nodes are out of cache).
+    pub fn eval_owned(&self, outputs: Vec<Tensor>) -> Result<Vec<Tensor>> {
+        self.rt.eval_owned(outputs)
+    }
+
     /// Evaluate (if needed) and copy to host as f32 (casting f16/bf16/i32).
     pub fn to_vec_f32(&self, t: &Tensor) -> Result<Vec<f32>> {
         self.rt.to_vec_f32(t)

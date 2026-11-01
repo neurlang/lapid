@@ -7,12 +7,13 @@ pub mod error;
 pub mod fxhash;
 pub mod op;
 pub mod tensor;
+pub mod walk;
 
 pub use buffer::{DeviceBuffer, DeviceData, HostData};
 pub use dtype::DType;
 pub use error::{Error, Result};
 pub use op::{BinaryOp, Op, ReduceOp, UnaryOp};
-pub use tensor::{Node, Tensor};
+pub use tensor::{Node, Shape, Srcs, Tensor};
 
 /// Topologically sorted list of all nodes reachable from `outputs` (srcs before users),
 /// deduplicated by id.

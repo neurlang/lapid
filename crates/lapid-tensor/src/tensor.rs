@@ -11,7 +11,6 @@
 //! have exactly the output shape. Scalars (`*_scalar`) become `Op::Const` nodes of the
 //! output shape and dtype.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bail;
@@ -19,11 +18,13 @@ use crate::buffer::{DeviceData, HostData};
 use crate::dtype::DType;
 use crate::error::Result;
 use crate::op::{BinaryOp, Op, ReduceOp, UnaryOp};
+use smallvec::{SmallVec, smallvec};
 
 mod check;
 mod index;
 mod linalg;
 mod moe;
+mod node;
 #[cfg(test)]
 mod tests;
 
@@ -35,27 +36,25 @@ pub fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-#[derive(Debug)]
-pub struct Node {
-    /// Unique, monotonically increasing id (creation order => valid topological order).
-    pub id: u64,
-    pub op: Op,
-    pub src: Vec<Tensor>,
-    pub shape: Vec<usize>,
-    pub dtype: DType,
-    /// Optional debug name (e.g. "encoder.blocks.3.attn.out"). Used by lapid-verify to
-    /// match reference activations. Set with `Tensor::named`.
-    pub name: Option<String>,
-}
+use node::NodeRef;
+pub use node::{Node, Shape, Srcs};
 
 #[derive(Clone, Debug)]
-pub struct Tensor(pub Arc<Node>);
+pub struct Tensor(pub(crate) NodeRef);
 
 impl Tensor {
     // ---------- raw construction ----------
     /// Create a node. No validation — builders below validate before calling this.
-    pub fn from_op(op: Op, src: Vec<Tensor>, shape: Vec<usize>, dtype: DType) -> Tensor {
-        Tensor(Arc::new(Node { id: next_id(), op, src, shape, dtype, name: None }))
+    pub fn from_op(op: Op, src: impl Into<Srcs>, shape: impl Into<Shape>, dtype: DType) -> Tensor {
+        Tensor(NodeRef::new(Node {
+            id: next_id(),
+            op,
+            src: src.into(),
+            shape: shape.into(),
+            dtype,
+            name: None,
+            mark: Default::default(),
+        }))
     }
 
     pub fn id(&self) -> u64 {
@@ -85,13 +84,14 @@ impl Tensor {
     /// Returns a tensor that is the same node content with a debug name attached
     /// (a new node with identical op/src; cheap).
     pub fn named(&self, name: impl Into<String>) -> Tensor {
-        Tensor(Arc::new(Node {
+        Tensor(NodeRef::new(Node {
             id: next_id(),
             op: self.op().clone(),
-            src: self.src().to_vec(),
-            shape: self.shape().to_vec(),
+            src: self.src().into(),
+            shape: self.shape().into(),
             dtype: self.dtype(),
-            name: Some(name.into()),
+            name: Some(name.into().into_boxed_str()),
+            mark: Default::default(),
         }))
     }
     /// Resolve a possibly-negative axis.
@@ -110,10 +110,10 @@ impl Tensor {
                 dtype.name()
             );
         }
-        Ok(Tensor::from_op(Op::Host(data), vec![], shape.to_vec(), dtype))
+        Ok(Tensor::from_op(Op::Host(data), Srcs::new(), shape, dtype))
     }
     pub fn from_device(data: DeviceData, shape: &[usize], dtype: DType) -> Tensor {
-        Tensor::from_op(Op::Device(data), vec![], shape.to_vec(), dtype)
+        Tensor::from_op(Op::Device(data), Srcs::new(), shape, dtype)
     }
     pub fn from_f32(data: &[f32], shape: &[usize]) -> Result<Tensor> {
         check::numel_matches(data.len(), shape)?;
@@ -126,7 +126,7 @@ impl Tensor {
         Tensor::from_host(HostData::from_vec(bytes), shape, DType::I32)
     }
     pub fn full(value: f64, shape: &[usize], dtype: DType) -> Tensor {
-        Tensor::from_op(Op::Const(value), vec![], shape.to_vec(), dtype)
+        Tensor::from_op(Op::Const(value), Srcs::new(), shape, dtype)
     }
     pub fn zeros(shape: &[usize], dtype: DType) -> Tensor {
         Tensor::full(0.0, shape, dtype)
@@ -139,7 +139,7 @@ impl Tensor {
         if !(dt.is_float() || int_ok) {
             bail!("unsupported_dtype", "unary {op:?} is not defined for {}", dt.name());
         }
-        Ok(Tensor::from_op(Op::Unary(op), vec![self.clone()], self.shape().to_vec(), dt))
+        Ok(Tensor::from_op(Op::Unary(op), smallvec![self.clone()], self.shape(), dt))
     }
     pub fn binary(&self, op: BinaryOp, rhs: &Tensor) -> Result<Tensor> {
         check::elementwise_dtype(self, "binary")?;
@@ -156,13 +156,13 @@ impl Tensor {
         let shape = broadcast_shapes(self.shape(), rhs.shape())?;
         let a = self.broadcast_to(&shape)?;
         let b = rhs.broadcast_to(&shape)?;
-        Ok(Tensor::from_op(Op::Binary(op), vec![a, b], shape, self.dtype()))
+        Ok(Tensor::from_op(Op::Binary(op), smallvec![a, b], shape, self.dtype()))
     }
     pub fn binary_scalar(&self, op: BinaryOp, rhs: f64) -> Result<Tensor> {
         check::elementwise_dtype(self, "binary")?;
         index::check_int_only(op, self.dtype())?;
         let c = Tensor::full(rhs, self.shape(), self.dtype());
-        Ok(Tensor::from_op(Op::Binary(op), vec![self.clone(), c], self.shape().to_vec(), self.dtype()))
+        Ok(Tensor::from_op(Op::Binary(op), smallvec![self.clone(), c], self.shape(), self.dtype()))
     }
     pub fn add(&self, rhs: &Tensor) -> Result<Tensor> {
         self.binary(BinaryOp::Add, rhs)
@@ -230,7 +230,7 @@ impl Tensor {
             );
         }
         let shape = broadcast_shapes(&broadcast_shapes(cond.shape(), a.shape())?, b.shape())?;
-        let srcs = vec![cond.broadcast_to(&shape)?, a.broadcast_to(&shape)?, b.broadcast_to(&shape)?];
+        let srcs: Srcs = smallvec![cond.broadcast_to(&shape)?, a.broadcast_to(&shape)?, b.broadcast_to(&shape)?];
         Ok(Tensor::from_op(Op::Where, srcs, shape, a.dtype()))
     }
     pub fn cast(&self, dtype: DType) -> Result<Tensor> {
@@ -245,20 +245,20 @@ impl Tensor {
         if self.dtype() == dtype {
             return Ok(self.clone());
         }
-        Ok(Tensor::from_op(Op::Cast(dtype), vec![self.clone()], self.shape().to_vec(), dtype))
+        Ok(Tensor::from_op(Op::Cast(dtype), smallvec![self.clone()], self.shape(), dtype))
     }
 
     // ---------- reductions ----------
     pub fn reduce(&self, op: ReduceOp, axis: isize, keepdim: bool) -> Result<Tensor> {
         check::elementwise_dtype(self, "reduce")?;
         let axis = self.axis(axis)?;
-        let mut shape = self.shape().to_vec();
+        let mut shape = Shape::from_slice(self.shape());
         if keepdim {
             shape[axis] = 1;
         } else {
             shape.remove(axis);
         }
-        Ok(Tensor::from_op(Op::Reduce { op, axis, keepdim }, vec![self.clone()], shape, self.dtype()))
+        Ok(Tensor::from_op(Op::Reduce { op, axis, keepdim }, smallvec![self.clone()], shape, self.dtype()))
     }
     pub fn sum(&self, axis: isize, keepdim: bool) -> Result<Tensor> {
         self.reduce(ReduceOp::Sum, axis, keepdim)
@@ -282,7 +282,7 @@ impl Tensor {
     /// One dim may be usize::MAX meaning "infer".
     pub fn reshape(&self, shape: &[usize]) -> Result<Tensor> {
         let shape = check::infer_shape(self.numel(), self.shape(), shape)?;
-        if shape == self.shape() {
+        if shape[..] == *self.shape() {
             return Ok(self.clone());
         }
         if self.dtype().is_quant() {
@@ -293,24 +293,24 @@ impl Tensor {
                 self.shape()
             );
         }
-        Ok(Tensor::from_op(Op::Reshape, vec![self.clone()], shape, self.dtype()))
+        Ok(Tensor::from_op(Op::Reshape, smallvec![self.clone()], shape, self.dtype()))
     }
     pub fn permute(&self, perm: &[usize]) -> Result<Tensor> {
         check::not_quant(self, "permute")?;
         let rank = self.rank();
-        let mut seen = vec![false; rank];
+        let mut seen: SmallVec<[bool; 8]> = SmallVec::from_elem(false, rank);
         if perm.len() != rank || !perm.iter().all(|&p| p < rank && !std::mem::replace(&mut seen[p], true)) {
             bail!("invalid_argument", "permute: {perm:?} is not a permutation of 0..{rank}");
         }
         if perm.iter().enumerate().all(|(i, &p)| i == p) {
             return Ok(self.clone());
         }
-        let shape = perm.iter().map(|&p| self.shape()[p]).collect();
-        Ok(Tensor::from_op(Op::Permute(perm.to_vec()), vec![self.clone()], shape, self.dtype()))
+        let shape: Shape = perm.iter().map(|&p| self.shape()[p]).collect();
+        Ok(Tensor::from_op(Op::Permute(perm.to_vec()), smallvec![self.clone()], shape, self.dtype()))
     }
     pub fn transpose(&self, a: isize, b: isize) -> Result<Tensor> {
         let (a, b) = (self.axis(a)?, self.axis(b)?);
-        let mut perm: Vec<usize> = (0..self.rank()).collect();
+        let mut perm: Shape = (0..self.rank()).collect();
         perm.swap(a, b);
         self.permute(&perm)
     }
@@ -320,7 +320,7 @@ impl Tensor {
     }
     pub fn unsqueeze(&self, axis: isize) -> Result<Tensor> {
         let axis = check::resolve_axis(axis, self.rank() + 1)?;
-        let mut shape = self.shape().to_vec();
+        let mut shape = Shape::from_slice(self.shape());
         shape.insert(axis, 1);
         self.reshape(&shape)
     }
@@ -329,7 +329,7 @@ impl Tensor {
         if self.shape()[axis] != 1 {
             bail!("shape_mismatch", "squeeze: axis {axis} of {:?} has size {} (must be 1)", self.shape(), self.shape()[axis]);
         }
-        let mut shape = self.shape().to_vec();
+        let mut shape = Shape::from_slice(self.shape());
         shape.remove(axis);
         self.reshape(&shape)
     }
@@ -343,9 +343,9 @@ impl Tensor {
         if start == 0 && end == dim {
             return Ok(self.clone());
         }
-        let mut shape = self.shape().to_vec();
+        let mut shape = Shape::from_slice(self.shape());
         shape[axis] = end - start;
-        Ok(Tensor::from_op(Op::Slice { axis, start, end }, vec![self.clone()], shape, self.dtype()))
+        Ok(Tensor::from_op(Op::Slice { axis, start, end }, smallvec![self.clone()], shape, self.dtype()))
     }
     pub fn pad(&self, axis: isize, before: usize, after: usize, value: f64) -> Result<Tensor> {
         check::not_quant(self, "pad")?;
@@ -353,9 +353,9 @@ impl Tensor {
         if before == 0 && after == 0 {
             return Ok(self.clone());
         }
-        let mut shape = self.shape().to_vec();
+        let mut shape = Shape::from_slice(self.shape());
         shape[axis] += before + after;
-        Ok(Tensor::from_op(Op::Pad { axis, before, after, value }, vec![self.clone()], shape, self.dtype()))
+        Ok(Tensor::from_op(Op::Pad { axis, before, after, value }, smallvec![self.clone()], shape, self.dtype()))
     }
     pub fn cat(tensors: &[&Tensor], axis: isize) -> Result<Tensor> {
         let Some(first) = tensors.first() else {
@@ -379,7 +379,7 @@ impl Tensor {
             0 => Ok((*first).clone()),
             1 => Ok(parts[0].clone()),
             _ => {
-                let mut shape = first.shape().to_vec();
+                let mut shape = Shape::from_slice(first.shape());
                 shape[axis] = parts.iter().map(|t| t.shape()[axis]).sum();
                 let dtype = first.dtype();
                 Ok(Tensor::from_op(Op::Cat { axis }, parts, shape, dtype))
@@ -388,7 +388,7 @@ impl Tensor {
     }
     pub fn contiguous(&self) -> Result<Tensor> {
         check::not_quant(self, "contiguous")?;
-        Ok(Tensor::from_op(Op::Contiguous, vec![self.clone()], self.shape().to_vec(), self.dtype()))
+        Ok(Tensor::from_op(Op::Contiguous, smallvec![self.clone()], self.shape(), self.dtype()))
     }
 
     // ---------- linear algebra / indexing ----------
@@ -448,7 +448,7 @@ impl Tensor {
             bail!("shape_mismatch", "cannot broadcast {:?} to {shape:?}", self.shape());
         }
         let t = if lead > 0 {
-            let mut padded = vec![1usize; lead];
+            let mut padded = Shape::from_elem(1, lead);
             padded.extend_from_slice(self.shape());
             self.reshape(&padded)?
         } else {
@@ -458,6 +458,6 @@ impl Tensor {
             return Ok(t);
         }
         let dtype = t.dtype();
-        Ok(Tensor::from_op(Op::Expand, vec![t], shape.to_vec(), dtype))
+        Ok(Tensor::from_op(Op::Expand, smallvec![t], shape, dtype))
     }
 }
