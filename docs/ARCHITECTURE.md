@@ -69,6 +69,17 @@ kernel serves every shape — e.g. a growing KV cache never recompiles.
 - **Quantization:** `int8` / `int4` with a per-block scale; block size is an attribute of the tensor.
 - **Import:** generic readers (safetensors, …); each model's conversion lives with the model.
 
+## Adding a model
+
+A model is only its own math: about 300 to 500 lines. Everything else is shared and reused:
+
+- **Pipelines:** causal LM (prefill, KV cache, sampling, chat), transducer, seq2seq, streaming, TTS, embedding.
+- **Building blocks:** attention variants, convolutions, norms, MLPs, RoPE, audio features, tokenizers.
+- **Conversion:** a generic converter plus a declarative weight-name map per model.
+- **Verification and benchmarks:** a generic harness driven by a short per-model description.
+
+If a model needs more than that, the missing piece belongs in the shared layer, not in the model.
+
 ## Verification
 
 A reference run of the original PyTorch model saves named activations. lapid runs the same inputs,
