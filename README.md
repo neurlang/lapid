@@ -11,7 +11,7 @@ CUDA · Vulkan · Metal · WebGPU · CPU: one build, nothing to install.
 
 </div>
 
-## Why lapid
+## Highlights
 
 - 📦 **No SDKs**: no CUDA toolkit, Vulkan SDK or C++ compiler. Drivers load at runtime.
 - 🪶 **Small models**: runs quantized weights (`fp16`, `int8`, `int4`, GGUF) to use less memory.
