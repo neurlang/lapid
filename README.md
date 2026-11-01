@@ -16,7 +16,6 @@ CUDA · Vulkan · Metal · WebGPU · CPU: one build, nothing to install.
 - 📦 **No SDKs**: no CUDA toolkit, Vulkan SDK or C++ compiler. Drivers load at runtime.
 - 🪶 **Small models**: runs quantized weights (`fp16`, `int8`, `int4`, GGUF) to use less memory.
 - 📄 **One file per model**: weights + tokenizer in a single `.lapid`. Imports safetensors and GGUF.
-- 🔬 **Verified**: every model is checked layer by layer against PyTorch.
 
 ## Quick start
 
