@@ -12,7 +12,7 @@
 ## Highlights
 
 - 📦 **Just `cargo add`**: builds anywhere with plain Rust; GPU drivers are picked up at runtime.
-- 🪶 **Small models**: runs quantized weights (`fp16`, `int8`, `int4`, GGUF) to use less memory.
+- 🛠️ **Hackable**: models and GPU kernels are plain, readable code you can change.
 - 🖥️ **Every GPU**: CUDA, Vulkan, Metal and WebGPU, with a fast CPU fallback.
 - 🤗 **Hugging Face and GGUF**: load models straight from the Hub or a `.gguf` file.
 
