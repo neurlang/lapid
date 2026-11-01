@@ -16,7 +16,7 @@
 - 🖥️ **Every GPU**: CUDA, Vulkan, Metal and WebGPU, with a fast CPU fallback.
 - 🤗 **Hugging Face and GGUF**: load models straight from the Hub or a `.gguf` file.
 
-## How it compares
+## Why Lapid
 
 - **vs ONNX Runtime**: fast on every GPU, not only NVIDIA, and a small Rust library you can change.
 - **vs llama.cpp**: one build for all GPUs, no SDKs to install.
