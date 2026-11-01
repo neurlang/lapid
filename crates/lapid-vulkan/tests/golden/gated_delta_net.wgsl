@@ -66,7 +66,8 @@ fn st(e: u32, v: f32) {
     out[e] = v;
 }
 
-const MAXP: u32 = 16u;
+// state rows per lane (ceil(Dk / lanes), baked in)
+const NP: u32 = 4u;
 
 fn colsum(x: f32, lane: u32, slot: u32) -> f32 {
     return subgroupAdd(x);
@@ -85,7 +86,6 @@ fn kernel(wg_lin: u32, wg_total: u32) {
     let lane = g_sgi;
     let lanes = g_sgs;
     let cols = g_nsg;
-    let np = (DK + lanes - 1u) / lanes;
     for (var item = wg_lin; item < items; item += wg_total) {
         let cb = item % ncb;
         let bh = item / ncb;
@@ -93,12 +93,12 @@ fn kernel(wg_lin: u32, wg_total: u32) {
         let b = bh / H;
         let j = cb * cols + slot;
         let act = j < DV;
-        var S: array<f32, MAXP>;
+        var S: array<f32, NP>;
         let sbase = bh * DK * DV;
-        for (var p = 0u; p < MAXP; p += 1u) {
+        for (var p = 0u; p < NP; p += 1u) {
             let i = lane + p * lanes;
             S[p] = 0.0;
-            if (act && p < np && i < DK) {
+            if (act && i < DK) {
                 S[p] = state[sbase + i * DV + j];
             }
         }
@@ -108,7 +108,7 @@ fn kernel(wg_lin: u32, wg_total: u32) {
             let eg = exp(g[r]);
             let bt = beta[r];
             var kv: f32 = 0.0;
-            for (var p = 0u; p < np; p += 1u) {
+            for (var p = 0u; p < NP; p += 1u) {
                 let i = lane + p * lanes;
                 if (i < DK) {
                     S[p] = S[p] * eg;
@@ -122,7 +122,7 @@ fn kernel(wg_lin: u32, wg_total: u32) {
             }
             let dl = bt * (vj - ks);
             var qv: f32 = 0.0;
-            for (var p = 0u; p < np; p += 1u) {
+            for (var p = 0u; p < NP; p += 1u) {
                 let i = lane + p * lanes;
                 if (i < DK) {
                     S[p] = S[p] + k[r * DK + i] * dl;
@@ -134,7 +134,7 @@ fn kernel(wg_lin: u32, wg_total: u32) {
                 st(obase + t * DV + j, o * scale);
             }
         }
-        for (var p = 0u; p < np; p += 1u) {
+        for (var p = 0u; p < NP; p += 1u) {
             let i = lane + p * lanes;
             if (act && i < DK) {
                 st(obase + (T + i) * DV + j, S[p]);

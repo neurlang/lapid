@@ -57,6 +57,10 @@ fn idiv_up(a: u32, b: u32) -> u32 {
 // The epilogue stages each accumulator through shared memory.
 // Params: [batch, m, n, k, a.off, a.bs, a.rs, b.off, b.bs, b.rs, scales_words, tiles_n,
 //          tiles_m, out(off, bs, rs), extra_e(off, s_batch, s_m, s_n)...]
+// ID (grouped MoE GEMM after `moe_route`): tiles_m = tile slots, b.bs = expert stride
+// (b array elements / words), P[16] = R, P[17] = E; scratch S = [row offsets (E + 1),
+// tile offsets (E + 1), pair list]; A rows are gathered (token = pair / R), output rows
+// scattered (pair), the expert's weights start at g_eb (quantized) / b_base (float).
 @group(0) @binding(1) var<storage, read> a: array<f32>;
 fn ld_a(e: u32) -> f32 {
     return a[e];
@@ -188,8 +192,8 @@ fn kernel(wg_lin: u32, wg_total: u32) {
         let rest = item / tiles_n;
         let tm = rest % tiles_m;
         let bt = rest / tiles_m;
-        let row0 = tm * BM;
         let col0 = tn * BN;
+        let row0 = tm * BM;
         let a_base = P[4] + bt * P[5];
         let b_base = P[7] + bt * P[8];
         var c00 = coop_mat16x16<f32, C>();

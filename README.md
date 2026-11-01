@@ -16,16 +16,18 @@
 - 🖥️ **Every GPU**: CUDA, Vulkan, Metal and WebGPU, with a fast CPU fallback.
 - 🤗 **Hugging Face and GGUF**: load models straight from the Hub or a `.gguf` file.
 
-## Why
+## How it compares
 
-| | In short |
-|---|---|
-| **ONNX Runtime** | Fast on NVIDIA, slow on other GPUs, big and hard to change |
-| **llama.cpp** | Fast, but you need a different build for each GPU |
-| **Candle** | Supports few GPUs |
-| **Burn** | Made for training |
-| **Tract** | Runs only on CPU |
-| **Lapid** | One small Rust library, fast on every GPU, and you can read and change all of it |
+| | Every GPU | One build, no SDKs | Pure Rust | Made for inference |
+|---|:---:|:---:|:---:|:---:|
+| ONNX Runtime | ⚠️ | ❌ | ❌ | ✅ |
+| llama.cpp | ✅ | ❌ | ❌ | ✅ |
+| Candle | ⚠️ | ❌ | ✅ | ✅ |
+| Burn | ✅ | ⚠️ | ✅ | ❌ |
+| Tract | ❌ | ✅ | ✅ | ✅ |
+| **Lapid** | ✅ | ✅ | ✅ | ✅ |
+
+⚠️ partly
 
 ## Quick start
 
