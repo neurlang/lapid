@@ -25,8 +25,21 @@
 ## Quick start
 
 ```sh
-cargo add lapid
+cargo add lapid lapid-hub
 ```
+
+Transcribe audio with Parakeet TDT:
+
+```rust
+use lapid::Device;
+use lapid_hub::{Parakeet, parakeet::TranscribeOptions};
+
+let model = Parakeet::from_hub("nvidia/parakeet-tdt-0.6b-v3", "int8", &Device::best())?;
+let out = model.transcribe_file("audio.wav".as_ref(), &TranscribeOptions::default())?;
+println!("{}", out.text);
+```
+
+Or use the tensor engine directly:
 
 ```rust
 use lapid::{Device, Tensor};
