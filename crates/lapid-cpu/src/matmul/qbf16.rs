@@ -1,8 +1,9 @@
 //! Quantized-B GEMM for larger m (encoder, prefill) with bf16 `bfmmla` (aarch64 BF16).
 //!
-//! Activations are rounded to bf16 per element (no int8 activation blocks); int8 / int4
+//! Activations are split into hi + lo bf16 halves (no int8 activation blocks); int8 / int4
 //! weights are exact (their integer quants are bf16 values) with the f16 group scale applied
-//! per 32-group in f32, K-quant weights are dequantized to bf16. f32 accumulation:
+//! per 32-group in f32, K-quant weights are dequantized and split into hi + lo bf16 too, so
+//! results match f32 math on the dequantized weights to ~1e-5 (see `split_mode`). f32 accumulation:
 //! `bfmmla` multiplies a 2x4 bf16 block by a 4x2 block into a 2x2 f32 tile, 4x the MACs of
 //! an f32 `fmla` per instruction.
 //!
@@ -36,11 +37,16 @@ fn bf16(x: f32) -> u16 {
     half::bf16::from_f32(x).to_bits()
 }
 
-/// Activations as hi + lo bf16 pairs (two `bfmmla` per chunk, ~16 mantissa bits: int8/int4
-/// weights then multiply nearly f32-exact activations). `LAPID_CPU_BF16_SPLIT=0`: hi only.
-fn split_a() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LAPID_CPU_BF16_SPLIT").map_or(true, |v| v.trim() != "0"))
+/// Operand splitting into hi + lo bf16 halves: `LAPID_CPU_BF16_SPLIT=0` none (plain bf16
+/// rounding, fastest), `a` activations only (int8/int4 exact, K-quant weights rounded to
+/// bf16), default both (K-quant weights too; ~f32 exact, ~1.5x the time on K-quants).
+fn split_mode() -> (bool, bool) {
+    static MODE: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("LAPID_CPU_BF16_SPLIT").as_deref().map(str::trim) {
+        Ok("0") => (false, false),
+        Ok("a") => (true, false),
+        _ => (true, true),
+    })
 }
 
 /// Residual of `r` after bf16 rounding (in place: `r[i] -= bf16(r[i])`).
@@ -86,12 +92,16 @@ fn imp(ctx: &Ctx, ws: &mut Workspace, a: &AOp, b: &QMat, d: &MatMulDims, epi: &E
     let pair = kc * 8;
 
     let kg = k / GROUP;
-    let split = split_a();
+    let (split, split_k) = split_mode();
     // A pair p: hi at `p * apair`, lo (if split) right after it.
     let apair = if split { 2 * pair } else { pair };
+    // K-quant weights are not bf16 values: B pair p gets a lo (residual) half too, so the
+    // products are a_hi*b_hi + a_lo*b_hi + a_hi*b_lo (~f32 exact).
+    let split_b = split_k && b.is_k();
+    let bpair = if split_b { 2 * pair } else { pair };
     let Workspace { ha, hb, psb, .. } = ws;
     let ha = grow(ha, rpairs * apair);
-    let hb = grow(hb, cpairs * pair);
+    let hb = grow(hb, cpairs * bpair);
     let psb = grow(psb, cpairs * kg * 4);
 
     // 1. A rows → bf16 pairs.
@@ -129,7 +139,7 @@ fn imp(ctx: &Ctx, ws: &mut Workspace, a: &AOp, b: &QMat, d: &MatMulDims, epi: &E
             // SAFETY: column pair cp owns its `pair` elements and `kg * 4` scales.
             let (dst, ds) = unsafe {
                 (
-                    std::slice::from_raw_parts_mut(hp.0.add(cp * pair), pair),
+                    std::slice::from_raw_parts_mut(hp.0.add(cp * bpair), bpair),
                     std::slice::from_raw_parts_mut(sp.0.add(cp * kg * 4), kg * 4),
                 )
             };
@@ -155,7 +165,13 @@ fn imp(ctx: &Ctx, ws: &mut Workspace, a: &AOp, b: &QMat, d: &MatMulDims, epi: &E
             for (g, s) in sc.iter().enumerate() {
                 ds[g * 4..g * 4 + 4].copy_from_slice(&[s[0], s[1], s[0], s[1]]);
             }
-            pack_pair((cols[0] < n).then_some(&t0[..]), (cols[1] < n).then_some(&t1[..]), k, dst);
+            let (hi, lo) = dst.split_at_mut(pair);
+            pack_pair((cols[0] < n).then_some(&t0[..]), (cols[1] < n).then_some(&t1[..]), k, hi);
+            if split_b {
+                residual(t0);
+                residual(t1);
+                pack_pair((cols[0] < n).then_some(&t0[..]), (cols[1] < n).then_some(&t1[..]), k, lo);
+            }
         });
     }
     let (ha, hb, psb): (&[u16], &[u16], &[f32]) = (ha, hb, psb);
@@ -184,11 +200,11 @@ fn imp(ctx: &Ctx, ws: &mut Workspace, a: &AOp, b: &QMat, d: &MatMulDims, epi: &E
                     let tile = unsafe {
                         kernel_4x8(
                             &ha[(r / 2) * apair + c0 * 8..],
-                            &hb[(c / 2) * pair + c0 * 8..],
+                            &hb[(c / 2) * bpair + c0 * 8..],
                             &psb[((c / 2) * kg + c0 / 8) * 4..],
                             cn / 8,
-                            (apair, pair, kg * 4),
-                            split.then_some(pair),
+                            (apair, bpair, kg * 4),
+                            (split.then_some(pair), split_b.then_some(pair)),
                         )
                     };
                     let valid_c = (j1 - c).min(8);
@@ -237,7 +253,7 @@ unsafe fn bfmmla(
 
 /// 4 rows (2 pairs from `pa`) x 8 columns (4 pairs from `pb`, scales `sb`) over `groups`
 /// 32-groups (8 chunks each); A pairs are `pas`, B pairs `ps` elements / `ss` scales apart.
-/// `lo`: offset of each A pair's low (residual) half, multiplied with the same B.
+/// `lo`: offsets of each A / B pair's low (residual) half (`a_lo * b_hi`, `a_hi * b_lo`).
 ///
 /// # Safety
 /// `pa` holds 2 and `pb` / `sb` 4 pairs of at least `groups` groups; the CPU supports BF16.
@@ -249,7 +265,7 @@ unsafe fn kernel_4x8(
     sb: &[f32],
     groups: usize,
     (pas, ps, ss): (usize, usize, usize),
-    lo: Option<usize>,
+    (lo, blo): (Option<usize>, Option<usize>),
 ) -> [[f32; 8]; 4] {
     use std::arch::aarch64::*;
     // SAFETY: bounds per the function contract.
@@ -271,6 +287,19 @@ unsafe fn kernel_4x8(
                     for pr in 0..2 {
                         for pc in 0..4 {
                             t[pr][pc] = bfmmla(t[pr][pc], al[pr], bv[pc]);
+                        }
+                    }
+                }
+                if let Some(lo) = blo {
+                    let bl = [
+                        vld1q_u16(b.add(lo + c * 8)),
+                        vld1q_u16(b.add(ps + lo + c * 8)),
+                        vld1q_u16(b.add(2 * ps + lo + c * 8)),
+                        vld1q_u16(b.add(3 * ps + lo + c * 8)),
+                    ];
+                    for pr in 0..2 {
+                        for pc in 0..4 {
+                            t[pr][pc] = bfmmla(t[pr][pc], av[pr], bl[pc]);
                         }
                     }
                 }

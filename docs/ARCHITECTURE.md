@@ -39,7 +39,7 @@ until `Device::eval`.
 
 ## The compiler
 
-1. **Views.** Movement ops become strided views — no copies for reshape, permute, broadcast or slice.
+1. **Views.** Movement ops become strided views: no copies for reshape, permute, broadcast or slice.
 2. **Fusion.** Elementwise chains are inlined into their consumer: matmul epilogues
    (`linear + bias + gelu` is one kernel), reduce prologues, attention inputs.
 3. **Lowering.** The result is a list of launches over a small kernel IR: elementwise, reduce,
@@ -47,7 +47,7 @@ until `Device::eval`.
 4. **Memory.** Temporaries share memory slots by liveness.
 
 Each kernel has a *spec* (structure, cached) and *dims* (sizes, passed at launch), so one compiled
-kernel serves every shape — e.g. a growing KV cache never recompiles.
+kernel serves every shape: e.g. a growing KV cache never recompiles.
 
 ## Backends
 
@@ -60,7 +60,7 @@ kernel serves every shape — e.g. a growing KV cache never recompiles.
 - **Metal:** kernels are `.metal` templates with slots (`simdgroup_matrix` matmul and attention),
   compiled by the system Metal compiler at runtime; unified-memory buffers, zero-copy uploads.
 - **CUDA:** kernels are PTX templates with slots, JIT-compiled by the driver; the driver is loaded
-  at runtime — no CUDA toolkit needed to build or run.
+  at runtime: no CUDA toolkit needed to build or run.
 
 ## Data
 

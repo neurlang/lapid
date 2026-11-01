@@ -2,7 +2,7 @@
 //!
 //! Layers hold device tensors and build lazy graph nodes; nothing runs until `Device::eval`.
 
-use lapid::{DType, Error, Result, Tensor, UnaryOp, bail};
+use lapid::{DType, Error, Result, Tensor, bail};
 
 use crate::weights::fake_quant_act;
 

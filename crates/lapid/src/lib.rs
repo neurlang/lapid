@@ -14,7 +14,7 @@ mod runtime;
 
 pub use device::{Device, DeviceInfo};
 pub use file::LapidFile;
-pub use log::set_log_hook;
+pub use log::{LogHook, set_log_hook};
 pub use lapid_tensor::{
     BinaryOp, DType, DeviceBuffer, DeviceData, Error, HostData, Op, ReduceOp, Result, Tensor,
     UnaryOp, bail,
