@@ -140,7 +140,7 @@ fn cases() -> Vec<(&'static str, Key, bool)> {
             Key::MatMulId(Arc::new(MatMulIdSpec { x_dtype: DType::F32, w_dtype: DType::Int8, out_dtype: DType::F32 })),
             false,
         ),
-        ("gated_delta_net", Key::GatedDeltaNet(Arc::new(GatedDeltaNetSpec { out_dtype: DType::F32 })), true),
+        ("gated_delta_net", Key::GatedDeltaNet(Arc::new(GatedDeltaNetSpec { out_dtype: DType::F32 }), 4), true),
     ]
 }
 

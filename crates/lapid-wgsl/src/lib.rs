@@ -144,8 +144,8 @@ pub enum Key {
     MoeRoute(u32),
     /// MoE prefill stage 2: grouped cooperative-matrix GEMM over the routed pairs.
     GemmIdCoop(Arc<MatMulIdSpec>),
-    /// Gated delta rule (one lane group per state column).
-    GatedDeltaNet(Arc<GatedDeltaNetSpec>),
+    /// Gated delta rule (one lane group per state column; state rows per lane baked in).
+    GatedDeltaNet(Arc<GatedDeltaNetSpec>, u32),
 }
 
 /// Backend buffer bound after a kernel's output.
@@ -169,7 +169,7 @@ impl Key {
             Key::Gather(_) | Key::GatherAxis(_) => 2,
             Key::TopK(..) => 1,
             Key::MatMulId(_) | Key::MoeRoute(_) | Key::GemmIdCoop(_) => 3,
-            Key::GatedDeltaNet(_) => 6,
+            Key::GatedDeltaNet(..) => 6,
             Key::Softmax(_) => 1,
             Key::LayerNorm(_) => 3,
             Key::RmsNorm(_) => 2,
@@ -204,7 +204,7 @@ impl Key {
             && match self {
                 Key::Reduce(_, row) => *row,
                 Key::TopK(_, argmax) => *argmax,
-                Key::Gemv(..) | Key::MatMulId(_) | Key::GatedDeltaNet(_) | Key::GemmCoop(_) | Key::GemmIdCoop(_) | Key::Softmax(_) | Key::LayerNorm(_) | Key::RmsNorm(_) | Key::AttnSplit(..) | Key::AttnCoop(_) => true,
+                Key::Gemv(..) | Key::MatMulId(_) | Key::GatedDeltaNet(..) | Key::GemmCoop(_) | Key::GemmIdCoop(_) | Key::Softmax(_) | Key::LayerNorm(_) | Key::RmsNorm(_) | Key::AttnSplit(..) | Key::AttnCoop(_) => true,
                 _ => false,
             }
     }
@@ -243,7 +243,7 @@ impl Key {
             Key::MatMulId(_) => "matmul_id",
             Key::MoeRoute(_) => "moe_route",
             Key::GemmIdCoop(_) => "gemm_id_coop",
-            Key::GatedDeltaNet(_) => "gated_delta_net",
+            Key::GatedDeltaNet(..) => "gated_delta_net",
         }
     }
 }
@@ -306,7 +306,7 @@ pub fn source(key: &Key, caps: &Caps) -> String {
         Key::MatMulId(s) => moe::source(s, caps),
         Key::MoeRoute(emax) => moe::source_route(*emax, caps),
         Key::GemmIdCoop(s) => matmul::source_coop_id(s, caps),
-        Key::GatedDeltaNet(s) => delta::source(s, caps),
+        Key::GatedDeltaNet(s, np) => delta::source(s, *np, caps),
     }
 }
 

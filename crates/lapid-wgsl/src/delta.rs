@@ -25,10 +25,12 @@ pub(super) fn plan(spec: &Arc<GatedDeltaNetSpec>, d: &GatedDeltaNetDims, caps: &
     p.u(d.b)?.u(d.t)?.u(d.h)?.u(d.dk)?.u(d.dv)?.bits(d.scale).u(ncb)?;
     p.u(d.b * d.h * (d.t + d.dk) * d.dv)?;
     let items = (d.b * d.h * ncb) as u64;
-    Ok(Plan { scratch: 0, next: None, key: Key::GatedDeltaNet(spec.clone()), params: p.0, groups: grid(items, caps) })
+    // rows per lane baked in: constant trip counts keep the state column in registers
+    let np = d.dk.div_ceil(lanes).max(1) as u32;
+    Ok(Plan { scratch: 0, next: None, key: Key::GatedDeltaNet(spec.clone(), np), params: p.0, groups: grid(items, caps) })
 }
 
-pub(super) fn source(spec: &GatedDeltaNetSpec, caps: &Caps) -> String {
+pub(super) fn source(spec: &GatedDeltaNetSpec, np: u32, caps: &Caps) -> String {
     let bindings = common::output(7, spec.out_dtype, caps);
-    template::module(caps, KERNEL, &[("BINDINGS", &bindings)], &[], 256, true)
+    template::module(caps, KERNEL, &[("BINDINGS", &bindings), ("NP", &np.to_string())], &[], 256, true)
 }

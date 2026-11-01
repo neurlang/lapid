@@ -326,15 +326,19 @@ fn round3_kernels_compile_on_all_caps() {
     }
     for d in [DType::F32, DType::F16, DType::BF16, DType::Int8, DType::Int4, DType::Q4K, DType::Q5K, DType::Q6K] {
         keys.push(Key::MatMulId(Arc::new(MatMulIdSpec { x_dtype: DType::F16, w_dtype: d, out_dtype: DType::F32 })));
+        if !matches!(d, DType::F32 | DType::BF16) {
+            keys.push(Key::GemmIdCoop(Arc::new(MatMulIdSpec { x_dtype: DType::F32, w_dtype: d, out_dtype: DType::F32 })));
+        }
     }
-    keys.push(Key::GatedDeltaNet(Arc::new(GatedDeltaNetSpec { out_dtype: DType::F32 })));
-    keys.push(Key::GatedDeltaNet(Arc::new(GatedDeltaNetSpec { out_dtype: DType::F16 })));
+    keys.push(Key::MoeRoute(256));
+    keys.push(Key::GatedDeltaNet(Arc::new(GatedDeltaNetSpec { out_dtype: DType::F32 }), 4));
+    keys.push(Key::GatedDeltaNet(Arc::new(GatedDeltaNetSpec { out_dtype: DType::F16 }), 2));
     let mut coop = caps(true, true, true);
     coop.coopmat = true;
     coop.full_subgroups = true;
     for c in [caps(true, true, true), caps(false, false, false), caps(true, false, false), coop] {
         for key in &keys {
-            if matches!(key, Key::GemmCoop(_)) && !c.coopmat {
+            if matches!(key, Key::GemmCoop(_) | Key::GemmIdCoop(_)) && !c.coopmat {
                 continue;
             }
             let src = codegen::source(key, &c);
