@@ -51,12 +51,9 @@ fn idiv_up(a: u32, b: u32) -> u32 {
 // output column. An expert id outside [0, E) raises the error flag and uses expert 0.
 // Params: [T, R, N, K, scales_words, expert_stride (words for quantized, elements else),
 //          col_blocks, E]
-@group(0) @binding(1) var<storage, read> a: array<f32>;
-fn ld_a(e: u32) -> f32 {
-    return a[e];
-}
+@group(0) @binding(1) var<storage, read> a4: array<vec4<f32>>;
 fn lda4(e: u32) -> vec4<f32> {
-    return vec4<f32>(ld_a(e), ld_a(e + 1u), ld_a(e + 2u), ld_a(e + 3u));
+    return a4[e >> 2u];
 }
 @group(0) @binding(2) var<storage, read> w: array<u32>;
 fn wdeq(x: u32, e: u32) -> f32 {
@@ -102,8 +99,11 @@ fn kernel(wg_lin: u32, wg_total: u32) {
         let a_row = t * K;
         var part: f32 = 0.0;
         if (j < N) {
-            for (var k = lane; k < K; k += lanes) {
-                part = part + ld_a(a_row + k) * wdeq(x, j * K + k);
+            let wb = x * P[5];
+            for (var k4 = lane; k4 < K / 4u; k4 += lanes) {
+                let e = j * K + k4 * 4u;
+                let sc = unpack2x16float(w[wb + P[4] + (e >> 6u)])[(e >> 5u) & 1u];
+                part = part + dot(vec4<f32>(unpack4xI8(w[wb + (e >> 2u)])), lda4(a_row + k4 * 4u)) * sc;
             }
         }
         workgroupBarrier();

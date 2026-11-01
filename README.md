@@ -25,7 +25,7 @@
 ## Quick start
 
 ```sh
-cargo add lapid lapid-hub
+cargo add --git https://github.com/thewh1teagle/lapid lapid lapid-hub
 ```
 
 Transcribe audio with Parakeet TDT:

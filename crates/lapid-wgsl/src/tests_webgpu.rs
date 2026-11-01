@@ -56,6 +56,9 @@ fn keys() -> Vec<Key> {
     k.push(Key::RmsNorm(Arc::new(LayerNormSpec { in_dtype: DType::F16, param_dtype: DType::F32, out_dtype: DType::F16 })));
     k.push(Key::TopK(Arc::new(TopKSpec { in_dtype: DType::F32 }), true));
     k.push(Key::TopK(Arc::new(TopKSpec { in_dtype: DType::F32 }), false));
+    // subgroup-only kernels (skipped on caps without subgroups)
+    k.push(Key::TopKSmall(Arc::new(TopKSpec { in_dtype: DType::F32 })));
+    k.push(Key::GatedDeltaNet8(Arc::new(lapid_compiler::GatedDeltaNetSpec { out_dtype: DType::F32 }), 16, 8));
     for causal in [false, true] {
         for mask in [None, Some(DType::F32)] {
             let s = Arc::new(AttentionSpec { dtype: DType::F16, mask_dtype: mask, causal, out_dtype: DType::F32 });
@@ -99,6 +102,9 @@ fn webgpu_kernels_validate() {
     for (f16, sg) in [(false, false), (true, false), (false, true), (true, true)] {
         let c = caps(f16, sg);
         for key in keys() {
+            if matches!(key, Key::TopKSmall(_) | Key::GatedDeltaNet8(..)) && !sg {
+                continue;
+            }
             if let Err(e) = validate(&key, &c) {
                 failures.push(format!("{} f16={f16} sg={sg}: {e}", key.name()));
             }

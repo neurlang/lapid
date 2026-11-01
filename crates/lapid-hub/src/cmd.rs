@@ -10,7 +10,7 @@ use serde_json::Value;
 pub use crate::convert::{convert, convert_with};
 
 /// Model families `verify` / `bench` route to.
-pub const MODELS: &[&str] = &["whisper", "embeddinggemma", "parakeet", "lfm3", "phonon", "qwen35", "deepseek4", "qwen4exp", "gemma4", "gemma4moe", "gemma4vl", "qwen3vl", "llama"];
+pub const MODELS: &[&str] = &["whisper", "embeddinggemma", "parakeet", "lfm3", "phonon", "qwen35", "deepseek4", "qwen4exp", "gemma4", "gemma4moe", "gemma4vl", "qwen3vl", "llama", "vad", "zipformer"];
 
 /// Common model selection of `lapid verify` / `lapid bench`; `None` = the model's default.
 #[derive(Clone, Debug, Default)]
@@ -43,6 +43,8 @@ pub fn verify(model: &str, reference: Option<&Path>, args: &ModelArgs) -> Result
         "gemma4moe" => crate::gemma4moe::cmd::verify(reference, args),
         "gemma4vl" => crate::gemma4vl::cmd::verify(reference, args),
         "qwen3vl" => crate::qwen3vl::cmd::verify(reference, args),
+        "vad" => crate::vad::cmd::verify(reference, args),
+        "zipformer" => crate::zipformer::cmd::verify(reference, args),
         _ => Err(unknown(model)),
     }
 }
@@ -66,6 +68,8 @@ pub fn bench(model: &str, input: Option<&Path>, args: &ModelArgs, runs: usize) -
         "gemma4moe" => crate::gemma4moe::cmd::bench(input, args, runs),
         "gemma4vl" => crate::gemma4vl::cmd::bench(input, args, runs),
         "qwen3vl" => crate::qwen3vl::cmd::bench(input, args, runs),
+        "vad" => crate::vad::cmd::bench(input, args, runs),
+        "zipformer" => crate::zipformer::cmd::bench(input, args, runs),
         _ => Err(unknown(model)),
     }
 }

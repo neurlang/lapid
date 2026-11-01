@@ -108,6 +108,23 @@ fn b_kdeq4(bb: u32, i: u32) -> vec4<f32> {
     let dm = unpack2x16float(b[bb >> 2u]);
     return vec4<f32>(q) * (dm.x * sm.x) - vec4<f32>(dm.y * sm.y);
 }
+fn b_kdeq16(bb: u32, i: u32) -> array<vec4<f32>, 4> {
+    let c = i >> 6u;
+    let hi = (i >> 5u) & 1u;
+    let l = i & 31u;
+    let sm = b_smk(bb, 2u * c + hi);
+    let dm = unpack2x16float(b[bb >> 2u]);
+    let sc = dm.x * sm.x;
+    let mn = vec4<f32>(dm.y * sm.y);
+    let w0 = (bb + 16u + c * 32u + l) >> 2u;
+    var r: array<vec4<f32>, 4>;
+    for (var u = 0u; u < 4u; u += 1u) {
+        let qw = b[w0 + u];
+        var q = (vec4<u32>(qw, qw >> 8u, qw >> 16u, qw >> 24u) >> vec4<u32>(hi * 4u)) & vec4<u32>(15u);
+        r[u] = vec4<f32>(q) * sc - mn;
+    }
+    return r;
+}
 fn b_deq(so: u32, e: u32) -> f32 {
     return b_kdeq((e >> 8u) * 144u, e & 255u);
 }
@@ -150,9 +167,7 @@ fn load_tiles(row0: u32, col0: u32, a_base: u32, b_base: u32, k0: u32, M: u32, N
         }
         if (gj < N && kk < K) {
             let bb = (gj * (K / 256u) + kk / 256u) * 144u;
-            for (var u = 0u; u < 4u; u += 1u) {
-                rbk[u] = b_kdeq4(bb, kk % 256u + 4u * u);
-            }
+            rbk = b_kdeq16(bb, kk % 256u);
         }
     }
 }

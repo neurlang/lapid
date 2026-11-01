@@ -88,7 +88,7 @@ impl Exec {
                 return Err(ectx(Error::new("too_large", format!("output of {out_size} bytes exceeds maxStorageBufferBindingSize ({limit})"))));
             }
             // launches binding a buffer above the limit run as several sub-range launches
-            let parts: Vec<(lapid_wgsl::Plan, Vec<Option<(u64, u64)>>)> = match lapid_wgsl::plan_split(&l.kernel, &sizes, limit, align, &ctx.caps).map_err(&ectx)? {
+            let parts: Vec<(lapid_wgsl::Plan, lapid_wgsl::Ranges)> = match lapid_wgsl::plan_split(&l.kernel, &sizes, limit, align, &ctx.caps).map_err(&ectx)? {
                 Some(subs) => subs.into_iter().map(|s| (s.plan, s.ranges)).collect(),
                 None => vec![(lapid_wgsl::plan(&l.kernel, &ctx.caps).map_err(&ectx)?, vec![None; l.inputs.len()])],
             };

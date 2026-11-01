@@ -98,6 +98,22 @@ fn b_kdeq4(bb: u32, i: u32) -> vec4<f32> {
     let sc = extractBits(bitcast<i32>(b_b8(bb + 192u + h * 8u + (l >> 4u) + 2u * quad)), 0u, 8u);
     return q * (b_h(bb + 208u) * f32(sc));
 }
+fn b_kdeq16(bb: u32, i: u32) -> array<vec4<f32>, 4> {
+    let h = i >> 7u;
+    let quad = (i >> 5u) & 3u;
+    let l = i & 31u;
+    let sc = extractBits(bitcast<i32>(b_b8(bb + 192u + h * 8u + (l >> 4u) + 2u * quad)), 0u, 8u);
+    let f = b_h(bb + 208u) * f32(sc);
+    var r: array<vec4<f32>, 4>;
+    for (var u = 0u; u < 4u; u += 1u) {
+        let ql = b_w(bb + h * 64u + l + (quad & 1u) * 32u + 4u * u);
+        let qh = b_w(bb + 128u + h * 32u + l + 4u * u);
+        let lo = (vec4<u32>(ql, ql >> 8u, ql >> 16u, ql >> 24u) >> vec4<u32>((quad >> 1u) * 4u)) & vec4<u32>(15u);
+        let hb = (vec4<u32>(qh, qh >> 8u, qh >> 16u, qh >> 24u) >> vec4<u32>(quad * 2u)) & vec4<u32>(3u);
+        r[u] = (vec4<f32>(lo | (hb << vec4<u32>(4u))) - vec4<f32>(32.0)) * f;
+    }
+    return r;
+}
 fn b_deq(so: u32, e: u32) -> f32 {
     return b_kdeq((e >> 8u) * 210u, e & 255u);
 }

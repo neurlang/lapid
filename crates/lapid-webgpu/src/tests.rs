@@ -250,7 +250,7 @@ fn gather_and_out_of_range() {
 #[test]
 fn topk_and_argmax() {
     let Some(be) = backend() else { return };
-    for &(rows, cols, k) in &[(3usize, 1000usize, 1usize), (2, 51865, 1), (4, 4097, 50), (2, 37, 5)] {
+    for &(rows, cols, k) in &[(3usize, 1000usize, 1usize), (2, 51865, 1), (4, 4097, 50), (2, 37, 5), (64, 256, 8), (2, 1000, 16)] {
         let x = rnd(rows * cols, (cols + k) as u32);
         let kern = Kernel::TopK(Arc::new(TopKSpec { in_dtype: DType::F32 }), TopKDims { rows, cols, k });
         let (g, c) = both(&be, kern, &[f32b(&x)], rows * k * 4);

@@ -109,7 +109,7 @@ fn run_case(be: &crate::VulkanBackend, c: Case, seed: u32) {
     let got = from_f32b(&be.download(&bufs[n]).unwrap());
     let vmax = v.iter().fold(0f32, |a, x| a.max(x.abs()));
     // f16 storage (and the coopmat path, which rounds P to f16) gets the f16 tolerance
-    let coop_like = be.shared.caps.coopmat && d == 64 && sq > 8;
+    let coop_like = be.shared.caps.coopmat && matches!(d, 64 | 256 | 512) && sq > 8;
     let tol = if c.f16 || coop_like { 2e-3 } else { 1e-5 } * vmax;
     let tol = tol.max(1e-6);
     let mut worst = (0f32, 0usize);
@@ -181,8 +181,8 @@ fn attention_large_head_dims() {
     let Some(be) = backend() else { return };
     let mut n = 300;
     for &d in &[256usize, 320, 512] {
-        for &(sq, sk) in &[(1usize, 1usize), (1, 700), (37, 37), (20, 90)] {
-            for &(causal, mask) in &[(true, false), (false, true)] {
+        for &(sq, sk) in &[(1usize, 1usize), (1, 700), (37, 37), (20, 90), (130, 130), (9, 200)] {
+            for &(causal, mask) in &[(true, false), (false, true), (true, true)] {
                 let f16 = n % 2 == 0;
                 run_case(&be, Case { b: 1, h: 2, sq, sk, d, causal, mask, f16, cache: sq == 1 }, n);
                 n += 1;

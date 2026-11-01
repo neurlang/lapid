@@ -234,7 +234,7 @@ fn topk_ref(x: &[f32], cols: usize, k: usize) -> Vec<i32> {
 #[test]
 fn topk_and_argmax() {
     let Some(be) = backend() else { return };
-    for &(rows, cols, k) in &[(3usize, 1000usize, 1usize), (2, 51865, 1), (1, 300, 300), (4, 4097, 50), (2, 37, 5), (1, 151_936, 64), (5, 2000, 1024)] {
+    for &(rows, cols, k) in &[(3usize, 1000usize, 1usize), (2, 51865, 1), (1, 300, 300), (4, 4097, 50), (2, 37, 5), (1, 151_936, 64), (5, 2000, 1024), (512, 256, 8), (1, 256, 8), (3, 1024, 16), (2, 700, 16), (2, 9, 9)] {
         let mut x = rnd(rows * cols, (cols + k) as u32);
         // ties (also with -0.0 vs 0.0) and repeated maxima
         for (i, v) in x.iter_mut().enumerate() {

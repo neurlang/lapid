@@ -109,7 +109,12 @@ pub(crate) fn matmul_id(
         };
         let a = Src::F32(&a_rows);
         let dst = Dst::new(res.as_mut_ptr() as *mut u8, res.len(), DType::F32);
-        matmul::run(ctx, ws, &mm_spec, &dims, &a, &b, &[], &dst)?;
+        // Prefill-sized launches keep float activations for every expert (as dense
+        // matmuls with many rows do), however few rows an expert got: one numeric path.
+        ws.float_act = t > 8;
+        let r = matmul::run(ctx, ws, &mm_spec, &dims, &a, &b, &[], &dst);
+        ws.float_act = false;
+        r?;
         for (row, &i) in list.iter().enumerate() {
             // SAFETY: every (token, slot) index appears in exactly one expert list, so the
             // output rows written here are disjoint; single-threaded.

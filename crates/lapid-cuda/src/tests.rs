@@ -347,7 +347,7 @@ fn all_keys() -> Vec<Key> {
     }
     keys.push(Key::TopKMerge);
     for s in [mat_spec(F32, Q6K, true, vec![], None), mat_spec(F16, Int4, true, vec![], None)] {
-        keys.extend([Key::GemvId(s.clone(), true, false, 2), Key::GemmMmaId(s, false, false)]);
+        keys.extend([Key::GemvId(s.clone(), true, false, 2), Key::GemmMmaId(s.clone(), false, false, false), Key::GemmMmaId(s, true, false, true)]);
     }
     keys.push(Key::MoeRoute);
     let gdn = Arc::new(GatedDeltaNetSpec { out_dtype: F16 });
@@ -385,12 +385,12 @@ fn all_keys() -> Vec<Key> {
                     causal,
                     out_dtype: DType::F32,
                 });
-                keys.push(Key::AttnSplit(s.clone(), true, 64));
-                keys.push(Key::AttnSplit(s.clone(), false, 80));
+                keys.push(Key::AttnSplit(s.clone(), true, 64, 1));
+                keys.push(Key::AttnSplit(s.clone(), false, 80, 4));
                 keys.push(Key::AttnMerge(s.clone()));
-                keys.push(Key::AttnMma(s.clone(), 64, true));
-                keys.push(Key::AttnMma(s.clone(), 128, false));
-                keys.push(Key::AttnMma(s, 48, false));
+                keys.push(Key::AttnMma(s.clone(), 64, true, false));
+                keys.push(Key::AttnMma(s.clone(), 128, false, true));
+                keys.push(Key::AttnMma(s, 48, false, true));
             }
         }
     }

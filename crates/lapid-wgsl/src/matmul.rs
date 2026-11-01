@@ -261,9 +261,7 @@ fn b_coop_slots(spec: &MatMulSpec) -> (String, String, String) {
         }}
         if (gj < N && kk < K) {{
             let bb = (gj * (K / 256u) + kk / 256u) * {bb}u;
-            for (var u = 0u; u < 4u; u += 1u) {{
-                rbk[u] = b_kdeq4(bb, kk % 256u + 4u * u);
-            }}
+            rbk = b_kdeq16(bb, kk % 256u);
         }}
     }}
 "#,

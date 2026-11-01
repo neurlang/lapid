@@ -208,6 +208,42 @@ impl KvCache {
         self.staged_len = None;
     }
 
+    /// Rewind to the first `len` committed tokens (`len <= offset`), e.g. to reuse the longest
+    /// common prefix of a new prompt. Later writes overwrite the dropped positions in place.
+    /// Fails (cache unchanged) while a step is staged, or when a sliding-window layer has
+    /// already evicted positions the shorter context needs.
+    pub fn truncate(&mut self, len: usize) -> Result<()> {
+        if self.staged_len.is_some() {
+            bail!("invalid_argument", "kv cache: truncate while a step is staged");
+        }
+        if len > self.offset {
+            bail!("invalid_argument", "kv cache: truncate to {len} > {} committed tokens", self.offset);
+        }
+        let drop = self.offset - len;
+        let mut next = Vec::with_capacity(self.layers.len());
+        for (layer, w) in self.layers.iter().zip(&self.windows) {
+            let Some(l) = layer else {
+                next.push(None);
+                continue;
+            };
+            // Buffer position p holds absolute token p + shift.
+            let shift = self.offset - l.end;
+            let start_abs = l.start + shift;
+            let need_abs = w.map_or(0, |w| len.saturating_sub(w));
+            if start_abs > need_abs {
+                bail!("invalid_argument", "kv cache: cannot rewind to {len}: window already evicted token {need_abs}");
+            }
+            let end = l.end - drop.min(l.end - l.start);
+            let start = l.start.max(need_abs.saturating_sub(shift)).min(end);
+            let view_k = heads_view(&l.k, start, end)?;
+            let view_v = heads_view(&l.v, start, end)?;
+            next.push(Some(Layer { k: l.k.clone(), v: l.v.clone(), start, end, view_k, view_v }));
+        }
+        self.layers = next;
+        self.offset = len;
+        Ok(())
+    }
+
     /// Forget everything.
     pub fn clear(&mut self) {
         let cap = self.capacity;
@@ -260,6 +296,61 @@ mod tests {
         assert_ne!(ptrs[2], ptrs[3]);
         assert_eq!(ptrs[3], ptrs[4]);
         assert_eq!(c.len(0), 8);
+    }
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::KvCache;
+    use lapid::{Device, Tensor};
+
+    fn step(dev: &Device, c: &mut KvCache, n: usize, seed: f32) -> Vec<f32> {
+        let v: Vec<f32> = (0..2 * n * 4).map(|i| seed + i as f32).collect();
+        let k = Tensor::from_f32(&v, &[1, 2, n, 4]).unwrap();
+        let (fk, _) = c.append(0, &k, &k).unwrap();
+        let mut outs = vec![&fk];
+        outs.extend(c.staged());
+        let mut r = dev.eval(&outs).unwrap();
+        let rest = r.split_off(1);
+        c.commit(rest).unwrap();
+        dev.to_vec_f32(&r[0]).unwrap()
+    }
+
+    /// Rewind then re-append: same contents as a cache that only ever saw the kept prefix.
+    #[test]
+    fn truncate_then_append_matches_fresh() {
+        let dev = Device::cpu();
+        let mut a = KvCache::with_capacity(vec![None], 8);
+        let mut b = KvCache::with_capacity(vec![None], 8);
+        step(&dev, &mut a, 3, 0.0);
+        step(&dev, &mut a, 2, 100.0);
+        step(&dev, &mut b, 3, 0.0);
+        a.truncate(3).unwrap();
+        assert_eq!(a.offset(), 3);
+        assert_eq!(a.len(0), 3);
+        let got = step(&dev, &mut a, 2, 500.0);
+        let want = step(&dev, &mut b, 2, 500.0);
+        assert_eq!(got, want);
+        assert!(a.truncate(9).is_err());
+    }
+
+    /// A sliding-window layer can rewind only within what it still holds.
+    #[test]
+    fn windowed_truncate_limits() {
+        let dev = Device::cpu();
+        let mut c = KvCache::with_capacity(vec![Some(4)], 16);
+        for i in 0..6 {
+            step(&dev, &mut c, 1, 10.0 * i as f32);
+        }
+        // Holds tokens 2..6; rewinding to 5 needs tokens 1..5: token 1 is gone.
+        assert!(c.truncate(5).is_err());
+        c.truncate(6).unwrap();
+        let mut d = KvCache::with_capacity(vec![Some(4)], 16);
+        for i in 0..3 {
+            step(&dev, &mut d, 1, 10.0 * i as f32);
+        }
+        d.truncate(2).unwrap();
+        assert_eq!(d.len(0), 2);
     }
 }
 

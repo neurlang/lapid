@@ -52,12 +52,9 @@ fn idiv_up(a: u32, b: u32) -> u32 {
 // output column. An expert id outside [0, E) raises the error flag and uses expert 0.
 // Params: [T, R, N, K, scales_words, expert_stride (words for quantized, elements else),
 //          col_blocks, E]
-@group(0) @binding(1) var<storage, read> a: array<f32>;
-fn ld_a(e: u32) -> f32 {
-    return a[e];
-}
+@group(0) @binding(1) var<storage, read> a4: array<vec4<f32>>;
 fn lda4(e: u32) -> vec4<f32> {
-    return vec4<f32>(ld_a(e), ld_a(e + 1u), ld_a(e + 2u), ld_a(e + 3u));
+    return a4[e >> 2u];
 }
 @group(0) @binding(2) var<storage, read> w: array<u32>;
 fn w_b8(o: u32) -> u32 {
@@ -101,6 +98,23 @@ fn w_kdeq4(bb: u32, i: u32) -> vec4<f32> {
     let sm = w_smk(bb, 2u * c + hi);
     let dm = unpack2x16float(w[bb >> 2u]);
     return vec4<f32>(q) * (dm.x * sm.x) - vec4<f32>(dm.y * sm.y);
+}
+fn w_kdeq16(bb: u32, i: u32) -> array<vec4<f32>, 4> {
+    let c = i >> 6u;
+    let hi = (i >> 5u) & 1u;
+    let l = i & 31u;
+    let sm = w_smk(bb, 2u * c + hi);
+    let dm = unpack2x16float(w[bb >> 2u]);
+    let sc = dm.x * sm.x;
+    let mn = vec4<f32>(dm.y * sm.y);
+    let w0 = (bb + 16u + c * 32u + l) >> 2u;
+    var r: array<vec4<f32>, 4>;
+    for (var u = 0u; u < 4u; u += 1u) {
+        let qw = w[w0 + u];
+        var q = (vec4<u32>(qw, qw >> 8u, qw >> 16u, qw >> 24u) >> vec4<u32>(hi * 4u)) & vec4<u32>(15u);
+        r[u] = vec4<f32>(q) * sc - mn;
+    }
+    return r;
 }
 fn w_deq(so: u32, e: u32) -> f32 {
     return w_kdeq((e >> 8u) * 144u, e & 255u);

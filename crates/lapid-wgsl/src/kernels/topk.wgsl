@@ -25,6 +25,69 @@ fn before(ka: u32, ia: u32, kb: u32, ib: u32) -> bool {
     return ka > kb || (ka == kb && ia < ib);
 }
 
+// #if SMALLK
+// k <= 16, cols <= 1024 (MoE routers): each thread keeps its <= 4 keys in registers; k
+// rounds of a workgroup argmax (subgroup reductions), the winner is marked taken.
+var<workgroup> rk: array<u32, 256>;
+var<workgroup> ri: array<u32, 256>;
+var<workgroup> win: u32;
+
+fn kernel(wg_lin: u32, wg_total: u32) {
+    let rows = P[0];
+    let cols = P[1];
+    let k = P[2];
+    for (var r = wg_lin; r < rows; r += wg_total) {
+        let base = r * cols;
+        var kv: array<u32, 4>;
+        var taken = 0u;
+        for (var u = 0u; u < 4u; u += 1u) {
+            let c = g_lid + 256u * u;
+            kv[u] = 0u;
+            if (c < cols) {
+                kv[u] = okey(ld_x(base + c));
+            } else {
+                taken = taken | (1u << u);
+            }
+        }
+        for (var t = 0u; t < k; t += 1u) {
+            var bk = 0u;
+            var bi = 0xffffffffu;
+            for (var u = 0u; u < 4u; u += 1u) {
+                if ((taken & (1u << u)) == 0u && (bi == 0xffffffffu || kv[u] > bk)) {
+                    bk = kv[u];
+                    bi = g_lid + 256u * u;
+                }
+            }
+            let m = subgroupMax(select(0u, bk, bi != 0xffffffffu));
+            let mi = subgroupMin(select(0xffffffffu, bi, bk == m && bi != 0xffffffffu));
+            workgroupBarrier();
+            if (g_sgi == 0u) {
+                rk[g_sgid] = m;
+                ri[g_sgid] = mi;
+            }
+            workgroupBarrier();
+            if (g_lid == 0u) {
+                var k0 = rk[0];
+                var i0 = ri[0];
+                for (var s = 1u; s < g_nsg; s += 1u) {
+                    if (ri[s] != 0xffffffffu && (i0 == 0xffffffffu || before(rk[s], ri[s], k0, i0))) {
+                        k0 = rk[s];
+                        i0 = ri[s];
+                    }
+                }
+                out[r * k + t] = i32(i0);
+                win = i0;
+            }
+            workgroupBarrier();
+            let w = win;
+            if (w % 256u == g_lid) {
+                taken = taken | (1u << (w / 256u));
+            }
+        }
+        workgroupBarrier();
+    }
+}
+// #endif
 // #if ARGMAX
 var<workgroup> rk: array<u32, 256>;
 var<workgroup> ri: array<u32, 256>;
@@ -88,6 +151,7 @@ fn kernel(wg_lin: u32, wg_total: u32) {
 }
 // #endif
 // #if !ARGMAX
+// #if !SMALLK
 var<workgroup> hist: array<atomic<u32>, 256>;
 var<workgroup> sel: array<u32, 3>;
 var<workgroup> cnt: atomic<u32>;
@@ -220,4 +284,5 @@ fn kernel(wg_lin: u32, wg_total: u32) {
         workgroupBarrier();
     }
 }
+// #endif
 // #endif

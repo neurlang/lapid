@@ -36,6 +36,20 @@ fn bf16(x: f32) -> u16 {
     half::bf16::from_f32(x).to_bits()
 }
 
+/// Activations as hi + lo bf16 pairs (two `bfmmla` per chunk, ~16 mantissa bits: int8/int4
+/// weights then multiply nearly f32-exact activations). `LAPID_CPU_BF16_SPLIT=0`: hi only.
+fn split_a() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LAPID_CPU_BF16_SPLIT").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Residual of `r` after bf16 rounding (in place: `r[i] -= bf16(r[i])`).
+fn residual(r: &mut [f32]) {
+    for x in r {
+        *x -= half::bf16::from_bits(bf16(*x)).to_f32();
+    }
+}
+
 /// Pack two f32 rows (`None` = zero row) of length `k` into pair layout `dst` (`kc * 8`).
 fn pack_pair(r0: Option<&[f32]>, r1: Option<&[f32]>, k: usize, dst: &mut [u16]) {
     for (c, chunk) in dst.chunks_exact_mut(8).enumerate() {
@@ -72,8 +86,11 @@ fn imp(ctx: &Ctx, ws: &mut Workspace, a: &AOp, b: &QMat, d: &MatMulDims, epi: &E
     let pair = kc * 8;
 
     let kg = k / GROUP;
+    let split = split_a();
+    // A pair p: hi at `p * apair`, lo (if split) right after it.
+    let apair = if split { 2 * pair } else { pair };
     let Workspace { ha, hb, psb, .. } = ws;
-    let ha = grow(ha, rpairs * pair);
+    let ha = grow(ha, rpairs * apair);
     let hb = grow(hb, cpairs * pair);
     let psb = grow(psb, cpairs * kg * 4);
 
@@ -93,8 +110,14 @@ fn imp(ctx: &Ctx, ws: &mut Workspace, a: &AOp, b: &QMat, d: &MatMulDims, epi: &E
             };
             let (h0, h1) = (load(rp * 2, t0), load(rp * 2 + 1, t1));
             // SAFETY: row pair rp owns its `pair` elements.
-            let dst = unsafe { std::slice::from_raw_parts_mut(hp.0.add(rp * pair), pair) };
-            pack_pair(h0.then_some(&t0[..]), h1.then_some(&t1[..]), k, dst);
+            let dst = unsafe { std::slice::from_raw_parts_mut(hp.0.add(rp * apair), apair) };
+            let (hi, lo) = dst.split_at_mut(pair);
+            pack_pair(h0.then_some(&t0[..]), h1.then_some(&t1[..]), k, hi);
+            if split {
+                residual(t0);
+                residual(t1);
+                pack_pair(h0.then_some(&t0[..]), h1.then_some(&t1[..]), k, lo);
+            }
         });
     }
     // 2. B (weight rows = output columns) → bf16 pairs: integer quants + group scales, or
@@ -160,11 +183,12 @@ fn imp(ctx: &Ctx, ws: &mut Workspace, a: &AOp, b: &QMat, d: &MatMulDims, epi: &E
                     // chunks per pair; bf16 checked by `available`.
                     let tile = unsafe {
                         kernel_4x8(
-                            &ha[(r / 2) * pair + c0 * 8..],
+                            &ha[(r / 2) * apair + c0 * 8..],
                             &hb[(c / 2) * pair + c0 * 8..],
                             &psb[((c / 2) * kg + c0 / 8) * 4..],
                             cn / 8,
-                            (pair, kg * 4),
+                            (apair, pair, kg * 4),
+                            split.then_some(pair),
                         )
                     };
                     let valid_c = (j1 - c).min(8);
@@ -212,13 +236,21 @@ unsafe fn bfmmla(
 }
 
 /// 4 rows (2 pairs from `pa`) x 8 columns (4 pairs from `pb`, scales `sb`) over `groups`
-/// 32-groups (8 chunks each); pairs are `ps` elements / `ss` scales apart.
+/// 32-groups (8 chunks each); A pairs are `pas`, B pairs `ps` elements / `ss` scales apart.
+/// `lo`: offset of each A pair's low (residual) half, multiplied with the same B.
 ///
 /// # Safety
 /// `pa` holds 2 and `pb` / `sb` 4 pairs of at least `groups` groups; the CPU supports BF16.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon,bf16")]
-unsafe fn kernel_4x8(pa: &[u16], pb: &[u16], sb: &[f32], groups: usize, (ps, ss): (usize, usize)) -> [[f32; 8]; 4] {
+unsafe fn kernel_4x8(
+    pa: &[u16],
+    pb: &[u16],
+    sb: &[f32],
+    groups: usize,
+    (pas, ps, ss): (usize, usize, usize),
+    lo: Option<usize>,
+) -> [[f32; 8]; 4] {
     use std::arch::aarch64::*;
     // SAFETY: bounds per the function contract.
     unsafe {
@@ -227,11 +259,19 @@ unsafe fn kernel_4x8(pa: &[u16], pb: &[u16], sb: &[f32], groups: usize, (ps, ss)
         for g in 0..groups {
             let mut t = [[vdupq_n_f32(0.0); 4]; 2];
             for c in g * 8..g * 8 + 8 {
-                let av = [vld1q_u16(a.add(c * 8)), vld1q_u16(a.add(ps + c * 8))];
+                let av = [vld1q_u16(a.add(c * 8)), vld1q_u16(a.add(pas + c * 8))];
                 let bv = [vld1q_u16(b.add(c * 8)), vld1q_u16(b.add(ps + c * 8)), vld1q_u16(b.add(2 * ps + c * 8)), vld1q_u16(b.add(3 * ps + c * 8))];
                 for pr in 0..2 {
                     for pc in 0..4 {
                         t[pr][pc] = bfmmla(t[pr][pc], av[pr], bv[pc]);
+                    }
+                }
+                if let Some(lo) = lo {
+                    let al = [vld1q_u16(a.add(lo + c * 8)), vld1q_u16(a.add(pas + lo + c * 8))];
+                    for pr in 0..2 {
+                        for pc in 0..4 {
+                            t[pr][pc] = bfmmla(t[pr][pc], al[pr], bv[pc]);
+                        }
                     }
                 }
             }

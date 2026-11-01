@@ -60,12 +60,14 @@ pub(crate) enum Key {
     LayerNorm(Arc<LayerNormSpec>, bool),
     /// Few queries, split over key chunks; `true` = one chunk, writes the output directly
     /// (no merge stage); head dim baked in (<= 256).
-    AttnSplit(Arc<AttentionSpec>, bool, u32),
-    /// Merge stage of `AttnSplit(_, false, _)`.
+    /// Last field: queries per block (they share the K / V loads).
+    AttnSplit(Arc<AttentionSpec>, bool, u32, u32),
+    /// Merge stage of `AttnSplit(_, false, ..)`.
     AttnMerge(Arc<AttentionSpec>),
     /// Flash attention on tensor cores (many queries); head dim baked in (multiple of 16,
     /// <= 128); `true` = K/V rows readable as 16-byte vectors.
-    AttnMma(Arc<AttentionSpec>, u32, bool),
+    /// Last flag: precise variant (hi/lo f16 splits, ~f32 accuracy; f32 / bf16 inputs).
+    AttnMma(Arc<AttentionSpec>, u32, bool, bool),
     GatherAxis(Arc<GatherAxisSpec>),
     /// `true` = k == 1 (argmax reduction), `false` = radix-select top-k.
     TopK(Arc<TopKSpec>, bool),
@@ -75,8 +77,9 @@ pub(crate) enum Key {
     GemvId(Arc<MatMulSpec>, bool, bool, u32),
     /// MatMulId routing stage (rows grouped by expert into scratch).
     MoeRoute,
-    /// MatMulId grouped tensor-core GEMM over the routed rows (after `MoeRoute`).
-    GemmMmaId(Arc<MatMulSpec>, bool, bool),
+    /// MatMulId grouped tensor-core GEMM over the routed rows (after `MoeRoute`);
+    /// last flag: 32-row tiles (few rows per expert).
+    GemmMmaId(Arc<MatMulSpec>, bool, bool, bool),
     /// Gated delta rule; Dk baked in.
     Gdn(Arc<GatedDeltaNetSpec>, u32),
 }
@@ -104,7 +107,7 @@ impl Key {
     pub fn uses_scratch(&self) -> bool {
         matches!(
             self,
-            Key::AttnSplit(_, false, _)
+            Key::AttnSplit(_, false, ..)
                 | Key::AttnMerge(_)
                 | Key::TopK(_, true)
                 | Key::TopKMerge
@@ -133,14 +136,16 @@ impl Key {
                 format!("gemm_mma_id {}x{}", s.a_dtype.name(), s.b_dtype.name())
             }
             Key::Gdn(_, dk) => format!("gated_delta_net dk{dk}"),
-            Key::AttnSplit(s, direct, d) => {
+            Key::AttnSplit(s, direct, d, qb) => {
                 format!(
-                    "attention_split{} d{d} {}",
+                    "attention_split{} d{d} q{qb} {}",
                     if *direct { "_direct" } else { "" },
                     s.dtype.name()
                 )
             }
-            Key::AttnMma(s, d, _) => format!("attention_mma d{d} {}", s.dtype.name()),
+            Key::AttnMma(s, d, _, precise) => {
+                format!("attention_mma{} d{d} {}", if *precise { "_precise" } else { "" }, s.dtype.name())
+            }
             k => k.label().to_string(),
         }
     }
@@ -242,18 +247,18 @@ pub(crate) fn source(key: &Key, _caps: &Caps) -> String {
         Key::Ew(s, modes, out) => elementwise::source(s, modes, *out),
         Key::Reduce(s, row) => reduce::source(s, *row),
         Key::Gemm(s) => matmul::source(s),
-        Key::GemmMma(s, va, vb) => mma::source(s, *va, *vb, false),
+        Key::GemmMma(s, va, vb) => mma::source(s, *va, *vb, false, false),
         Key::Gemv(s, va, vb, w) => gemv::source(s, *va, *vb, false, *w),
         Key::GemvId(s, va, vb, w) => gemv::source(s, *va, *vb, true, *w),
-        Key::GemmMmaId(s, va, vb) => mma::source(s, *va, *vb, true),
+        Key::GemmMmaId(s, va, vb, small) => mma::source(s, *va, *vb, true, *small),
         Key::MoeRoute => moe::source_route(),
         Key::Gdn(s, dk) => gdn::source(s, *dk as usize),
         Key::Gather(s) => rows::source_gather(s),
         Key::Softmax(s) => rows::source_softmax(s),
         Key::LayerNorm(s, rms) => rows::source_layer_norm(s, *rms),
-        Key::AttnSplit(s, direct, d) => attention::source_split(s, *direct, *d),
+        Key::AttnSplit(s, direct, d, qb) => attention::source_split(s, *direct, *d, *qb),
         Key::AttnMerge(s) => attention::source_merge(s),
-        Key::AttnMma(s, d, vec) => flash::source(s, *d, *vec),
+        Key::AttnMma(s, d, vec, precise) => flash::source(s, *d, *vec, *precise),
         Key::GatherAxis(s) => index::source_gather_axis(s),
         Key::TopK(s, k1) => index::source_topk(s, *k1),
         Key::TopKMerge => index::source_topk_merge(),

@@ -286,7 +286,7 @@ impl Exec {
             }
             let sizes: Vec<u64> = l.inputs.iter().map(|&i| vbufs[i].size).collect();
             // launches binding a buffer above the limit run as several sub-range launches
-            let parts: Vec<(Plan, Vec<Option<(u64, u64)>>)> = match codegen::plan_split(&l.kernel, &sizes, limit, caps.storage_align, &caps.wgsl()).map_err(&ctx)? {
+            let parts: Vec<(Plan, lapid_wgsl::Ranges)> = match codegen::plan_split(&l.kernel, &sizes, limit, caps.storage_align, &caps.wgsl()).map_err(&ctx)? {
                 Some(subs) => subs.into_iter().map(|s| (s.plan, s.ranges)).collect(),
                 None => vec![(codegen::plan(&l.kernel, caps).map_err(&ctx)?, vec![None; l.inputs.len()])],
             };

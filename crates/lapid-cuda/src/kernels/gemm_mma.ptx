@@ -2,8 +2,8 @@
 // m16n8k16). 64x128 output tile per 256-thread block (8 warps as 2 (m) x 4 (n), each warp
 // 32x32 = 2 x 4 mma tiles), k-tiles of 32.
 // Shared memory (f16, row stride LDS = 40 halves = 80 bytes, conflict-free for ldmatrix):
-//   As[2][64][LDS] at 0, Bs[2][128][LDS] at 10240 (double buffered; B stored [n][k]),
-//   overlaid after the main loop by the f32 accumulator tile Cs[64][132].
+//   As[2][BM][LDS] at 0, Bs[2][128][LDS] at B_OFF = 2 * BM * 80 (double buffered; B stored
+//   [n][k]), overlaid after the main loop by the f32 accumulator tile Cs[BM][132].
 // Pipeline: the next k-tile is loaded from global memory into registers (A converted to
 // f16 / B dequantized only when stored) while the current one is multiplied; one barrier
 // per k-tile.
@@ -16,7 +16,7 @@
 // = id / r, output row = id. P[16] = E, P[17] = expert stride in bytes.
 // Small-tile variant (WM = 16, MatMulId with few rows per expert): 32x128 tiles, each warp
 // 16x32 (one m16 tile); only the first 32 rows of As / Cs are used.
-.shared .align 16 .b8 smem[33792];
+.shared .align 16 .b8 smem[{{SMEM}}];
 
 .visible .entry lapid_main(
 {{ARGS}}
@@ -175,7 +175,7 @@ BS_DONE:
 {{A_LOAD}}
 {{B_LOAD}}
     mov.u32 %sa_st, %sm;
-    add.u32 %sb_st, %sm, 10240;
+    add.u32 %sb_st, %sm, {{B_OFF}};
 {{A_STORE}}
 {{B_STORE}}
     bar.sync 0;
@@ -183,10 +183,10 @@ BS_DONE:
 MAIN_LOOP:
     // operands of k-tile kt live in buffer kt % 2
     and.b32 %t, %kt, 1;
-    mad.lo.u32 %pa, %t, 5120, %sm;
+    mad.lo.u32 %pa, %t, {{A_BUF}}, %sm;
     add.u32 %pa, %pa, %a_lane;
     mad.lo.u32 %pb, %t, 10240, %sm;
-    add.u32 %pb, %pb, 10240;
+    add.u32 %pb, %pb, {{B_OFF}};
     add.u32 %pb, %pb, %b_lane;
     add.u32 %t, %kt, 1;
     setp.lt.u32 %more, %t, %nk;
@@ -199,9 +199,9 @@ SKIP_LOAD:
     @!%more bra SKIP_STORE;
     xor.b32 %t, %kt, 1;
     and.b32 %t, %t, 1;
-    mad.lo.u32 %sa_st, %t, 5120, %sm;
+    mad.lo.u32 %sa_st, %t, {{A_BUF}}, %sm;
     mad.lo.u32 %sb_st, %t, 10240, %sm;
-    add.u32 %sb_st, %sb_st, 10240;
+    add.u32 %sb_st, %sb_st, {{B_OFF}};
 {{A_STORE}}
 {{B_STORE}}
 SKIP_STORE:

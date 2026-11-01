@@ -68,6 +68,9 @@ pub(crate) struct Workspace {
     /// bf16 operand pairs of `qbf16`.
     pub ha: Vec<u16>,
     pub hb: Vec<u16>,
+    /// Quantized B with few rows still takes the float-activation path (set by MatMulId for
+    /// prefill-sized launches).
+    pub float_act: bool,
 }
 
 /// A operand: element (bt, i, p) at `offset + bt * bs + i * rs + p`.
@@ -241,7 +244,7 @@ pub(crate) fn run(
                     format!("cpu matmul: quantized B is [{}, {}], expected [{n}, {k}]", q.rows, q.cols),
                 ));
             }
-            if batch * m > SMALL_M && !int8_activations() {
+            if (batch * m > SMALL_M || ws.float_act) && !int8_activations() {
                 if qbf16::available(ctx) && batch * m >= qbf16::MIN_M {
                     qbf16::matmul(ctx, ws, &aop, q, d, &epi);
                 } else {

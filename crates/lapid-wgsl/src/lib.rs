@@ -39,7 +39,7 @@ use lapid_compiler::{
 use lapid_tensor::{DType, Error, Result};
 
 pub use elementwise::IdxMode;
-pub use split::{SubLaunch, plan_split};
+pub use split::{Ranges, SubLaunch, plan_split};
 pub use template::fill;
 
 /// What the target device can do, as far as code generation is concerned.
@@ -131,12 +131,16 @@ pub enum Key {
     AttnSplit(Arc<AttentionSpec>, bool, u32),
     /// Flash attention on cooperative matrices (head dim 64, many queries).
     AttnCoop(Arc<AttentionSpec>),
+    /// Flash attention on cooperative matrices for wide heads (head dim 256 / 512 baked in).
+    AttnCoopWide(Arc<AttentionSpec>, u32),
     /// Merge stage of `AttnSplit(_, false)`.
     AttnMerge(Arc<AttentionSpec>),
     /// take_along_axis (exact element copy).
     GatherAxis(Arc<GatherAxisSpec>),
     /// Top-k indices per row; `true` = argmax variant (k = 1).
     TopK(Arc<TopKSpec>, bool),
+    /// Top-k for small k and rows (k rounds of a workgroup argmax; needs subgroups).
+    TopKSmall(Arc<TopKSpec>),
     /// Mixture-of-experts matmul (one lane group per output column).
     MatMulId(Arc<MatMulIdSpec>),
     /// MoE prefill stage 1: bucket (token, slot) pairs by expert (one workgroup; experts
@@ -146,6 +150,9 @@ pub enum Key {
     GemmIdCoop(Arc<MatMulIdSpec>),
     /// Gated delta rule (one lane group per state column; state rows per lane baked in).
     GatedDeltaNet(Arc<GatedDeltaNetSpec>, u32),
+    /// Gated delta rule, few lanes per column (32-lane full subgroups): (rows per lane,
+    /// lanes per column).
+    GatedDeltaNet8(Arc<GatedDeltaNetSpec>, u32, u32),
 }
 
 /// Backend buffer bound after a kernel's output.
@@ -167,13 +174,13 @@ impl Key {
             Key::Reduce(s, _) => s.in_dtypes.len(),
             Key::Gemm(s) | Key::GemmCoop(s) | Key::Gemv(s, ..) => 2 + s.extra_dtypes.len(),
             Key::Gather(_) | Key::GatherAxis(_) => 2,
-            Key::TopK(..) => 1,
+            Key::TopK(..) | Key::TopKSmall(_) => 1,
             Key::MatMulId(_) | Key::MoeRoute(_) | Key::GemmIdCoop(_) => 3,
-            Key::GatedDeltaNet(..) => 6,
+            Key::GatedDeltaNet(..) | Key::GatedDeltaNet8(..) => 6,
             Key::Softmax(_) => 1,
             Key::LayerNorm(_) => 3,
             Key::RmsNorm(_) => 2,
-            Key::AttnTile(s, _) | Key::AttnCoop(s) | Key::AttnSplit(s, ..) | Key::AttnMerge(s) => 3 + s.mask_dtype.is_some() as usize,
+            Key::AttnTile(s, _) | Key::AttnCoop(s) | Key::AttnCoopWide(s, _) | Key::AttnSplit(s, ..) | Key::AttnMerge(s) => 3 + s.mask_dtype.is_some() as usize,
         }
     }
 
@@ -204,7 +211,8 @@ impl Key {
             && match self {
                 Key::Reduce(_, row) => *row,
                 Key::TopK(_, argmax) => *argmax,
-                Key::Gemv(..) | Key::MatMulId(_) | Key::GatedDeltaNet(..) | Key::GemmCoop(_) | Key::GemmIdCoop(_) | Key::Softmax(_) | Key::LayerNorm(_) | Key::RmsNorm(_) | Key::AttnSplit(..) | Key::AttnCoop(_) => true,
+                Key::TopKSmall(_) => true,
+                Key::Gemv(..) | Key::MatMulId(_) | Key::GatedDeltaNet(..) | Key::GatedDeltaNet8(..) | Key::GemmCoop(_) | Key::GemmIdCoop(_) | Key::Softmax(_) | Key::LayerNorm(_) | Key::RmsNorm(_) | Key::AttnSplit(..) | Key::AttnCoop(_) | Key::AttnCoopWide(..) => true,
                 _ => false,
             }
     }
@@ -238,12 +246,13 @@ impl Key {
             Key::AttnSplit(..) => "attention_split",
             Key::AttnMerge(_) => "attention_merge",
             Key::AttnCoop(_) => "attention_coop",
+            Key::AttnCoopWide(..) => "attention_coop_wide",
             Key::GatherAxis(_) => "gather_axis",
-            Key::TopK(..) => "topk",
+            Key::TopK(..) | Key::TopKSmall(_) => "topk",
             Key::MatMulId(_) => "matmul_id",
             Key::MoeRoute(_) => "moe_route",
             Key::GemmIdCoop(_) => "gemm_id_coop",
-            Key::GatedDeltaNet(..) => "gated_delta_net",
+            Key::GatedDeltaNet(..) | Key::GatedDeltaNet8(..) => "gated_delta_net",
         }
     }
 }
@@ -301,12 +310,15 @@ pub fn source(key: &Key, caps: &Caps) -> String {
         Key::AttnSplit(s, direct, d) => attention::source_split(s, *direct, *d, caps),
         Key::AttnMerge(s) => attention::source_merge(s, caps),
         Key::AttnCoop(s) => attention::source_coop(s, caps),
+        Key::AttnCoopWide(s, d) => attention::source_coop_wide(s, *d, caps),
         Key::GatherAxis(s) => gather::source_axis(s, caps),
         Key::TopK(s, argmax) => topk::source(s, *argmax, caps),
+        Key::TopKSmall(s) => topk::source_small(s, caps),
         Key::MatMulId(s) => moe::source(s, caps),
         Key::MoeRoute(emax) => moe::source_route(*emax, caps),
         Key::GemmIdCoop(s) => matmul::source_coop_id(s, caps),
         Key::GatedDeltaNet(s, np) => delta::source(s, *np, caps),
+        Key::GatedDeltaNet8(s, np, lpc) => delta::source8(s, *np, *lpc, caps),
     }
 }
 

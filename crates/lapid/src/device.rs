@@ -13,6 +13,13 @@ pub struct Device {
     pub(crate) rt: Arc<crate::runtime::Runtime>,
 }
 
+/// One usable device (see [`Device::list_info`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub name: String,
+    pub description: String,
+}
+
 impl std::fmt::Debug for Device {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Device({})", self.description())
@@ -30,7 +37,9 @@ impl Device {
             if !name.is_empty() {
                 match Device::from_name(name) {
                     Ok(d) => return d,
-                    Err(e) => eprintln!("lapid: LAPID_DEVICE={name} is unavailable ({e}); selecting a device automatically"),
+                    Err(e) => crate::log::emit(&format!(
+                        "lapid: LAPID_DEVICE={name} is unavailable ({e}); selecting a device automatically"
+                    )),
                 }
             }
         }
@@ -47,6 +56,18 @@ impl Device {
         out.extend(vulkan_lines());
         out.extend(wg::lines());
         out
+    }
+
+    /// [`Device::list`] as structured entries: `name` is what [`Device::from_name`] accepts
+    /// ("cpu", "vulkan:0", ...), `description` the rest of the line.
+    pub fn list_info() -> Vec<DeviceInfo> {
+        Device::list()
+            .into_iter()
+            .map(|line| match line.split_once(": ") {
+                Some((name, desc)) => DeviceInfo { name: name.to_string(), description: desc.to_string() },
+                None => DeviceInfo { name: line, description: String::new() },
+            })
+            .collect()
     }
 
     pub fn cpu() -> Device {
@@ -137,6 +158,12 @@ impl Device {
     /// Evaluate (if needed) and copy to host as f32 (casting f16/bf16/i32).
     pub fn to_vec_f32(&self, t: &Tensor) -> Result<Vec<f32>> {
         self.rt.to_vec_f32(t)
+    }
+
+    /// Evaluate (if needed) and copy the raw storage bytes to host, in the tensor's own dtype
+    /// (f16/bf16 little endian, quantized tensors in their lapid-quant layout).
+    pub fn to_vec_bytes(&self, t: &Tensor) -> Result<Vec<u8>> {
+        self.rt.to_vec_bytes(t)
     }
 
     pub fn to_vec_i32(&self, t: &Tensor) -> Result<Vec<i32>> {

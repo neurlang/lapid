@@ -49,8 +49,11 @@ const ROUTE_EMAX: usize = 4096;
 /// (each expert's weights read once per 64-row tile instead of once per pair).
 fn grouped(spec: &MatMulIdSpec, d: &MatMulIdDims, caps: &Caps) -> bool {
     let w = spec.w_dtype;
+    // at least ~4 rows per expert on average (decode's down projection, t = 8 pairs with
+    // r = 1, stays on the per-pair kernel)
     caps.coopmat
         && d.t > 4
+        && d.t * d.r >= 4 * d.e
         && d.e <= ROUTE_EMAX
         && matches!(w, DType::F16 | DType::Int8 | DType::Int4 | DType::Q4K | DType::Q5K | DType::Q6K)
         && spec.x_dtype != DType::BF16
@@ -120,10 +123,16 @@ fn w_loader(d: DType, caps: &Caps) -> String {
 }
 
 pub(super) fn source(spec: &MatMulIdSpec, caps: &Caps) -> String {
-    let mut bindings = common::input(1, "a", spec.x_dtype, caps);
-    bindings.push_str(
-        "fn lda4(e: u32) -> vec4<f32> {\n    return vec4<f32>(ld_a(e), ld_a(e + 1u), ld_a(e + 2u), ld_a(e + 3u));\n}\n",
-    );
+    // f32 x with K % 4 == 0 (always for K-quant experts): vec4 loads
+    let mut bindings = if spec.x_dtype == DType::F32 && (kquant::is_k(spec.w_dtype) || spec.w_dtype == DType::Int8) {
+        "@group(0) @binding(1) var<storage, read> a4: array<vec4<f32>>;\n\
+         fn lda4(e: u32) -> vec4<f32> {\n    return a4[e >> 2u];\n}\n"
+            .to_string()
+    } else {
+        let mut b = common::input(1, "a", spec.x_dtype, caps);
+        b.push_str("fn lda4(e: u32) -> vec4<f32> {\n    return vec4<f32>(ld_a(e), ld_a(e + 1u), ld_a(e + 2u), ld_a(e + 3u));\n}\n");
+        b
+    };
     bindings.push_str(&w_loader(spec.w_dtype, caps));
     bindings.push_str(&common::output(4, spec.out_dtype, caps));
     let dot = if kquant::is_k(spec.w_dtype) {
@@ -133,6 +142,12 @@ pub(super) fn source(spec: &MatMulIdSpec, caps: &Caps) -> String {
              for (var idx = lane; idx < nb * 8u; idx += lanes) {{\n                let blk = idx >> 3u;\n                \
              part = part + w_kdot(row_byte + blk * {bb}u, idx & 7u, a_row + blk * 256u);\n            }}\n"
         )
+    } else if spec.w_dtype == DType::Int8 {
+        // one 4-element word per lane step (K % 32 == 0)
+        "            let wb = x * P[5];\n            for (var k4 = lane; k4 < K / 4u; k4 += lanes) {\n                \
+         let e = j * K + k4 * 4u;\n                let sc = unpack2x16float(w[wb + P[4] + (e >> 6u)])[(e >> 5u) & 1u];\n                \
+         part = part + dot(vec4<f32>(unpack4xI8(w[wb + (e >> 2u)])), lda4(a_row + k4 * 4u)) * sc;\n            }\n"
+            .to_string()
     } else {
         "            for (var k = lane; k < K; k += lanes) {\n                part = part + ld_a(a_row + k) * wdeq(x, j * K + k);\n            }\n"
             .to_string()

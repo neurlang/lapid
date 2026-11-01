@@ -404,7 +404,16 @@ impl Lowerer {
             return true;
         }
         let u = self.users_of(t);
-        if u <= 1 || (ops <= 1 && u <= 2) {
+        if u <= 1 {
+            return false;
+        }
+        // A consumer reads it from a buffer anyway (e.g. a norm of `x + attn` whose sum is also
+        // the residual): write it once (often as a matmul epilogue) and let every user read it,
+        // instead of recomputing it — and a pending matmul inside it — in the other users.
+        if self.heavy_users.contains(&t.id()) {
+            return true;
+        }
+        if ops <= 1 && u <= 2 {
             return false;
         }
         // Two fusing consumers: recompute a cheap expression in both. Not with a pending

@@ -43,6 +43,13 @@ pub(super) fn plan(spec: &Arc<AttentionSpec>, d: &AttentionDims, caps: &Caps) ->
     if let Some(m) = &d.mask {
         p.view(m, 4)?;
     }
+    if caps.coopmat && caps.f16 && d.sq > 8 && matches!(d.d, 256 | 512) {
+        // wide heads (Gemma 4): 16-query blocks on cooperative matrices
+        let nqb = d.sq.div_ceil(16);
+        p.0[6] = u32::try_from(nqb).map_err(|_| bad("attention: too many queries"))?;
+        let items = (d.batch * d.heads * nqb) as u64;
+        return Ok(Plan { scratch: 0, next: None, key: Key::AttnCoopWide(spec.clone(), d.d as u32), params: p.0, groups: grid(items, caps) });
+    }
     if tile && caps.coopmat && d.d == 64 {
         let items = (d.batch * d.heads * q_blocks) as u64;
         return Ok(Plan { scratch: 0, next: None, key: Key::AttnCoop(spec.clone()), params: p.0, groups: grid(items, caps) });
@@ -113,6 +120,20 @@ pub(super) fn source_coop(spec: &AttentionSpec, caps: &Caps) -> String {
     let mut flags = split_flags(spec, false);
     flags.push("COOPMAT");
     template::module(caps, COOP, &[("BINDINGS", &b)], &flags, 256, true)
+}
+
+const COOP_WIDE: &str = include_str!("kernels/attn_coop_wide.wgsl");
+
+pub(super) fn source_coop_wide(spec: &AttentionSpec, d: u32, caps: &Caps) -> String {
+    let b = bindings(spec, caps);
+    let mut flags = split_flags(spec, false);
+    flags.push("COOPMAT");
+    match d / 128 {
+        2 => flags.push("NT2"),
+        4 => flags.push("NT4"),
+        _ => {}
+    }
+    template::module(caps, COOP_WIDE, &[("BINDINGS", &b), ("D", &d.to_string())], &flags, 256, true)
 }
 
 pub(super) fn source_merge(spec: &AttentionSpec, caps: &Caps) -> String {

@@ -108,6 +108,22 @@ fn attention_case(sq: usize, sk: usize, encoder: bool) -> Case {
     }
 }
 
+/// Causal prefill attention with wide heads (Gemma 4: d 256 sliding / 512 full).
+fn attention_wide_case(s: usize, h: usize, d: usize) -> Case {
+    let spec = Arc::new(AttentionSpec { dtype: DType::F32, mask_dtype: None, causal: true, out_dtype: DType::F32 });
+    let v = View::contiguous(&[1, h, s, d]);
+    let dims = AttentionDims { batch: 1, heads: h, sq: s, sk: s, d, scale: 1f32.to_bits(), q: v.clone(), k: v.clone(), v: v.clone(), mask: None };
+    let sizes = vec![h * s * d * 4; 4];
+    Case {
+        name: format!("attention causal s={s} h={h} d={d}"),
+        launch: Launch { kernel: Kernel::Attention(spec, dims), inputs: vec![0, 1, 2], output: 3 },
+        cold: vec![],
+        flops: 2.0 * (h * s * s * d) as f64,
+        bytes: sizes.iter().sum::<usize>() as f64,
+        sizes,
+    }
+}
+
 fn layer_norm_case(rows: usize) -> Case {
     let spec = Arc::new(LayerNormSpec { in_dtype: DType::F32, param_dtype: DType::F32, out_dtype: DType::F32 });
     let dims = LayerNormDims { rows, cols: 768, eps: 1e-5f32.to_bits() };
@@ -168,6 +184,8 @@ fn cases() -> Vec<Case> {
         v.push(matmul_id_case(512, 8, 256, 512, 2048, w));
         v.push(matmul_id_case(512, 8, 256, 2048, 512, w));
     }
+    v.push(attention_wide_case(512, 8, 256));
+    v.push(attention_wide_case(512, 8, 512));
     v.push(gdn_case(1, 32, 128));
     v.push(gdn_case(512, 32, 128));
     for b in [DType::Int8, DType::F16] {

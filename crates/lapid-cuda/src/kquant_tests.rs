@@ -283,7 +283,7 @@ fn ids_for(t: usize, r: usize, e: usize, seed: u64) -> Vec<i32> {
 fn matmul_id() {
     let Some(be) = cuda() else { return };
     for w_t in [DType::F16, DType::Int8, DType::Int4, DType::Q4K, DType::Q6K] {
-        for (t, r, e, n, k, tol) in [(1, 2, 5, 70, 256, 1e-5), (3, 2, 4, 33, 512, 1e-5), (70, 3, 7, 150, 256, 2e-3)] {
+        for (t, r, e, n, k, tol) in [(1, 2, 5, 70, 256, 1e-5), (3, 2, 4, 33, 512, 1e-5), (70, 3, 7, 150, 256, 2e-3), (200, 2, 3, 150, 256, 2e-3), (64, 8, 64, 96, 256, 2e-3), (8, 1, 6, 40, 256, 1e-5)] {
             let ids = ids_for(t, r, e, 5 + t as u64);
             let (got, want) = run_id(&be, DType::F32, w_t, (t, r, e, n, k), &ids).unwrap();
             check(&format!("matmul_id {w_t:?} t{t} r{r} e{e} n{n} k{k}"), &got, &want, tol);

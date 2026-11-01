@@ -479,8 +479,8 @@ fn finish(spec: &AttentionSpec, dm: &Dims) -> String {
     g.finish()
 }
 
-pub(super) fn source(spec: &AttentionSpec, d: u32, vec: bool) -> String {
-    let dm = dims(d, spec.dtype != DType::F16);
+pub(super) fn source(spec: &AttentionSpec, d: u32, vec: bool, precise: bool) -> String {
+    let dm = dims(d, precise);
     let (args, ptrs) = ptx::args(&names(spec, false));
     let vec = vec && matches!(spec.dtype, DType::F16 | DType::F32);
     let kv_items = if vec { dm.bk * dm.d / 8 } else { dm.bk * dm.d };

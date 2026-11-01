@@ -11,15 +11,11 @@ use crate::ir::{
     AttentionDims, AttentionSpec, BufId, Kernel, LayerNormDims, LayerNormSpec, RowDims, SoftmaxSpec, View,
 };
 
-/// Emit `Kernel::RmsNorm` (`LAPID_RMS_NORM=0|1` overrides; the decomposition is reduce + one
-/// fused elementwise).
+/// Emit `Kernel::RmsNorm` (every backend has it; `LAPID_RMS_NORM=0` falls back to the
+/// decomposition: reduce + one fused elementwise).
 fn native_rms_norm_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("LAPID_RMS_NORM").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => false,
-    })
+    *ON.get_or_init(|| std::env::var("LAPID_RMS_NORM").map_or(true, |v| v.trim() != "0"))
 }
 
 impl Lowerer {

@@ -1,35 +1,37 @@
-// Attention for few queries (decoder), split over keys ("flash decoding").
-// One T-thread block (T = max(256, D) rounded to warps, NW warps) per (batch, head, query,
-// chunk of 64 keys):
+// Attention for few queries (decoder) or wide heads, split over keys ("flash decoding").
+// One T-thread block (T = max(256, D) rounded to warps, NW warps) per (batch, head, group of
+// QB queries, chunk of 64 keys); the QB queries share every K / V load:
 //   scores: warp w takes keys w, w + NW, ...; lanes stride the head dim (coalesced rows),
-//           warp butterfly sum;
-//   softmax of the chunk: every warp computes max / exp / sum redundantly from shared
-//           memory (lane owns keys lane and lane + 32), so no extra barrier is needed;
-//   P V: threads split as (key group g < G, dim lane) and reduce the G partials.
+//           one dot per query, warp butterfly sums;
+//   softmax of the chunk: warp q < QB handles query q (lane owns keys lane and lane + 32);
+//   P V: threads split as (key group g < G, dim lane), QB accumulators each, then the G
+//        partials are reduced.
 // DIRECT (one chunk covers all keys): normalize and write the output. Otherwise write the
-// partial (m, l, o[D]) to scratch; `attn_merge` combines the chunks.
-// Head dim D is baked in (constant trip counts, predicated loads, unrolled by ptxas).
+// partial (m, l, o[D]) per query to scratch; `attn_merge` combines the chunks.
+// Head dim D and QB are baked in (constant trip counts, predicated loads, unrolled by ptxas).
 // "No score" is the lowest finite f32; real -inf mask values compare below it.
 // Params: [B, H, sq, sk, d, scale_bits, nsplit, q(off, s0..s3), k(..), v(..), mask(..)?]
-.shared .align 16 .f32 qsh[{{T}}];
-.shared .align 16 .f32 dots[{{DOTS}}];
-.shared .align 16 .f32 pp[64];
-.shared .align 16 .f32 part[{{T}}];
+.shared .align 16 .f32 qsh[{{QD}}];
+.shared .align 16 .f32 dots[{{QDOTS}}];
+.shared .align 16 .f32 pp[{{QP}}];
+.shared .align 16 .f32 part[{{QT}}];
+.shared .align 16 .f32 ml[{{Q2}}];
 
 .visible .entry lapid_main(
 {{ARGS}}
 )
 .maxntid {{T}}, 1, 1
 {
-    .reg .pred %p, %pv;
-    .reg .b32 %tx, %lane, %warp, %item, %NS, %split, %bhq, %qi, %bh, %h, %b, %H, %SQ, %SK;
-    .reg .b32 %qbase, %kbase, %vbase, %ks, %kd, %vs, %vd, %kend, %k0, %kn, %u, %c, %kj, %kc, %kr, %dd, %t, %a;
-    .reg .b32 %grp, %dl;
+    .reg .pred %p, %pv, %pq;
+    .reg .b32 %tx, %lane, %warp, %item, %NS, %split, %g, %qg, %nqg, %q0, %qi, %q, %bh, %h, %b, %H, %SQ, %SK;
+    .reg .b32 %qbase, %kbase, %vbase, %qs, %qd, %ks, %kd, %vs, %vd, %kend, %k0, %kn, %knq, %u, %c, %kj, %kc, %kr, %dd, %t, %a, %e;
+    .reg .b32 %grp, %dl, %row;
     .reg .s32 %st;
     .reg .b64 %rd_s;
-    .reg .f32 %scale, %x, %kv, %qv, %sh, %m, %l, %sc0, %sc1, %p0, %p1, %acc, %pt, %vv, %tot;
+    .reg .f32 %scale, %x, %kv, %qv, %sh, %m, %l, %sc0, %sc1, %p0, %p1, %pt, %vv, %tot;
+{{REGS}}
 // #if MASK
-    .reg .b32 %mrow, %mstep;
+    .reg .b32 %mrow0, %mrow, %mq, %mstep;
     .reg .f32 %mv;
 // #endif
 {{PTRS}}
@@ -42,19 +44,22 @@
     ld.param.u32 %SK, [P+12];
     ld.param.f32 %scale, [P+20];
     ld.param.u32 %NS, [P+24];
+    add.u32 %nqg, %SQ, {{QB1}};
+    div.u32 %nqg, %nqg, {{QB}};
     rem.u32 %split, %item, %NS;
-    div.u32 %bhq, %item, %NS;
-    rem.u32 %qi, %bhq, %SQ;
-    div.u32 %bh, %bhq, %SQ;
+    div.u32 %g, %item, %NS;
+    rem.u32 %qg, %g, %nqg;
+    div.u32 %bh, %g, %nqg;
     rem.u32 %h, %bh, %H;
     div.u32 %b, %bh, %H;
+    mul.lo.u32 %q0, %qg, {{QB}};
     ld.param.u32 %qbase, [P+28];
     ld.param.u32 %t, [P+32];
     mad.lo.u32 %qbase, %b, %t, %qbase;
     ld.param.u32 %t, [P+36];
     mad.lo.u32 %qbase, %h, %t, %qbase;
-    ld.param.u32 %t, [P+40];
-    mad.lo.u32 %qbase, %qi, %t, %qbase;
+    ld.param.u32 %qs, [P+40];
+    ld.param.u32 %qd, [P+44];
     ld.param.u32 %kbase, [P+48];
     ld.param.u32 %t, [P+52];
     mad.lo.u32 %kbase, %b, %t, %kbase;
@@ -70,18 +75,19 @@
     ld.param.u32 %vs, [P+80];
     ld.param.u32 %vd, [P+84];
 // #if MASK
-    ld.param.u32 %mrow, [P+88];
+    ld.param.u32 %mrow0, [P+88];
     ld.param.u32 %t, [P+92];
-    mad.lo.u32 %mrow, %b, %t, %mrow;
+    mad.lo.u32 %mrow0, %b, %t, %mrow0;
     ld.param.u32 %t, [P+96];
-    mad.lo.u32 %mrow, %h, %t, %mrow;
-    ld.param.u32 %t, [P+100];
-    mad.lo.u32 %mrow, %qi, %t, %mrow;
+    mad.lo.u32 %mrow0, %h, %t, %mrow0;
+    ld.param.u32 %mq, [P+100];
     ld.param.u32 %mstep, [P+104];
 // #endif
+    // visible keys of the group = those of its last query
+    add.u32 %t, %q0, {{QB}};
+    min.u32 %t, %t, %SQ;
 // #if CAUSAL
-    add.s32 %st, %qi, 1;
-    add.s32 %st, %st, %SK;
+    add.s32 %st, %t, %SK;
     sub.s32 %st, %st, %SQ;
     max.s32 %st, %st, 0;
     min.s32 %st, %st, %SK;
@@ -99,70 +105,75 @@
     setp.eq.u32 %p, %kn, 0;
     @%p bra EMPTY;
 
-    // q * scale -> shared
-    setp.ge.u32 %p, %tx, {{D}};
+    // q * scale -> shared [QB][D] (rows past sq repeat the last query)
+    mov.u32 %e, %tx;
+Q_LOOP:
+    setp.ge.u32 %p, %e, {{QD}};
     @%p bra Q_DONE;
-    ld.param.u32 %t, [P+44];
-    mad.lo.u32 %t, %tx, %t, %qbase;
+    div.u32 %q, %e, {{D}};
+    rem.u32 %dd, %e, {{D}};
+    add.u32 %qi, %q0, %q;
+    sub.u32 %t, %SQ, 1;
+    min.u32 %qi, %qi, %t;
+    mad.lo.u32 %t, %qi, %qs, %qbase;
+    mad.lo.u32 %t, %dd, %qd, %t;
 {{LOAD_Q}}
     mul.f32 %qv, %qv, %scale;
     mov.u32 %a, qsh;
-    mad.lo.u32 %a, %tx, 4, %a;
+    mad.lo.u32 %a, %e, 4, %a;
     st.shared.f32 [%a], %qv;
+    add.u32 %e, %e, {{T}};
+    bra Q_LOOP;
 Q_DONE:
     bar.sync 0;
 
-    // scores of keys warp + 8u
-    mov.u32 %u, 0;
-SC_LOOP:
-    mad.lo.u32 %kj, %u, {{NW}}, %warp;
-    setp.lt.u32 %pv, %kj, %kn;
-    selp.b32 %kc, %kj, 0, %pv;
-    add.u32 %kr, %k0, %kc;
-    mad.lo.u32 %kr, %kr, %ks, %kbase;
-    mov.f32 %x, 0f00000000;
+    // scores of keys warp + NW u (u < SCU), all accumulated over one pass of the head dim:
+    // per 32-dim slice the lane's q values sit in registers, each K element is loaded once
     mov.u32 %c, 0;
+{{SC_ZERO}}
 SC_D:
     mad.lo.u32 %dd, %c, 32, %lane;
     setp.lt.u32 %p, %dd, {{D}};
     selp.b32 %dd, %dd, 0, %p;
-    mad.lo.u32 %t, %dd, %kd, %kr;
-{{LOAD_K}}
     mov.u32 %a, qsh;
     mad.lo.u32 %a, %dd, 4, %a;
-    ld.shared.f32 %qv, [%a];
-    selp.f32 %qv, %qv, 0f00000000, %p;
-    fma.rn.f32 %x, %qv, %kv, %x;
+{{SC_BODY}}
     add.u32 %c, %c, 1;
     setp.lt.u32 %p, %c, {{DC}};
     @%p bra SC_D;
-    shfl.sync.bfly.b32 %sh, %x, 16, 31, -1;
-    add.f32 %x, %x, %sh;
-    shfl.sync.bfly.b32 %sh, %x, 8, 31, -1;
-    add.f32 %x, %x, %sh;
-    shfl.sync.bfly.b32 %sh, %x, 4, 31, -1;
-    add.f32 %x, %x, %sh;
-    shfl.sync.bfly.b32 %sh, %x, 2, 31, -1;
-    add.f32 %x, %x, %sh;
-    shfl.sync.bfly.b32 %sh, %x, 1, 31, -1;
-    add.f32 %x, %x, %sh;
-    setp.eq.u32 %p, %lane, 0;
-    mov.u32 %a, dots;
-    mad.lo.u32 %a, %kj, 4, %a;
-    @%p st.shared.f32 [%a], %x;
-    add.u32 %u, %u, 1;
-    setp.lt.u32 %p, %u, {{SCU}};
-    @%p bra SC_LOOP;
+{{SC_RED}}
     bar.sync 0;
 
-    // chunk softmax (every warp): lane owns keys lane and lane + 32
+    // chunk softmax: warp q < QB, lane owns keys lane and lane + 32
+    setp.ge.u32 %p, %warp, {{QB}};
+    @%p bra SM_DONE;
+    add.u32 %qi, %q0, %warp;
+// #if CAUSAL
+    add.s32 %st, %qi, 1;
+    add.s32 %st, %st, %SK;
+    sub.s32 %st, %st, %SQ;
+    max.s32 %st, %st, 0;
+    min.s32 %st, %st, %SK;
+    sub.s32 %st, %st, %k0;
+    max.s32 %st, %st, 0;
+    min.s32 %st, %st, 64;
+    mov.b32 %knq, %st;
+// #endif
+// #if !CAUSAL
+    mov.u32 %knq, %kn;
+// #endif
+    setp.lt.u32 %pq, %qi, %SQ;
+    selp.b32 %knq, %knq, 0, %pq;
     mov.u32 %a, dots;
+    mad.lo.u32 %a, %warp, {{DOTS4}}, %a;
     mad.lo.u32 %a, %lane, 4, %a;
     ld.shared.f32 %sc0, [%a];
     ld.shared.f32 %sc1, [%a+128];
 // #if MASK
+    sub.u32 %t, %SQ, 1;
+    min.u32 %t, %qi, %t;
+    mad.lo.u32 %mrow, %t, %mq, %mrow0;
     add.u32 %t, %k0, %lane;
-    min.u32 %t, %t, %SK;
     sub.u32 %c, %SK, 1;
     min.u32 %t, %t, %c;
     mad.lo.u32 %t, %t, %mstep, %mrow;
@@ -175,10 +186,10 @@ SC_D:
 {{LOAD_M}}
     add.f32 %sc1, %sc1, %mv;
 // #endif
-    setp.lt.u32 %p, %lane, %kn;
+    setp.lt.u32 %p, %lane, %knq;
     selp.f32 %sc0, %sc0, 0fFF7FFFFF, %p;
     add.u32 %t, %lane, 32;
-    setp.lt.u32 %p, %t, %kn;
+    setp.lt.u32 %p, %t, %knq;
     selp.f32 %sc1, %sc1, 0fFF7FFFFF, %p;
     max.f32 %m, %sc0, %sc1;
     shfl.sync.bfly.b32 %sh, %m, 16, 31, -1;
@@ -199,9 +210,9 @@ SC_D:
     mul.f32 %p1, %p1, 0f3FB8AA3B;
     ex2.approx.f32 %p1, %p1;
     setp.gt.f32 %pv, %m, 0fFF7FFFFF;
-    setp.lt.and.u32 %p, %lane, %kn, %pv;
+    setp.lt.and.u32 %p, %lane, %knq, %pv;
     selp.f32 %p0, %p0, 0f00000000, %p;
-    setp.lt.and.u32 %p, %t, %kn, %pv;
+    setp.lt.and.u32 %p, %t, %knq, %pv;
     selp.f32 %p1, %p1, 0f00000000, %p;
     add.f32 %l, %p0, %p1;
     shfl.sync.bfly.b32 %sh, %l, 16, 31, -1;
@@ -214,17 +225,24 @@ SC_D:
     add.f32 %l, %l, %sh;
     shfl.sync.bfly.b32 %sh, %l, 1, 31, -1;
     add.f32 %l, %l, %sh;
-    setp.eq.u32 %p, %warp, 0;
     mov.u32 %a, pp;
+    mad.lo.u32 %a, %warp, 256, %a;
     mad.lo.u32 %a, %lane, 4, %a;
-    @%p st.shared.f32 [%a], %p0;
-    @%p st.shared.f32 [%a+128], %p1;
+    st.shared.f32 [%a], %p0;
+    st.shared.f32 [%a+128], %p1;
+    setp.ne.u32 %p, %lane, 0;
+    @%p bra SM_DONE;
+    mov.u32 %a, ml;
+    mad.lo.u32 %a, %warp, 8, %a;
+    st.shared.f32 [%a], %m;
+    st.shared.f32 [%a+4], %l;
+SM_DONE:
     bar.sync 0;
 
     // P V: thread (grp, dl) sums keys grp, grp + G, ...
     div.u32 %grp, %tx, {{D}};
     rem.u32 %dl, %tx, {{D}};
-    mov.f32 %acc, 0f00000000;
+{{PV_ZERO}}
     setp.ge.u32 %p, %grp, {{G}};
     @%p bra V_DONE;
     mov.u32 %u, 0;
@@ -232,29 +250,34 @@ V_LOOP:
     mad.lo.u32 %kj, %u, {{G}}, %grp;
     setp.lt.u32 %pv, %kj, %kn;
     selp.b32 %kc, %kj, 0, %pv;
-    mov.u32 %a, pp;
-    mad.lo.u32 %a, %kc, 4, %a;
-    ld.shared.f32 %pt, [%a];
-    selp.f32 %pt, %pt, 0f00000000, %pv;
     add.u32 %t, %k0, %kc;
     mad.lo.u32 %t, %t, %vs, %vbase;
     mad.lo.u32 %t, %dl, %vd, %t;
 {{LOAD_V}}
-    fma.rn.f32 %acc, %pt, %vv, %acc;
+    selp.f32 %vv, %vv, 0f00000000, %pv;
+    mov.u32 %a, pp;
+    mad.lo.u32 %a, %kc, 4, %a;
+{{PV_FMA}}
     add.u32 %u, %u, 1;
     setp.lt.u32 %p, %u, {{VT}};
     @%p bra V_LOOP;
 V_DONE:
     mov.u32 %a, part;
     mad.lo.u32 %a, %tx, 4, %a;
-    st.shared.f32 [%a], %acc;
+{{PV_ST}}
     bar.sync 0;
     setp.ge.u32 %p, %tx, {{D}};
+    @%p bra DONE;
+    mov.u32 %q, 0;
+OUT_LOOP:
+    add.u32 %qi, %q0, %q;
+    setp.ge.u32 %p, %qi, %SQ;
     @%p bra DONE;
     mov.f32 %tot, 0f00000000;
     mov.u32 %u, 0;
 SUM_LOOP:
     mad.lo.u32 %t, %u, {{D}}, %tx;
+    mad.lo.u32 %t, %q, {{T}}, %t;
     mov.u32 %a, part;
     mad.lo.u32 %a, %t, 4, %a;
     ld.shared.f32 %x, [%a];
@@ -262,35 +285,72 @@ SUM_LOOP:
     add.u32 %u, %u, 1;
     setp.lt.u32 %p, %u, {{G}};
     @%p bra SUM_LOOP;
-    bra OUT;
-EMPTY:
-    mov.f32 %tot, 0f00000000;
-    mov.f32 %m, 0fFF7FFFFF;
-    mov.f32 %l, 0f00000000;
-    setp.ge.u32 %p, %tx, {{D}};
-    @%p bra DONE;
-OUT:
+    mov.u32 %a, ml;
+    mad.lo.u32 %a, %q, 8, %a;
+    ld.shared.f32 %m, [%a];
+    ld.shared.f32 %l, [%a+4];
+    mad.lo.u32 %row, %bh, %SQ, %qi;
 // #if DIRECT
     div.rn.f32 %x, %tot, %l;
     setp.gt.f32 %p, %l, 0f00000000;
     selp.f32 %x, %x, 0f00000000, %p;
-    mad.lo.u32 %t, %bhq, {{D}}, %tx;
+    mad.lo.u32 %t, %row, {{D}}, %tx;
 {{STORE}}
 // #endif
 // #if !DIRECT
-    mul.lo.u32 %t, %item, {{D2}};
-    add.u32 %t, %t, %tx;
-    mul.wide.u32 %rd_s, %t, 4;
+    mad.lo.u32 %t, %row, %NS, %split;
+    mul.lo.u32 %t, %t, {{D2}};
+    add.u32 %c, %t, %tx;
+    mul.wide.u32 %rd_s, %c, 4;
     add.s64 %rd_s, %rd_s, %g_scr;
     st.global.f32 [%rd_s+8], %tot;
     setp.ne.u32 %p, %tx, 0;
-    @%p bra DONE;
-    mul.lo.u32 %t, %item, {{D2}};
+    @%p bra OUT_NEXT;
     mul.wide.u32 %rd_s, %t, 4;
     add.s64 %rd_s, %rd_s, %g_scr;
     st.global.f32 [%rd_s], %m;
     st.global.f32 [%rd_s+4], %l;
+OUT_NEXT:
 // #endif
+    add.u32 %q, %q, 1;
+    setp.lt.u32 %p, %q, {{QB}};
+    @%p bra OUT_LOOP;
+    bra DONE;
+EMPTY:
+    setp.ge.u32 %p, %tx, {{D}};
+    @%p bra DONE;
+    mov.f32 %tot, 0f00000000;
+    mov.f32 %m, 0fFF7FFFFF;
+    mov.f32 %l, 0f00000000;
+    mov.u32 %q, 0;
+E_LOOP:
+    add.u32 %qi, %q0, %q;
+    setp.ge.u32 %p, %qi, %SQ;
+    @%p bra DONE;
+    mad.lo.u32 %row, %bh, %SQ, %qi;
+// #if DIRECT
+    mov.f32 %x, 0f00000000;
+    mad.lo.u32 %t, %row, {{D}}, %tx;
+{{STORE}}
+// #endif
+// #if !DIRECT
+    mad.lo.u32 %t, %row, %NS, %split;
+    mul.lo.u32 %t, %t, {{D2}};
+    add.u32 %c, %t, %tx;
+    mul.wide.u32 %rd_s, %c, 4;
+    add.s64 %rd_s, %rd_s, %g_scr;
+    st.global.f32 [%rd_s+8], %tot;
+    setp.ne.u32 %p, %tx, 0;
+    @%p bra E_NEXT;
+    mul.wide.u32 %rd_s, %t, 4;
+    add.s64 %rd_s, %rd_s, %g_scr;
+    st.global.f32 [%rd_s], %m;
+    st.global.f32 [%rd_s+4], %l;
+E_NEXT:
+// #endif
+    add.u32 %q, %q, 1;
+    setp.lt.u32 %p, %q, {{QB}};
+    @%p bra E_LOOP;
 DONE:
     ret;
 }

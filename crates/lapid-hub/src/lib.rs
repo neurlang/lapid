@@ -62,6 +62,8 @@ pub mod phonon;
 pub mod qwen35;
 pub mod qwen4exp;
 pub mod qwen3vl;
+pub mod vad;
+pub mod zipformer;
 pub mod vision;
 pub mod whisper;
 
@@ -75,6 +77,8 @@ pub use parakeet::Parakeet;
 pub use phonon::{Phonon, SpeakOptions};
 pub use qwen35::Qwen35;
 pub use qwen4exp::Qwen4Exp;
+pub use vad::{SpeechSegment, Vad, VadEvent, VadOptions, VadStream};
+pub use zipformer::{StreamOptions, StreamResult, Zipformer, ZipformerStream};
 pub use whisper::{Segment, Task, TranscribeOptions, Transcript, Whisper};
 
 pub(crate) fn debug_enabled() -> bool {

@@ -292,7 +292,7 @@ fn gdn_ref(q: &[f32], k: &[f32], v: &[f32], g: &[f32], beta: &[f32], s0: &[f32],
 #[test]
 fn gated_delta_net_matches_reference() {
     let Some(be) = backend() else { return };
-    for &(b, t, hh, dk, dv) in &[(2usize, 3usize, 2usize, 40usize, 24usize), (1, 5, 3, 16, 33)] {
+    for &(b, t, hh, dk, dv) in &[(2usize, 3usize, 2usize, 40usize, 24usize), (1, 5, 3, 16, 33), (1, 9, 2, 128, 128), (1, 4, 1, 36, 20), (1, 0, 2, 64, 64), (1, 20, 2, 128, 64)] {
         let q = rnd(b * t * hh * dk, 1);
         let k = rnd(b * t * hh * dk, 2);
         let v = rnd(b * t * hh * dv, 3);
@@ -331,6 +331,8 @@ fn round3_kernels_compile_on_all_caps() {
         }
     }
     keys.push(Key::MoeRoute(256));
+    keys.push(Key::GatedDeltaNet8(Arc::new(GatedDeltaNetSpec { out_dtype: DType::F32 }), 16, 8));
+    keys.push(Key::GatedDeltaNet8(Arc::new(GatedDeltaNetSpec { out_dtype: DType::F16 }), 8, 16));
     keys.push(Key::GatedDeltaNet(Arc::new(GatedDeltaNetSpec { out_dtype: DType::F32 }), 4));
     keys.push(Key::GatedDeltaNet(Arc::new(GatedDeltaNetSpec { out_dtype: DType::F16 }), 2));
     let mut coop = caps(true, true, true);
@@ -338,7 +340,7 @@ fn round3_kernels_compile_on_all_caps() {
     coop.full_subgroups = true;
     for c in [caps(true, true, true), caps(false, false, false), caps(true, false, false), coop] {
         for key in &keys {
-            if matches!(key, Key::GemmCoop(_) | Key::GemmIdCoop(_)) && !c.coopmat {
+            if matches!(key, Key::GemmCoop(_) | Key::GemmIdCoop(_)) && !c.coopmat || matches!(key, Key::GatedDeltaNet8(..)) && !c.subgroup {
                 continue;
             }
             let src = codegen::source(key, &c);

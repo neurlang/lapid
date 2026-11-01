@@ -39,6 +39,8 @@ enum Architecture {
     Llama,
     Gemma4Moe,
     Qwen3Vl,
+    SileroVad,
+    Zipformer,
 }
 
 fn classify(src: &str) -> Result<Source> {
@@ -76,6 +78,8 @@ fn hf_architecture(config: &Path) -> Result<Architecture> {
         Some("gemma4" | "gemma4_text") if gemma4_is_moe(&cfg) => Ok(Architecture::Gemma4Moe),
         Some("gemma4" | "gemma4_text") => Ok(Architecture::Gemma4),
         Some("qwen3_vl") => Ok(Architecture::Qwen3Vl),
+        Some("silero_vad") => Ok(Architecture::SileroVad),
+        Some(crate::zipformer::convert::MODEL_TYPE) => Ok(Architecture::Zipformer),
         Some("gradium_phonon_tts") => Ok(Architecture::Phonon),
         Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text") => Ok(Architecture::Qwen35),
         Some("deepseek_v4") => Ok(Architecture::Deepseek4),
@@ -343,6 +347,22 @@ pub fn convert_with(src: &str, dtype: &str, out: Option<&Path>, calibrate: Optio
         }
         (Architecture::Whisper, Source::Gguf(f)) => {
             bail!("unsupported_model", "{}: no GGUF converter for whisper", f.display())
+        }
+        (Architecture::SileroVad, Source::HfRepo(r)) => crate::vad::convert::convert_hf(r, dtype, &out)?,
+        (Architecture::SileroVad, Source::HfDir(d)) => {
+            let s = d.to_str().ok_or_else(|| Error::new("invalid_argument", "model directory path is not UTF-8"))?;
+            crate::vad::convert::convert_hf(s, dtype, &out)?
+        }
+        (Architecture::SileroVad, Source::Ggml(f) | Source::Gguf(f)) => {
+            bail!("unsupported_model", "{}: Silero VAD converts from its exported safetensors directory only", f.display())
+        }
+        (Architecture::Zipformer, Source::HfRepo(r)) => crate::zipformer::convert::convert_hf(r, dtype, &out)?,
+        (Architecture::Zipformer, Source::HfDir(d)) => {
+            let s = d.to_str().ok_or_else(|| Error::new("invalid_argument", "model directory path is not UTF-8"))?;
+            crate::zipformer::convert::convert_hf(s, dtype, &out)?
+        }
+        (Architecture::Zipformer, Source::Ggml(f) | Source::Gguf(f)) => {
+            bail!("unsupported_model", "{}: Zipformer2 converts from an exported icefall directory only (tools/reference/zipformer_ref.py export)", f.display())
         }
     }
     Ok(out)

@@ -24,7 +24,15 @@ pub(super) fn plan(spec: &Arc<TopKSpec>, d: &TopKDims, caps: &Caps) -> Result<Pl
     let mut p = Params::default();
     p.u(d.rows)?.u(d.cols)?.u(d.k)?;
     let groups = if d.k == 0 { [0, 0, 0] } else { grid(d.rows as u64, caps) };
+    if d.k > 1 && d.k <= 16 && d.cols <= 1024 && caps.subgroup {
+        return Ok(Plan { scratch: 0, next: None, key: Key::TopKSmall(spec.clone()), params: p.0, groups });
+    }
     Ok(Plan { scratch: 0, next: None, key: Key::TopK(spec.clone(), d.k == 1), params: p.0, groups })
+}
+
+pub(super) fn source_small(spec: &TopKSpec, caps: &Caps) -> String {
+    let bindings = common::input(1, "x", spec.in_dtype, caps);
+    template::module(caps, KERNEL, &[("BINDINGS", &bindings), ("MAXK", &MAXK.to_string())], &["SMALLK"], 256, true)
 }
 
 pub(super) fn source(spec: &TopKSpec, argmax: bool, caps: &Caps) -> String {

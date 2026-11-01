@@ -214,6 +214,63 @@ fn kdeq4(n: &str, d: DType) -> String {
     }
 }
 
+/// `{n}_kdeq16(bb, i)`: elements i..i+16 (i % 16 == 0) of a block: one sub-block, so the
+/// scale (and min) are decoded once.
+fn kdeq16(n: &str, d: DType) -> String {
+    match d {
+        DType::Q4K | DType::Q5K => {
+            let qh = if d == DType::Q5K {
+                format!(
+                    "        let qh = {n}[(bb >> 2u) + 4u + (l >> 2u) + u];\n        \
+                     q = q | (((vec4<u32>(qh, qh >> 8u, qh >> 16u, qh >> 24u) >> vec4<u32>(2u * c + hi)) & vec4<u32>(1u)) << vec4<u32>(4u));\n"
+                )
+            } else {
+                String::new()
+            };
+            let qs = if d == DType::Q4K { 16 } else { 48 };
+            format!(
+                r#"fn {n}_kdeq16(bb: u32, i: u32) -> array<vec4<f32>, 4> {{
+    let c = i >> 6u;
+    let hi = (i >> 5u) & 1u;
+    let l = i & 31u;
+    let sm = {n}_smk(bb, 2u * c + hi);
+    let dm = unpack2x16float({n}[bb >> 2u]);
+    let sc = dm.x * sm.x;
+    let mn = vec4<f32>(dm.y * sm.y);
+    let w0 = (bb + {qs}u + c * 32u + l) >> 2u;
+    var r: array<vec4<f32>, 4>;
+    for (var u = 0u; u < 4u; u += 1u) {{
+        let qw = {n}[w0 + u];
+        var q = (vec4<u32>(qw, qw >> 8u, qw >> 16u, qw >> 24u) >> vec4<u32>(hi * 4u)) & vec4<u32>(15u);
+{qh}        r[u] = vec4<f32>(q) * sc - mn;
+    }}
+    return r;
+}}
+"#
+            )
+        }
+        _ => format!(
+            r#"fn {n}_kdeq16(bb: u32, i: u32) -> array<vec4<f32>, 4> {{
+    let h = i >> 7u;
+    let quad = (i >> 5u) & 3u;
+    let l = i & 31u;
+    let sc = extractBits(bitcast<i32>({n}_b8(bb + 192u + h * 8u + (l >> 4u) + 2u * quad)), 0u, 8u);
+    let f = {n}_h(bb + 208u) * f32(sc);
+    var r: array<vec4<f32>, 4>;
+    for (var u = 0u; u < 4u; u += 1u) {{
+        let ql = {n}_w(bb + h * 64u + l + (quad & 1u) * 32u + 4u * u);
+        let qh = {n}_w(bb + 128u + h * 32u + l + 4u * u);
+        let lo = (vec4<u32>(ql, ql >> 8u, ql >> 16u, ql >> 24u) >> vec4<u32>((quad >> 1u) * 4u)) & vec4<u32>(15u);
+        let hb = (vec4<u32>(qh, qh >> 8u, qh >> 16u, qh >> 24u) >> vec4<u32>(quad * 2u)) & vec4<u32>(3u);
+        r[u] = (vec4<f32>(lo | (hb << vec4<u32>(4u))) - vec4<f32>(32.0)) * f;
+    }}
+    return r;
+}}
+"#
+        ),
+    }
+}
+
 /// Element helpers (`{n}_kdeq`, `{n}_kdeq4`, `{n}_deq`, `ld_{n}`) over binding `{n}`
 /// (declared by the caller).
 pub fn fns(n: &str, d: DType) -> String {
@@ -223,6 +280,7 @@ pub fn fns(n: &str, d: DType) -> String {
     }
     s.push_str(&kdeq(n, d));
     s.push_str(&kdeq4(n, d));
+    s.push_str(&kdeq16(n, d));
     let bb = block_bytes(d);
     s.push_str(&format!(
         "fn {n}_deq(so: u32, e: u32) -> f32 {{\n    return {n}_kdeq((e >> 8u) * {bb}u, e & 255u);\n}}\n\

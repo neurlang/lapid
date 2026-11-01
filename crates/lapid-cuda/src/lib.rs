@@ -16,6 +16,8 @@
 //! - `LAPID_PROFILE=1` times every launch with events and prints per-kernel totals when the
 //!   backend is dropped (`CudaBackend::profile_report`).
 //! - `LAPID_CUDA_NO_MMA=1` forces the scalar (non-tensor-core) kernels (testing).
+//! - `LAPID_CUDA_FAST_ATTENTION=1` rounds f32 q/k/v to f16 in the tensor-core flash attention
+//!   (default: hi/lo f16 splits, ~f32 accuracy, about 2.5x the attention time).
 //! - Compiled kernels (cubins) are cached under `$LAPID_CACHE/kernels/cuda` (see `cache`);
 //!   `LAPID_NO_KERNEL_CACHE=1` disables that cache.
 //! - `LAPID_CUDA_DISABLE=1` hides the driver (`devices()` → `cuda_unavailable`).

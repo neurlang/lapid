@@ -21,6 +21,8 @@ use crate::context::Caps;
 const ROUTE: &str = include_str!("../kernels/moe_route.ptx");
 /// Most experts the routed GEMM path handles (shared counters of the routing block).
 const MAX_E: usize = 2048;
+/// Most (token, slot) rows served by the GEMV variant regardless of t.
+const GEMV_MAX_ROWS: usize = 32;
 
 pub(super) fn plan(spec: &Arc<MatMulIdSpec>, d: &MatMulIdDims, caps: &Caps) -> Result<Plan> {
     check_plain(spec.x_dtype, "matmul_id x")?;
@@ -49,7 +51,13 @@ pub(super) fn plan(spec: &Arc<MatMulIdSpec>, d: &MatMulIdDims, caps: &Caps) -> R
     let rows = d.t.checked_mul(d.r).ok_or_else(|| bad("matmul_id: size overflow"))?;
     let so = if quant { scales_offset(spec.w_dtype, d.n, d.k) } else { 0 };
     let empty = rows == 0 || d.n == 0;
-    let gemv_path = d.t <= matmul::GEMV_MAX_M || !matmul::mma_ok(&ms, caps) || d.e > MAX_E;
+    // GEMV rows also when (token, slot) rows are few overall (e.g. a down projection over
+    // the t * r routed rows of one decode token, r = 1): the routed GEMM would run mostly
+    // empty 64-row tiles plus a routing launch.
+    let gemv_path = d.t <= matmul::GEMV_MAX_M
+        || rows <= GEMV_MAX_ROWS
+        || !matmul::mma_ok(&ms, caps)
+        || d.e > MAX_E;
     let tail = |p: &mut Params| -> Result<()> {
         // out view (contiguous [rows, n]), extras: E, stride
         p.u(0)?.u(d.n)?.u(0)?;
@@ -75,8 +83,11 @@ pub(super) fn plan(spec: &Arc<MatMulIdSpec>, d: &MatMulIdDims, caps: &Caps) -> R
         return Ok(Plan::new(Key::GemvId(ms, va, vb, w), p.0, grid, 256));
     }
     let scratch = 4 * (2 * (d.e + 1) + rows);
+    // few rows per used expert (many experts): 32-row tiles waste less tensor-core work
+    let small = rows < 48 * d.e.min(rows);
+    let bm = if small { mma::SMALL_BM } else { mma::BM };
     let mut route = Params::default();
-    route.u(rows)?.u(d.e)?;
+    route.u(rows)?.u(d.e)?.u(bm.trailing_zeros() as usize)?;
     let mut p = Params::default();
     p.u(1)?.u(rows)?.u(d.n)?.u(d.k)?;
     p.u(0)?.u(0)?.u(d.k)?;
@@ -86,8 +97,8 @@ pub(super) fn plan(spec: &Arc<MatMulIdSpec>, d: &MatMulIdDims, caps: &Caps) -> R
     let md = dims(1, rows, d.n, d.k);
     let (va, vb) = mma::vec_variants(&ms, &md);
     let tiles_n = d.n.div_ceil(mma::BN);
-    // every expert's last tile may be partial: at most rows / 64 + min(E, rows) tiles
-    let tiles = rows.div_ceil(mma::BM) + d.e.min(rows);
+    // every expert's last tile may be partial: at most rows / bm + min(E, rows) tiles
+    let tiles = rows.div_ceil(bm) + d.e.min(rows);
     if tiles > caps.max_grid[1] as usize || tiles_n > caps.max_grid[0] as usize {
         return Err(Error::new("too_large", format!("matmul_id grid {tiles_n}x{tiles} exceeds device limits")));
     }
@@ -96,7 +107,7 @@ pub(super) fn plan(spec: &Arc<MatMulIdSpec>, d: &MatMulIdDims, caps: &Caps) -> R
     } else {
         [tiles_n as u32, tiles as u32, 1]
     };
-    let mut gemm = Plan::new(Key::GemmMmaId(ms, va, vb), p.0, grid, 256);
+    let mut gemm = Plan::new(Key::GemmMmaId(ms, va, vb, small), p.0, grid, 256);
     gemm.scratch = scratch;
     let mut first = Plan::new(Key::MoeRoute, route.0, if empty { [0, 0, 0] } else { [1, 1, 1] }, 1024);
     first.scratch = scratch;

@@ -123,7 +123,7 @@ impl Runtime {
                 let owned: Vec<Tensor> = outputs.iter().map(|t| (*t).clone()).collect();
                 let schedule = lapid_compiler::compile(&owned, &CompileOptions::default())?;
                 if debug {
-                    eprintln!(
+                    crate::log::emit(&format!(
                         "[lapid] {}: compiled {} launches, {} buffers, {} temp slots in {:.3} ms\n{}",
                         self.backend.name(),
                         schedule.launches.len(),
@@ -131,7 +131,7 @@ impl Runtime {
                         schedule.slot_bytes.len(),
                         ms(t0.elapsed()),
                         lapid_compiler::dump(&schedule)
-                    );
+                    ));
                 }
                 let plan = Arc::new(Plan::new(schedule, &key));
                 lock(&self.plans).insert(&key, plan.clone());
@@ -169,7 +169,7 @@ impl Runtime {
                     line.push_str(&format!(" {kind} {n}x {t:.3} ms;"));
                 }
             }
-            eprintln!("{line}");
+            crate::log::emit(&line);
         }
         plan.outputs
             .iter()
@@ -270,14 +270,14 @@ impl Runtime {
             for (i, launch) in plan.launches.iter().enumerate() {
                 let tl = Instant::now();
                 self.backend.execute(std::slice::from_ref(launch), &buffers)?;
-                eprintln!("[lapid]   #{i:<4} {:<12} {:>9.3} ms", launch.kernel.kind(), ms(tl.elapsed()));
+                crate::log::emit(&format!("[lapid]   #{i:<4} {:<12} {:>9.3} ms", launch.kernel.kind(), ms(tl.elapsed())));
             }
         } else {
             self.backend.execute(&plan.launches, &buffers)?;
         }
         let t_exec = t1.elapsed();
         if debug {
-            eprintln!("[lapid] resolve buffers {:.3} ms, execute {:.3} ms", ms(t_resolve), ms(t_exec));
+            crate::log::emit(&format!("[lapid] resolve buffers {:.3} ms, execute {:.3} ms", ms(t_resolve), ms(t_exec)));
         }
         Ok((buffers, t_resolve, t_exec))
     }
@@ -331,6 +331,20 @@ impl Runtime {
             return convert::to_f32(bytes, t.dtype(), t.shape());
         }
         convert::to_f32(&self.host_bytes(t)?, t.dtype(), t.shape())
+    }
+
+    /// Raw storage bytes of `t` in its own dtype (quantized: the lapid-quant layout).
+    pub(crate) fn to_vec_bytes(&self, t: &Tensor) -> Result<Vec<u8>> {
+        let want = expected_bytes(t)?;
+        if let Op::Host(h) = t.op() {
+            let Some(bytes) = h.bytes().get(..want) else {
+                bail!("shape_mismatch", "host leaf is smaller than its shape {:?}", t.shape());
+            };
+            return Ok(bytes.to_vec());
+        }
+        let mut bytes = self.host_bytes(t)?;
+        bytes.truncate(want);
+        Ok(bytes)
     }
 
     pub(crate) fn to_vec_i32(&self, t: &Tensor) -> Result<Vec<i32>> {

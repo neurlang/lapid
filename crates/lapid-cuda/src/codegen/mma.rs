@@ -15,6 +15,8 @@ const KERNEL: &str = include_str!("../kernels/gemm_mma.ptx");
 /// Output tile per block.
 pub(crate) const BM: usize = 64;
 pub(crate) const BN: usize = 128;
+/// Tile rows of the small MatMulId variant.
+pub(crate) const SMALL_BM: usize = 32;
 /// Shared row stride in halves (32 + 8 padding).
 const LDS: usize = 40;
 
@@ -58,13 +60,13 @@ fn id_rows(n: usize, shift: u32) -> String {
     g.finish()
 }
 
-/// (REGS, A_LOAD, A_STORE, A_ROWS)
-fn a_parts(spec: &MatMulSpec, vec_a: bool, id: bool) -> (String, String, String, String) {
-    let (regs, load, store) = a_parts_inner(spec, vec_a, id);
+/// (REGS, A_LOAD, A_STORE, A_ROWS); `rows`: tile rows (BM, or 32 for the small variant).
+fn a_parts(spec: &MatMulSpec, vec_a: bool, id: bool, rows: usize) -> (String, String, String, String) {
+    let (regs, load, store) = a_parts_inner(spec, vec_a, id, rows);
     if !id {
         return (regs, load, store, String::new());
     }
-    let (n, shift) = if vec_a { (2, 3) } else { (8, 5) };
+    let (n, shift) = if vec_a { (rows / 32, 3) } else { (rows / 8, 5) };
     (format!("{regs}    .reg .b32 %arow<{n}>;\n"), load, store, id_rows(n, shift))
 }
 
@@ -76,12 +78,12 @@ fn a_row_index(g: &mut Gen, id: bool, u: usize, gi: &str, idx: &str) {
     }
 }
 
-fn a_parts_inner(spec: &MatMulSpec, vec_a: bool, id: bool) -> (String, String, String) {
+fn a_parts_inner(spec: &MatMulSpec, vec_a: bool, id: bool, rows: usize) -> (String, String, String) {
     let mut load = String::new();
     let mut store = String::new();
     if vec_a {
         let regs = "    .reg .f32 %ax<8>;\n    .reg .pred %av<2>;\n".to_string();
-        for u in 0..2 {
+        for u in 0..rows / 32 {
             // e = tid + 256u: row e / 8, k chunk (e % 8) * 4
             let mut g = Gen::new();
             let (e, r, gk, gi, idx) = (
@@ -146,7 +148,7 @@ fn a_parts_inner(spec: &MatMulSpec, vec_a: bool, id: bool) -> (String, String, S
     } else {
         "    .reg .f32 %ax<8>;\n    .reg .pred %av<8>;\n"
     };
-    for u in 0..8 {
+    for u in 0..rows / 8 {
         // e = tid + 256u: row e / 32, k e % 32
         let mut g = Gen::new();
         let (e, r, gk, gi, idx) = (
@@ -423,11 +425,11 @@ fn b_parts(spec: &MatMulSpec, vec_b: bool) -> (String, String, String) {
 
 /// Two k16 steps over the current buffers: ldmatrix A (2 m16 tiles) and B (4 n8 tiles),
 /// then 8 mma per step.
-fn mma_block() -> String {
+fn mma_block(mt: usize) -> String {
     let mut s = String::new();
     for kk in 0..2 {
         let ko = 32 * kk;
-        for mi in 0..2 {
+        for mi in 0..mt {
             let r = 4 * mi;
             s.push_str(&format!(
                 "    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%fa{}, %fa{}, %fa{}, %fa{}}}, [%pa+{}];\n",
@@ -449,7 +451,7 @@ fn mma_block() -> String {
                 p * 16 * 2 * LDS + ko
             ));
         }
-        for mi in 0..2 {
+        for mi in 0..mt {
             for ni in 0..4 {
                 let c = mi * 16 + ni * 4;
                 let a = mi * 4;
@@ -465,9 +467,9 @@ fn mma_block() -> String {
 }
 
 /// Accumulators → Cs (f32, row stride 132): c[mi][ni][0..2] at (row, col), [2..4] at row + 8.
-fn c_store() -> String {
+fn c_store(mt: usize) -> String {
     let mut s = String::new();
-    for mi in 0..2 {
+    for mi in 0..mt {
         for ni in 0..4 {
             let c = mi * 16 + ni * 4;
             let off = mi * 16 * 132 * 4 + ni * 8 * 4;
@@ -487,14 +489,16 @@ fn c_store() -> String {
 }
 
 /// `id`: MatMulId variant (rows grouped by expert, see `moe`); binds a, b, ids, out,
-/// scratch, flag.
-pub(super) fn source(spec: &MatMulSpec, vec_a: bool, vec_b: bool, id: bool) -> String {
+/// scratch, flag. `small`: 32-row tiles (MatMulId with few rows per expert).
+pub(super) fn source(spec: &MatMulSpec, vec_a: bool, vec_b: bool, id: bool, small: bool) -> String {
+    let rows = if small { SMALL_BM } else { BM };
+    let mt = rows / 32;
     let (args, ptrs) = if id {
         ptx::args(&["a", "b", "ids", "out", "scratch", "flag"])
     } else {
         args(spec)
     };
-    let (ra, la, sa, rows) = a_parts(spec, vec_a, id);
+    let (ra, la, sa, arows) = a_parts(spec, vec_a, id, rows);
     let (rb, lb, sb) = b_parts(spec, vec_b);
     let regs = format!("{ra}{rb}");
     template::fill(
@@ -507,9 +511,15 @@ pub(super) fn source(spec: &MatMulSpec, vec_a: bool, vec_b: bool, id: bool) -> S
             ("B_LOAD", &lb),
             ("A_STORE", &sa),
             ("B_STORE", &sb),
-            ("A_ROWS", &rows),
-            ("MMA", &mma_block()),
-            ("C_STORE", &c_store()),
+            ("A_ROWS", &arows),
+            ("MMA", &mma_block(mt)),
+            ("C_STORE", &c_store(mt)),
+            ("WM", &(16 * mt).to_string()),
+            ("A_BUF", &(rows * 2 * LDS).to_string()),
+            ("B_OFF", &(2 * rows * 2 * LDS).to_string()),
+            ("SMEM", &(2 * rows * 2 * LDS + 2 * BN * 2 * LDS).max(rows * 132 * 4).to_string()),
+            ("TSH", &rows.trailing_zeros().to_string()),
+            ("EPI_N", &(rows * BN).to_string()),
             ("EPILOGUE", &if id { id_epilogue(spec) } else { epilogue(spec) }),
         ],
         if id { &["ID"] } else { &[] },
