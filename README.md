@@ -22,10 +22,10 @@
 |---|---|
 | **ONNX Runtime** | Fast on NVIDIA, slow on other GPUs, big and hard to change |
 | **llama.cpp** | Fast, but you need a different build for each GPU |
-| **candle** | Supports few GPUs |
-| **burn** | Made for training |
-| **tract** | Runs only on CPU |
-| **lapid** | One small Rust library, fast on every GPU, and you can read and change all of it |
+| **Candle** | Supports few GPUs |
+| **Burn** | Made for training |
+| **Tract** | Runs only on CPU |
+| **Lapid** | One small Rust library, fast on every GPU, and you can read and change all of it |
 
 ## Quick start
 
