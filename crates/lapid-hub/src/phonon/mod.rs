@@ -3,6 +3,12 @@
 //! and a voice prompt, and the streaming Mimi decoder turns each latent into 1920 samples
 //! of 24 kHz audio as soon as it is sampled.
 //!
+//! Only the model's math, config, conversion tables and verification stages live here; text
+//! chunking, end of speech, fade-in, streaming, verification, benchmarks and serving are the
+//! shared speech pipeline (`runtime::tts`). The unique math (flow LM, LSD flow head, Mimi
+//! codec with streaming convolutions and transposed convolutions, text preparation) is about
+//! 1.1k lines, so this model is over the 500-line target.
+//!
 //! ```no_run
 //! let device = lapid::Device::best();
 //! let tts = lapid_hub::Phonon::from_hub("gradium/phonon-40m-en", "fp16", &device)?;
@@ -14,8 +20,6 @@
 //! # Ok::<(), lapid::Error>(())
 //! ```
 
-pub mod bench;
-pub mod cmd;
 pub mod config;
 pub mod convert;
 mod convtr;
@@ -25,23 +29,30 @@ mod mimi;
 mod stream;
 pub mod text;
 mod transformer;
-pub mod verify;
-pub mod wav;
+mod verify;
+/// WAV writing (moved to [`crate::audio`]).
+pub use crate::audio as wav;
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use lapid::{DType, Device, Error, LapidFile, Result, Tensor, bail};
-use lapid_nn::sampling::Rng;
+use lapid_convert::engine::ConvertSpec;
 use lapid_nn::{Loader, Tokenizer};
+use lapid_verify::Descriptor;
+use lapid_verify::harness::Reference;
 
 use crate::model::{Bytes, Model, ModelInfo, hub_model_path};
+use crate::runtime::ModelEntry;
+use crate::runtime::tts::{self, ReferenceSpeech, SpeechDef, SpeechRequest};
 use config::PhononConfig;
 pub use lapid_nn::Precision;
 use lm::FlowLm;
 use mimi::MimiDecoder;
-use stream::{Noise, StreamSetup, TextChunk};
-pub use stream::{SpeechStream, StreamStats};
+pub use crate::runtime::tts::StreamStats;
+
+/// Iterator of PCM chunks (mono f32 at [`Phonon::sample_rate`]); see [`Phonon::speak_stream`].
+pub type SpeechStream<'a> = tts::SpeechStream<Phonon, &'a Phonon>;
 
 /// Options of one synthesis call; `None` fields take the model's defaults.
 #[derive(Clone, Debug, Default)]
@@ -82,7 +93,7 @@ impl Phonon {
     /// Load `repo` (e.g. "gradium/phonon-40m-en") from the lapid cache, converting it from the
     /// Hugging Face hub first if missing (`dtype`: "fp32", "fp16", "int8", "int4").
     pub fn from_hub(repo: &str, dtype: &str, device: &Device) -> Result<Phonon> {
-        Phonon::load(&hub_model_path(repo, dtype, convert::convert_hf)?, device)
+        Phonon::load(&hub_model_path(repo, dtype, |r, d, out| convert::CONVERT.convert(r, d, out))?, device)
     }
 
     /// Load a converted `.lapid` Phonon model.
@@ -193,73 +204,12 @@ impl Phonon {
     /// Stream speech for `text`: an iterator of PCM chunks (mono f32 at
     /// [`sample_rate`](Self::sample_rate)), one per `frames_per_chunk` codec frames.
     pub fn speak_stream(&self, text: &str, opts: &SpeakOptions) -> Result<SpeechStream<'_>> {
-        let seed = opts.seed.unwrap_or_else(|| {
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
-        });
-        self.stream_with(text, opts, Noise::Seeded(Rng::new(seed)))
-    }
-
-    pub(crate) fn stream_with(&self, text: &str, opts: &SpeakOptions, noise: Noise) -> Result<SpeechStream<'_>> {
-        let g = &self.cfg.generation;
-        let prepared = text::prepare(text);
-        if prepared.is_empty() {
-            bail!("invalid_argument", "nothing to say: the text is empty");
-        }
-        let max_tokens = opts.max_chunk_tokens.unwrap_or(50).max(1);
-        let mut chunks = Vec::new();
-        for piece in text::split(&self.tokenizer, &prepared, max_tokens)? {
-            let ids = text::encode(&self.tokenizer, &piece)?;
-            let short = text::word_count(&piece) <= g.short_text_max_words;
-            let budget = ((ids.len() as f64 / 3.0 + 2.0) * self.cfg.mimi.frame_rate as f64).ceil() as usize;
-            chunks.push(TextChunk {
-                ids,
-                frames_after_eos: if short { g.frames_after_eos_short_text } else { g.frames_after_eos },
-                max_frames: opts.max_frames.unwrap_or(budget).max(1),
-            });
-        }
-        let name = opts.voice.as_deref().unwrap_or(&self.cfg.assets.default_voice);
-        let voice = self.voices.get(name).cloned().ok_or_else(|| {
-            Error::new("not_found", format!("unknown voice {name:?} (have: {})", self.voices().join(", ")))
-        })?;
-        let steps = opts.num_flow_steps.unwrap_or(g.num_flow_steps).max(1);
-        let cond = self.lm.condition(
-            self.cfg.conditions.num_speakers,
-            opts.duration_delta.unwrap_or(self.cfg.conditions.duration_delta),
-            &self.cfg.conditions,
-        )?;
-        let mut lazy = vec![cond];
-        for i in 0..steps {
-            lazy.push(self.lm.flow.time_condition(i as f32 / steps as f32, (i + 1) as f32 / steps as f32)?);
-        }
-        let refs: Vec<&Tensor> = lazy.iter().collect();
-        let mut realized = self.device.eval(&refs)?;
-        let time_conds = realized.split_off(1);
-        let cond = realized.pop().ok_or_else(|| Error::new("internal", "eval returned nothing"))?;
-        let temperature = opts.temperature.unwrap_or(g.temperature).max(0.0);
-        Ok(SpeechStream::new(
-            self,
-            StreamSetup {
-                chunks,
-                voice: Some(voice),
-                cond,
-                time_conds,
-                noise,
-                noise_std: temperature.sqrt(),
-                eos_threshold: opts.eos_threshold.unwrap_or(g.eos_threshold),
-                min_frames_before_eos: g.min_frames_before_eos,
-                frames_per_chunk: opts.frames_per_chunk.unwrap_or(1),
-                fade_samples: (g.fade_in_duration * self.cfg.mimi.sample_rate as f32) as usize,
-            },
-        ))
+        tts::speak(self, text, opts)
     }
 
     /// The whole utterance as one buffer.
     pub fn speak(&self, text: &str, opts: &SpeakOptions) -> Result<Vec<f32>> {
-        let mut out = Vec::new();
-        for pcm in self.speak_stream(text, opts)? {
-            out.extend(pcm?);
-        }
-        Ok(out)
+        tts::synthesize(self, text, opts)
     }
 
     /// Synthesize `text` with default options into a 16-bit PCM WAV file.
@@ -272,6 +222,58 @@ impl Phonon {
         wav::write_wav(path, &pcm, self.sample_rate())
     }
 }
+
+impl SpeechDef for Phonon {
+    const DESCRIPTOR: Descriptor = Descriptor {
+        name: "phonon",
+        default_model: "gradium/phonon-40m-en",
+        default_dtype: "fp16",
+        reference_dir: "data/reference/phonon-40m-en",
+        reference_script: "tools/reference/phonon_ref.py",
+        reference_label: "PyTorch fp32 (HF GradiumPhononTTSForConditionalGeneration + PocketTTSAudioTokenizer)",
+        strict_dtypes: &["fp32", "fp16"],
+        bench_prompt_tokens: 0,
+        bench_gen_tokens: 0,
+    };
+    const CONVERT: &'static ConvertSpec = &convert::CONVERT;
+
+    fn from_file(file: &LapidFile, device: &Device, precision: Precision) -> Result<Self> {
+        Phonon::from_file(file, device, precision)
+    }
+
+    fn voices(&self) -> Vec<String> {
+        Phonon::voices(self)
+    }
+
+    fn default_voice(&self) -> Option<String> {
+        Some(self.cfg.assets.default_voice.clone())
+    }
+
+    fn request_options(&self, req: &SpeechRequest) -> SpeakOptions {
+        SpeakOptions {
+            // OpenAI voice names ("alloy", ...) fall back to the model's default voice.
+            voice: req.voice.clone().filter(|v| self.voices.contains_key(v)),
+            seed: req.seed,
+            temperature: req.temperature,
+            frames_per_chunk: req.frames_per_chunk,
+            ..Default::default()
+        }
+    }
+
+    fn tokens(&self, text: &str) -> Result<Vec<u32>> {
+        Ok(self.tokenize(text)?.1)
+    }
+
+    fn reference_stages(&self, r: &Reference) -> Result<Vec<(String, Vec<f32>)>> {
+        verify::run_model(self, &verify::Inputs::from_reference(r)?)
+    }
+
+    fn reference_speech(&self, r: &Reference) -> Result<ReferenceSpeech> {
+        verify::reference_speech(self, r)
+    }
+}
+
+pub static ENTRY: ModelEntry = ModelEntry::speech::<Phonon>();
 
 impl Model for Phonon {
     fn info(&self) -> ModelInfo {

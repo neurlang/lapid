@@ -1,15 +1,15 @@
 //! Chat / completion adapter for the hub's text-generation models: every
-//! `runtime::Llm<M: CausalLm>` plus the not yet migrated Qwen3.5 / Gemma 4. They share one
-//! generation surface (`TokenStream`, `GenerateOptions`); [`ChatLm`] names it once so a
-//! single [`LlmServed`] serves all of them with a small pool of sessions: a
-//! request reuses the session whose consumed tokens are a prefix of its prompt (the earlier
-//! turns of a conversation), so only the new tokens are prefilled.
+//! `runtime::Llm<M: CausalLm>`. They share one generation surface (`TokenStream`,
+//! `GenerateOptions`); [`ChatLm`] names it once so a single [`LlmServed`] serves all of them
+//! with a small pool of sessions: a request reuses the session whose consumed tokens are a
+//! prefix of its prompt (the earlier turns of a conversation), so only the new tokens are
+//! prefilled.
 
 use lapid::{Error, Result};
 use crate::runtime::causal_lm::{CausalLm, Llm};
 use crate::runtime::generate::{FinishReason, GenerateOptions, TokenStream};
 use crate::runtime::session::Session;
-use crate::{Gemma4, ModelInfo, Qwen35};
+use crate::ModelInfo;
 use lapid_nn::SamplingParams;
 
 use super::{Capability, ChatParams, Delta, GenParams, GenSummary, ModelMeta, AnyModel};
@@ -29,38 +29,6 @@ pub trait ChatLm {
     fn think_markers(&self) -> (&'static str, &'static str) {
         ("<think>", "</think>")
     }
-}
-
-macro_rules! impl_llm {
-    ($ty:ty, $session:ty, $markers:expr) => {
-        impl ChatLm for $ty {
-            type Session = $session;
-            fn new_session(&self) -> $session {
-                <$ty>::new_session(self)
-            }
-            fn session_tokens(s: &$session) -> &[u32] {
-                s.tokens()
-            }
-            fn render(&self, messages: &str, tools: Option<&str>, enable_thinking: Option<bool>) -> Result<String> {
-                self.render_chat_json(messages, tools, true, enable_thinking)
-            }
-            fn encode(&self, text: &str) -> Result<Vec<u32>> {
-                <$ty>::encode(self, text)
-            }
-            fn generate<'a>(&'a self, s: &'a mut $session, prompt: &[u32], opts: GenerateOptions) -> Result<TokenStream<'a>> {
-                <$ty>::generate(self, s, prompt, opts)
-            }
-            fn recommended(&self) -> SamplingParams {
-                self.recommended_sampling()
-            }
-            fn info(&self) -> ModelInfo {
-                crate::Model::info(self)
-            }
-            fn think_markers(&self) -> (&'static str, &'static str) {
-                $markers
-            }
-        }
-    };
 }
 
 impl<M: CausalLm> ChatLm for Llm<M> {
@@ -91,8 +59,6 @@ impl<M: CausalLm> ChatLm for Llm<M> {
     }
 }
 
-impl_llm!(Qwen35, crate::qwen35::Session, ("<think>", "</think>"));
-impl_llm!(Gemma4, crate::gemma4::Session, ("<|channel>thought\n", "<channel|>"));
 
 struct Slot<S> {
     session: S,

@@ -9,7 +9,7 @@
 
 use lapid::{Error, Result};
 
-use crate::lfm3::jinja::{Template, Value};
+use crate::runtime::jinja::{Template, Value};
 
 pub const BOS: &str = "<｜begin▁of▁sentence｜>";
 pub const EOS: &str = "<｜end▁of▁sentence｜>";
@@ -324,6 +324,16 @@ pub fn encode(messages: &Value, thinking: bool) -> Result<String> {
         prompt.push_str(&render_message(i, &full, thinking, drop)?);
     }
     Ok(prompt)
+}
+
+/// Render messages given as JSON (OpenAI style; key order kept); `tools_json` (a list of
+/// OpenAI tools) goes on the system message, where upstream V4 carries tools.
+pub fn render_json(messages_json: &str, tools_json: Option<&str>, thinking: bool) -> Result<String> {
+    let mut messages = Value::from_json_str(messages_json)?;
+    if let Some(t) = tools_json {
+        messages = with_tools(messages, Value::from_json_str(t)?);
+    }
+    encode(&messages, thinking)
 }
 
 /// Attach OpenAI-format `tools` (JSON list) to the first system message (inserting an empty

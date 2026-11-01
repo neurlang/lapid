@@ -9,13 +9,19 @@
 //! * Serving: [`serve::AnyModel`] (one object-safe surface for `lapid serve` / `lapid run`),
 //!   [`serve::load`].
 //! * Other pipelines: [`transducer`] (RNN-T / TDT), [`seq2seq`] (Whisper-style),
-//!   [`embedding`] (pooling, normalize, Matryoshka), [`tts`] (streaming speech).
+//!   [`embedding`] (pooling, normalize, Matryoshka), [`tts`] (streaming speech),
+//!   [`vlm`] (image + text LMs on top of [`causal_lm`], verified by [`vlm_verify`]).
 //! * Routing: [`registry`] (convert / verify / bench / serve by model), [`resolve`] (sources
 //!   to cached `.lapid` files).
 //! * Conversion: `lapid_convert::engine` (declarative `ConvertSpec`).
 
+pub mod audio;
+pub mod audio_bench;
+pub mod audio_verify;
 pub mod causal_lm;
 pub mod embedding;
+pub mod embedding_harness;
+pub mod endpoint;
 pub mod chat;
 pub mod generate;
 pub mod jinja;
@@ -29,6 +35,9 @@ pub mod serve;
 pub mod session;
 pub mod transducer;
 pub mod tts;
+pub mod tts_harness;
+pub mod vlm;
+pub mod vlm_verify;
 
 pub use causal_lm::{CausalLm, LmDims, Llm, Rows, Taps};
 pub use chat::{ChatOptions, ChatTemplate, Message, TextAssets};
@@ -36,3 +45,4 @@ pub use generate::{CancelToken, FinishReason, GenerateOptions, GenerationStats, 
 pub use registry::{LmDef, ModelEntry};
 pub use serve::{AnyModel, LoadOptions};
 pub use session::{LmCache, LmState, Session};
+pub use vlm::{Media, MediaPrompt, VisionLm};

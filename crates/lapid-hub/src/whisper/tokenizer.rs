@@ -48,6 +48,27 @@ pub(crate) fn non_speech_tokens(tok: &Tokenizer) -> Vec<u32> {
     result
 }
 
+/// OpenAI `_get_suppress_tokens` (SuppressTokens) and SuppressBlank token lists.
+pub(crate) fn suppress_lists(cfg: &super::config::WhisperConfig, tok: &Tokenizer) -> (Vec<u32>, Vec<u32>) {
+    let sp = &cfg.special;
+    let mut suppress: Vec<u32> = cfg.suppress_tokens.iter().filter_map(|v| u32::try_from(*v).ok()).collect();
+    if cfg.suppress_tokens.is_empty() || cfg.suppress_tokens.contains(&-1) {
+        suppress.extend(non_speech_tokens(tok));
+    }
+    suppress.extend([sp.transcribe, sp.translate, sp.sot, sp.prev]);
+    suppress.extend(sp.sot_lm);
+    suppress.extend(sp.no_speech);
+    suppress.retain(|&t| (t as usize) < cfg.n_vocab);
+    suppress.sort_unstable();
+    suppress.dedup();
+    let mut blank = cfg.begin_suppress_tokens.clone();
+    if blank.is_empty() {
+        blank.extend(tok.token_for_bytes(b" "));
+        blank.push(sp.eot);
+    }
+    (suppress, blank)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

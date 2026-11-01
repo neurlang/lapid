@@ -1,120 +1,57 @@
-//! Streaming speech recognition with a Zipformer2 transducer: the WAV is fed in pieces as if
-//! it came from a microphone, partial results update in place, finals print at endpoints.
-//! With `--vad`, Silero VAD cuts the audio into speech segments first and each segment is
-//! decoded by a fresh stream.
+//! Streaming speech recognition with a Zipformer2 transducer: the WAV is fed in 100 ms pieces
+//! as if from a microphone; partials update in place, finals print at endpoints. `--vad`
+//! cuts the audio with Silero VAD first and decodes each segment with a fresh stream.
 //!
 //! ```text
 //! cargo run --release -p lapid-hub --example zipformer -- data/jfk.wav \
-//!     [--model data/hf/zipformer2-en-streaming-2023-05-17 | model.lapid] [--dtype fp16] \
-//!     [--chunk 16] [--piece-ms 100] [--vad [data/reference/vad/model]]
+//!     [data/hf/zipformer2-en-streaming-2023-05-17 | model.lapid] [fp16] [--vad]
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use lapid::Device;
 use lapid_hub::zipformer::{StreamOptions, Zipformer};
-use lapid_hub::{Vad, VadOptions};
-
-struct Args {
-    audio: PathBuf,
-    model: String,
-    dtype: String,
-    chunk: Option<usize>,
-    piece_ms: usize,
-    vad: Option<String>,
-}
-
-fn parse() -> Option<Args> {
-    let mut it = std::env::args().skip(1);
-    let mut a = Args {
-        audio: PathBuf::new(),
-        model: "data/hf/zipformer2-en-streaming-2023-05-17".into(),
-        dtype: "fp16".into(),
-        chunk: None,
-        piece_ms: 100,
-        vad: None,
-    };
-    let mut rest: Vec<String> = it.by_ref().collect();
-    rest.reverse();
-    while let Some(x) = rest.pop() {
-        match x.as_str() {
-            "--model" => a.model = rest.pop()?,
-            "--dtype" => a.dtype = rest.pop()?,
-            "--chunk" => a.chunk = rest.pop()?.parse().ok(),
-            "--piece-ms" => a.piece_ms = rest.pop()?.parse().ok()?,
-            "--vad" => {
-                let next = rest.last().filter(|n| !n.starts_with("--")).cloned();
-                if next.is_some() {
-                    rest.pop();
-                }
-                a.vad = Some(next.unwrap_or_else(|| "data/reference/vad/model".into()));
-            }
-            _ if a.audio.as_os_str().is_empty() => a.audio = PathBuf::from(x),
-            _ => return None,
-        }
-    }
-    (!a.audio.as_os_str().is_empty()).then_some(a)
-}
-
-fn load(model: &str, dtype: &str, device: &Device) -> lapid::Result<Zipformer> {
-    let p = Path::new(model);
-    if p.extension().is_some_and(|e| e == "lapid") { Zipformer::load(p, device) } else { Zipformer::from_hub(model, dtype, device) }
-}
+use lapid_hub::{StreamResult, Vad, VadOptions};
 
 /// Stream `samples` through a fresh stream; print partials (in place) and finals.
-fn run(z: &Zipformer, samples: &[f32], opts: &StreamOptions, piece: usize, offset_s: f64) -> lapid::Result<()> {
+fn run(z: &Zipformer, samples: &[f32], opts: &StreamOptions, offset_s: f64) -> lapid::Result<()> {
     let mut s = z.stream(opts)?;
-    let show = |r: &lapid_hub::StreamResult| {
-        if r.is_final {
-            eprint!("\r\x1b[2K");
-            println!("[{:7.2}] {}", offset_s + f64::from(r.start), r.text);
-        } else {
-            eprint!("\r\x1b[2K{}", r.text);
-        }
+    let show = |r: &StreamResult| match r.is_final {
+        true => println!("\r\x1b[2K[{:7.2}] {}", offset_s + f64::from(r.start), r.text),
+        false => eprint!("\r\x1b[2K{}", r.text),
     };
-    for p in samples.chunks(piece.max(1)) {
-        for r in s.accept_waveform(p)? {
-            show(&r);
-        }
+    for piece in samples.chunks(1600) {
+        s.accept_waveform(piece)?.iter().for_each(show);
     }
-    for r in s.input_finished()? {
-        show(&r);
-    }
+    s.input_finished()?.iter().for_each(show);
     Ok(())
 }
 
 fn main() -> lapid::Result<()> {
-    let Some(args) = parse() else {
-        eprintln!("usage: zipformer <audio.wav> [--model DIR|.lapid] [--dtype fp16] [--chunk 16] [--piece-ms 100] [--vad [DIR|.lapid]]");
+    let (flags, args): (Vec<String>, Vec<String>) = std::env::args().skip(1).partition(|a| a.starts_with("--"));
+    let [audio, rest @ ..] = &args[..] else {
+        eprintln!("usage: zipformer <audio.wav> [model dir | .lapid] [dtype (fp16)] [--vad]");
         std::process::exit(2);
     };
+    let model = rest.first().map_or("data/hf/zipformer2-en-streaming-2023-05-17", String::as_str);
     let device = Device::best();
-    eprintln!("device: {}", device.description());
+    let z = match Path::new(model) {
+        p if p.extension().is_some_and(|e| e == "lapid") => Zipformer::load(p, &device)?,
+        _ => Zipformer::from_hub(model, rest.get(1).map_or("fp16", String::as_str), &device)?,
+    };
+    let samples = lapid_hub::audio::load_audio_16k_mono(Path::new(audio))?;
     let t = Instant::now();
-    let z = load(&args.model, &args.dtype, &device)?;
-    eprintln!("loaded in {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
-    let samples = lapid_hub::audio::load_audio_16k_mono(&args.audio)?;
-    let sr = z.config().sample_rate as usize;
-    let piece = sr * args.piece_ms / 1000;
-    let t = Instant::now();
-    match &args.vad {
-        None => {
-            let opts = StreamOptions { chunk_size: args.chunk, ..StreamOptions::default() };
-            run(&z, &samples, &opts, piece, 0.0)?;
+    if flags.iter().any(|f| f == "--vad") {
+        let vad = Vad::from_hub("data/reference/vad/model", "fp32", &device)?;
+        let opts = StreamOptions { endpoint: None, ..StreamOptions::default() };
+        for seg in vad.process(&samples, &VadOptions::default())? {
+            run(&z, &samples[seg.start..seg.end], &opts, seg.start_seconds(16_000))?;
         }
-        Some(vad_model) => {
-            let vad = if vad_model.ends_with(".lapid") { Vad::load(Path::new(vad_model), &device)? } else { Vad::from_hub(vad_model, "fp32", &device)? };
-            let segments = vad.process(&samples, &VadOptions::default())?;
-            eprintln!("vad: {} speech segments", segments.len());
-            let opts = StreamOptions { chunk_size: args.chunk, left_context_frames: None, endpoint: None };
-            for seg in segments {
-                run(&z, &samples[seg.start..seg.end], &opts, piece, seg.start as f64 / sr as f64)?;
-            }
-        }
+    } else {
+        run(&z, &samples, &StreamOptions::default(), 0.0)?;
     }
-    let secs = samples.len() as f64 / sr as f64;
-    let el = t.elapsed().as_secs_f64();
-    eprintln!("{:.2} s of audio in {:.2} s (RTF {:.3})", secs, el, el / secs);
+    let secs = samples.len() as f64 / 16_000.0;
+    eprintln!("{} : {secs:.2} s of audio in {:.2} s (RTF {:.3})", device.description(), t.elapsed().as_secs_f64(), t.elapsed().as_secs_f64() / secs);
     Ok(())
 }

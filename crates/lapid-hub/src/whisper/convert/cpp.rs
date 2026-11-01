@@ -15,7 +15,7 @@ use serde_json::{Map, Value, json};
 
 use super::ggml::{self, GgmlModel, GgmlTensor, GgmlType, Hparams};
 use super::tokens::{Specials, byte_to_char_table, bytes_to_bpe_string};
-use super::{EMBED_TOKENS, add_token_blob, expected_tensors, metadata, role};
+use super::{CONVERT, EMBED_TOKENS, TOKENS_BLOB, expected_tensors, metadata};
 
 /// Maps a whisper.cpp (OpenAI checkpoint) tensor name to the HF name.
 pub(crate) fn map_name(n: &str) -> Option<String> {
@@ -190,8 +190,8 @@ pub(crate) fn convert(path: &Path, dtype: OutDType, out: &Path) -> Result<()> {
         }
     }
 
-    let mut w = ModelWriter::create(out, meta, dtype, role, mapped.len())?;
-    add_token_blob(&mut w, &token_list)?;
+    let mut w = ModelWriter::create_shared(out, meta, dtype, CONVERT.role_arc(), mapped.len())?;
+    w.add_blob(TOKENS_BLOB, "application/json", &serde_json::to_vec(&token_list)?)?;
     for (hf, t) in &mapped {
         convert_tensor(&mut w, hf, t)?;
     }

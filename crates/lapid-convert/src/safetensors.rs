@@ -156,7 +156,10 @@ impl SafeTensors {
                     f64::from_le_bytes(a) as f32
                 })
                 .collect(),
-            d => bail!("unsupported_dtype", "safetensors tensor {name:?} has dtype {d}, expected a float type"),
+            // integer tables (e.g. hash routing ids), exact up to 2^24
+            "I32" => b.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32).collect(),
+            "I64" => b.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap_or([0; 8])) as f32).collect(),
+            d => bail!("unsupported_dtype", "safetensors tensor {name:?} has dtype {d}, expected a float or integer type"),
         })
     }
 }

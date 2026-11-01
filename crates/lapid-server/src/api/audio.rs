@@ -17,7 +17,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::{ApiError, ApiResult, Shared, parse_json};
 use crate::format;
-use crate::served::{AsrParams, Capability, TranscriptOut, TtsParams};
+use lapid_hub::runtime::serve::{AsrParams, Capability, TranscriptOut, TtsParams};
 
 #[derive(Default)]
 struct TranscriptionForm {

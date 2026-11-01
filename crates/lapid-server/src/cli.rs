@@ -10,7 +10,7 @@ use clap::Args;
 use lapid::{Error, Result};
 
 use crate::load::LoadOptions;
-use crate::served::GenParams;
+use lapid_hub::runtime::serve::GenParams;
 
 /// llama.cpp's multi-letter single-dash flags and their long forms.
 const LLAMA_SHORT: &[(&str, &str)] = &[

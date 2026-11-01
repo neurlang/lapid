@@ -24,8 +24,6 @@
 //! window zero-padded), [`Vad::process`] = `get_speech_timestamps`, [`VadStream`] =
 //! `VADIterator` fed with 512-sample chunks. See [`model`] for the device / host split.
 
-pub mod bench;
-pub mod cmd;
 pub mod config;
 pub mod convert;
 pub(crate) mod model;
@@ -87,7 +85,11 @@ impl Vad {
     /// `model.safetensors`, or an HF repo with those files) from the lapid cache,
     /// converting it on first use.
     pub fn from_hub(repo_or_dir: &str, dtype: &str, device: &Device) -> Result<Vad> {
-        let path = hub_model_path(repo_or_dir, dtype, convert::convert_hf)?;
+        let path = if Path::new(repo_or_dir).is_dir() {
+            crate::runtime::resolve::resolve(repo_or_dir, Some(dtype))?.path
+        } else {
+            hub_model_path(repo_or_dir, dtype, |r, d, o| convert::CONVERT.convert(r, d, o))?
+        };
         Vad::load(&path, device)
     }
 
@@ -220,3 +222,6 @@ impl Model for Vad {
         &self.inner.device
     }
 }
+
+/// Registry entry: generic verify and bench (not served).
+pub static ENTRY: crate::runtime::ModelEntry = crate::runtime::audio::audio_entry::<Vad>();

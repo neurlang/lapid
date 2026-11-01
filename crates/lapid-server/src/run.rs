@@ -7,8 +7,10 @@ use std::path::PathBuf;
 use lapid::{Error, Result};
 use serde_json::{Value, json};
 
-use crate::load::{self, LoadOptions, ModelSpec};
-use crate::served::{AsrParams, Capability, ChatParams, Delta, EmbedParams, GenParams, Served, TtsParams};
+use lapid_hub::AnyModel;
+use lapid_hub::runtime::serve::{AsrParams, Capability, ChatParams, Delta, EmbedParams, GenParams, LoadOptions, TtsParams};
+
+use crate::load::ModelSpec;
 
 #[derive(Clone, Debug, Default)]
 pub struct RunOptions {
@@ -37,7 +39,10 @@ fn io(e: std::io::Error) -> Error {
 pub fn run(opts: RunOptions) -> Result<()> {
     let device = crate::device(opts.device.as_deref())?;
     let spec = ModelSpec::parse(&opts.model);
-    let mut model = load::load_spec(&spec, &device, &opts.load)?;
+    let mut model = lapid_hub::load(&spec.source, &device, &opts.load)?;
+    if let Some(id) = spec.id {
+        model.meta_mut().id = id;
+    }
     let caps = model.meta().capabilities.clone();
     if caps.contains(&Capability::Chat) {
         chat(model.as_mut(), &opts)
@@ -88,7 +93,7 @@ impl Printer {
     }
 }
 
-fn chat(model: &mut dyn Served, opts: &RunOptions) -> Result<()> {
+fn chat(model: &mut dyn AnyModel, opts: &RunOptions) -> Result<()> {
     let color = std::io::stdout().is_terminal();
     let mut p = Printer { color, in_reasoning: false };
     let model_id = model.meta().id.clone();
@@ -155,7 +160,7 @@ fn chat(model: &mut dyn Served, opts: &RunOptions) -> Result<()> {
     Ok(())
 }
 
-fn transcribe(model: &mut dyn Served, opts: &RunOptions) -> Result<()> {
+fn transcribe(model: &mut dyn AnyModel, opts: &RunOptions) -> Result<()> {
     if opts.inputs.is_empty() {
         return Err(Error::new("invalid_argument", "give one or more WAV files to transcribe"));
     }
@@ -177,7 +182,7 @@ fn transcribe(model: &mut dyn Served, opts: &RunOptions) -> Result<()> {
     Ok(())
 }
 
-fn speak(model: &mut dyn Served, opts: &RunOptions) -> Result<()> {
+fn speak(model: &mut dyn AnyModel, opts: &RunOptions) -> Result<()> {
     let text = opts.inputs.join(" ");
     if text.trim().is_empty() {
         return Err(Error::new("invalid_argument", "give the text to speak"));
@@ -195,7 +200,7 @@ fn speak(model: &mut dyn Served, opts: &RunOptions) -> Result<()> {
     Ok(())
 }
 
-fn embed(model: &mut dyn Served, opts: &RunOptions) -> Result<()> {
+fn embed(model: &mut dyn AnyModel, opts: &RunOptions) -> Result<()> {
     if opts.inputs.is_empty() {
         return Err(Error::new("invalid_argument", "give one or more texts to embed"));
     }

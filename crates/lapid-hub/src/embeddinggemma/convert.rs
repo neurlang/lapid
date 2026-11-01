@@ -1,7 +1,8 @@
-//! sentence-transformers EmbeddingGemma (HF repo or local directory) → one `.lapid` file.
+//! sentence-transformers EmbeddingGemma (HF repo or local directory) -> one `.lapid` file,
+//! through the generic converter (`lapid_convert::engine`).
 //!
 //! Reads the Gemma 3 text encoder (`config.json`, `model.safetensors`), the module list
-//! (`modules.json`: Transformer → Pooling → Dense… → Normalize), each Dense module's
+//! (`modules.json`: Transformer -> Pooling -> Dense... -> Normalize), each Dense module's
 //! weights, the prompts (`config_sentence_transformers.json`), the max sequence length
 //! (`sentence_bert_config.json`) and `tokenizer.json` (stored verbatim as a blob).
 //!
@@ -10,17 +11,14 @@
 //! (prefix `dense.<k>.`), `normalize`. Precision: projection and Dense weights follow the
 //! dtype; the token embedding (a gather table) is at most int8; norms f32.
 
-pub(crate) mod calibrate;
-
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
 
 use lapid::{Error, Result, bail};
-use lapid_convert::OutDType;
+use lapid_convert::assets::HfFiles;
+use lapid_convert::engine::{ConvertHooks, ConvertSpec, HfExtras};
+use lapid_convert::mapping::{RoleRule, Rule};
 use lapid_convert::policy::Role;
-use lapid_convert::safetensors::SafeTensors;
-use lapid_convert::writer::{ModelWriter, check_complete, file_hash, read_json};
-use lapid_convert::{download_hf, download_hf_optional};
+use lapid_convert::writer::read_json;
 use serde_json::{Value, json};
 
 use super::config::{DenseActivation, DenseConfig, EmbeddingGemmaConfig, META_KEY, PoolingConfig};
@@ -29,51 +27,51 @@ pub(crate) const TOKENIZER_BLOB: &str = "tokenizer/tokenizer.json";
 const EMBED: &str = "model.embed_tokens.weight";
 /// Matryoshka sizes EmbeddingGemma was trained with (model card).
 const MATRYOSHKA: [usize; 4] = [768, 512, 256, 128];
-const LICENSE: &str = "gemma";
-const LICENSE_URL: &str = "https://ai.google.dev/gemma/terms";
 
-/// Source files: repo id (downloaded on demand) or local directory.
-struct Source {
-    dir: Option<PathBuf>,
-    repo: String,
-}
+pub static CONVERT: ConvertSpec = ConvertSpec {
+    architecture: META_KEY,
+    license: "gemma",
+    hf_model_types: &["gemma3_text"],
+    gguf_architectures: &[],
+    hf_names: &[
+        Rule::new("embed_tokens.{w}", "model.embed_tokens.{w}"),
+        Rule::new("norm.{w}", "model.norm.{w}"),
+        Rule::new("layers.{i}.{a}.{w}", "model.layers.{i}.{a}.{w}"),
+        Rule::new("layers.{i}.{a}.{b}.{w}", "model.layers.{i}.{a}.{b}.{w}"),
+        Rule::new("dense.{k}.linear.{w}", "dense.{k}.{w}"),
+    ],
+    gguf_names: &[],
+    roles: &[RoleRule::new(EMBED, Role::LinearInt8)],
+    text_assets: false,
+    hooks: &Hooks,
+};
 
-impl Source {
-    fn new(src: &str) -> Source {
-        let p = Path::new(src);
-        if p.is_dir() {
-            Source { dir: Some(p.to_path_buf()), repo: p.display().to_string() }
-        } else {
-            Source { dir: None, repo: src.trim_matches('/').to_string() }
-        }
+struct Hooks;
+
+impl ConvertHooks for Hooks {
+    fn hf_config(&self, config: &Value) -> Result<Value> {
+        Ok(serde_json::to_value(encoder_config(config)?)?)
     }
 
-    fn required(&self, file: &str) -> Result<PathBuf> {
-        match &self.dir {
-            Some(d) => {
-                let p = d.join(file);
-                if p.is_file() { Ok(p) } else { bail!("not_found", "{}: missing {file}", d.display()) }
-            }
-            None => download_hf(&self.repo, file),
-        }
+    fn hf_extras(&self, files: &HfFiles, cfg: &mut Value) -> Result<HfExtras> {
+        let mut c: EmbeddingGemmaConfig = serde_json::from_value(cfg.clone())?;
+        let weights = read_modules(files, &mut c)?;
+        read_st_configs(files, &mut c)?;
+        c.validate()?;
+        let tokenizer = std::fs::read(files.required("tokenizer.json")?).map_err(|e| Error::new("io", format!("tokenizer.json: {e}")))?;
+        // Fail at conversion time, not load time, on a tokenizer we cannot parse.
+        lapid_nn::Tokenizer::from_bytes(&tokenizer)?;
+        let mut extras = HfExtras { weights, ..Default::default() };
+        extras.blobs.push((TOKENIZER_BLOB.into(), "application/json".into(), tokenizer));
+        extras.metadata.insert("license_url".into(), json!("https://ai.google.dev/gemma/terms"));
+        extras.metadata.insert("components".into(), components(&c)?);
+        *cfg = serde_json::to_value(&c)?;
+        Ok(extras)
     }
 
-    fn optional(&self, file: &str) -> Result<Option<PathBuf>> {
-        match &self.dir {
-            Some(d) => Ok(Some(d.join(file)).filter(|p| p.is_file())),
-            None => download_hf_optional(&self.repo, file),
-        }
-    }
-}
-
-/// Dtype-policy role of a tensor.
-pub(crate) fn role(name: &str, shape: &[usize]) -> Role {
-    if shape.len() <= 1 || name.ends_with("norm.weight") || name.ends_with(".bias") {
-        Role::Param
-    } else if name == EMBED {
-        Role::LinearInt8
-    } else {
-        Role::Linear
+    fn expected(&self, cfg: &Value) -> Result<Vec<String>> {
+        let c: EmbeddingGemmaConfig = serde_json::from_value(cfg.clone())?;
+        Ok(expected_tensors(&c))
     }
 }
 
@@ -150,14 +148,8 @@ fn encoder_config(cfg: &Value) -> Result<EmbeddingGemmaConfig> {
     })
 }
 
-/// A Dense module: its config and weight file.
-struct DenseModule {
-    cfg: DenseConfig,
-    weights: PathBuf,
-}
-
 /// Walk `modules.json`: pooling, Dense modules (in order), normalize.
-fn read_modules(src: &Source, cfg: &mut EmbeddingGemmaConfig) -> Result<Vec<DenseModule>> {
+fn read_modules(src: &HfFiles, cfg: &mut EmbeddingGemmaConfig) -> Result<Vec<(String, std::path::PathBuf)>> {
     let modules = read_json(&src.required("modules.json")?)?;
     let list = modules.as_array().ok_or_else(|| Error::new("format", "modules.json is not an array"))?;
     let mut dense = Vec::new();
@@ -180,28 +172,25 @@ fn read_modules(src: &Source, cfg: &mut EmbeddingGemmaConfig) -> Result<Vec<Dens
                 let act_name = d.get("activation_function").and_then(Value::as_str).unwrap_or("torch.nn.modules.activation.Tanh");
                 let activation = DenseActivation::from_torch(act_name)
                     .ok_or_else(|| Error::new("unsupported_model", format!("{path}: activation {act_name:?} is not supported")))?;
-                let k = dense.len();
-                dense.push(DenseModule {
-                    cfg: DenseConfig {
-                        prefix: format!("dense.{k}."),
-                        in_features: get_usize(&d, "in_features")?,
-                        out_features: get_usize(&d, "out_features")?,
-                        bias: d.get("bias").and_then(Value::as_bool).unwrap_or(true),
-                        activation,
-                    },
-                    weights: src.required(&format!("{path}/model.safetensors"))?,
+                let prefix = format!("dense.{}.", cfg.dense.len());
+                cfg.dense.push(DenseConfig {
+                    prefix: prefix.clone(),
+                    in_features: get_usize(&d, "in_features")?,
+                    out_features: get_usize(&d, "out_features")?,
+                    bias: d.get("bias").and_then(Value::as_bool).unwrap_or(true),
+                    activation,
                 });
+                dense.push((prefix, src.required(&format!("{path}/model.safetensors"))?));
             }
             "Normalize" => cfg.normalize = true,
             other => bail!("unsupported_model", "modules.json: module type {other:?} is not supported"),
         }
     }
-    cfg.dense = dense.iter().map(|d| d.cfg.clone()).collect();
     Ok(dense)
 }
 
 /// Prompts and max_seq_length from the sentence-transformers configs.
-fn read_st_configs(src: &Source, cfg: &mut EmbeddingGemmaConfig) -> Result<()> {
+fn read_st_configs(src: &HfFiles, cfg: &mut EmbeddingGemmaConfig) -> Result<()> {
     if let Some(p) = src.optional("config_sentence_transformers.json")? {
         let st = read_json(&p)?;
         if let Some(obj) = st.get("prompts").and_then(Value::as_object) {
@@ -244,13 +233,10 @@ pub(crate) fn expected_tensors(cfg: &EmbeddingGemmaConfig) -> Vec<String> {
     v
 }
 
-/// `.lapid` metadata: required keys, the config object and the component declarations.
-fn metadata(name: &str, dtype: OutDType, source: Value, cfg: &EmbeddingGemmaConfig) -> Result<Value> {
-    let mut m = lapid_convert::writer::metadata(name, META_KEY, dtype, LICENSE, source);
-    m["license_url"] = json!(LICENSE_URL);
-    m[META_KEY] = serde_json::to_value(cfg)?;
+/// Component declarations (encoder, pooling, Dense modules, normalize).
+fn components(cfg: &EmbeddingGemmaConfig) -> Result<Value> {
     let mut comps = serde_json::Map::new();
-    comps.insert("encoder".into(), json!({"architecture": "gemma3_text", "config": META_KEY, "license": LICENSE, "tensor_prefix": "model."}));
+    comps.insert("encoder".into(), json!({"architecture": "gemma3_text", "config": META_KEY, "license": "gemma", "tensor_prefix": "model."}));
     comps.insert("pooling".into(), json!({"architecture": "sentence_transformers.pooling", "config": serde_json::to_value(&cfg.pooling)?, "tensor_prefix": "pooling."}));
     for (k, d) in cfg.dense.iter().enumerate() {
         comps.insert(format!("dense_{k}"), json!({"architecture": "sentence_transformers.dense", "config": serde_json::to_value(d)?, "tensor_prefix": d.prefix}));
@@ -258,76 +244,24 @@ fn metadata(name: &str, dtype: OutDType, source: Value, cfg: &EmbeddingGemmaConf
     if cfg.normalize {
         comps.insert("normalize".into(), json!({"architecture": "sentence_transformers.normalize", "config": {}, "tensor_prefix": "normalize."}));
     }
-    m["components"] = Value::Object(comps);
-    Ok(m)
-}
-
-/// Convert `src` (repo id or directory) to `out` at `dtype`.
-pub fn convert_hf(src: &str, dtype: OutDType, out: &Path) -> Result<()> {
-    let src = Source::new(src);
-    let hf_cfg = read_json(&src.required("config.json")?)?;
-    if hf_cfg.get("model_type").and_then(Value::as_str) != Some("gemma3_text") {
-        bail!("unsupported_model", "{}: config.json model_type is not \"gemma3_text\"", src.repo);
-    }
-    let mut cfg = encoder_config(&hf_cfg)?;
-    let dense = read_modules(&src, &mut cfg)?;
-    read_st_configs(&src, &mut cfg)?;
-    cfg.validate()?;
-    let tokenizer = std::fs::read(src.required("tokenizer.json")?).map_err(|e| Error::new("io", format!("tokenizer.json: {e}")))?;
-    // Fail at conversion time, not load time, on a tokenizer we cannot parse.
-    let text = std::str::from_utf8(&tokenizer).map_err(|_| Error::new("tokenizer", "tokenizer.json is not UTF-8"))?;
-    lapid_nn::Tokenizer::from_tokenizer_json(text)?;
-
-    let weights = src.required("model.safetensors")?;
-    let st = SafeTensors::open(&weights)?;
-    let mut by_name: BTreeMap<String, (usize, String)> = BTreeMap::new();
-    for n in st.names() {
-        let norm = if n.starts_with("model.") { n.clone() } else { format!("model.{n}") };
-        by_name.insert(norm, (0, n));
-    }
-    let mut files = vec![st];
-    for d in &dense {
-        let dst = SafeTensors::open(&d.weights)?;
-        for n in dst.names() {
-            let leaf = n.rsplit('.').next().unwrap_or(&n).to_string();
-            by_name.insert(format!("{}{leaf}", d.cfg.prefix), (files.len(), n));
-        }
-        files.push(dst);
-    }
-    let expected = expected_tensors(&cfg);
-    let have: BTreeSet<String> = by_name.keys().cloned().collect();
-    check_complete(&have, &expected)?;
-    let (fi, en) = &by_name[EMBED];
-    let shape = files[*fi].shape(en)?;
-    if shape != [cfg.vocab_size, cfg.hidden_size] {
-        bail!("shape_mismatch", "{EMBED}: shape {shape:?}, config says [{}, {}]", cfg.vocab_size, cfg.hidden_size);
-    }
-
-    let name = src.repo.trim_end_matches('/').rsplit('/').next().unwrap_or("embeddinggemma").to_string();
-    let mut source = json!({ "repo": src.repo, "file_hash": file_hash(&weights)? });
-    if src.dir.is_none() {
-        source["revision"] = json!("main");
-    }
-    let meta = metadata(&name, dtype, source, &cfg)?;
-    let mut w = ModelWriter::create(out, meta, dtype, role, expected.len())?;
-    w.add_blob(TOKENIZER_BLOB, "application/json", &tokenizer)?;
-    for n in &expected {
-        let (fi, orig) = &by_name[n];
-        let f = &files[*fi];
-        w.add_f32(n, &f.shape(orig)?, &f.to_f32(orig)?)?;
-    }
-    w.finish(&expected)
+    Ok(Value::Object(comps))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use lapid::quant::Format;
+    use lapid_convert::OutDType;
+    use lapid_convert::mapping::{Renamed, rename};
     use lapid_convert::policy::{Target, target};
 
     #[test]
-    fn policy() {
-        let t = |n: &str, s: &[usize], d| target(role(n, s), s, d);
+    fn policy_and_names() {
+        let t = |n: &str, s: &[usize], d| target(CONVERT.role(n, s), s, d);
+        assert_eq!(rename(CONVERT.hf_names, "layers.3.self_attn.q_proj.weight"), Renamed::To("model.layers.3.self_attn.q_proj.weight".into()));
+        assert_eq!(rename(CONVERT.hf_names, "layers.3.input_layernorm.weight"), Renamed::To("model.layers.3.input_layernorm.weight".into()));
+        assert_eq!(rename(CONVERT.hf_names, "model.norm.weight"), Renamed::NoMatch);
+        assert_eq!(rename(CONVERT.hf_names, "dense.1.linear.weight"), Renamed::To("dense.1.weight".into()));
         assert_eq!(t(EMBED, &[262144, 768], OutDType::Int4), Target::Quant(Format::Int8));
         assert_eq!(t(EMBED, &[262144, 768], OutDType::F16), Target::F16);
         assert_eq!(t("model.layers.0.self_attn.q_proj.weight", &[768, 768], OutDType::Int4), Target::Quant(Format::Int4));

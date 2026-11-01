@@ -1,64 +1,37 @@
-//! `verify vad`: compare lapid's Silero VAD with the TorchScript reference written by
-//! `tools/reference/silero_vad_ref.py` for every sample directory (`jfk`, `gaps`) under the
-//! reference root.
+//! Silero VAD on the generic audio harness (`lapid verify vad`, `lapid bench vad`).
 //!
-//! Per sample:
-//! * per-window probabilities of the whole clip (max abs error <= [`PROB_TOLERANCE`]);
-//! * intermediates of the first windows (STFT magnitude, encoder, LSTM h / c, probability;
-//!   relative error <= [`LAYER_TOLERANCE`]);
-//! * `get_speech_timestamps` for each reference option set: exact, both from our
-//!   probabilities and (segment logic alone) from the reference probabilities;
-//! * `VADIterator` events from a [`super::VadStream`] fed in odd-sized chunks: exact;
-//! * stream vs whole-buffer probabilities: bit-identical.
+//! Per sample: per-window probabilities of the whole clip (max abs error <= 1e-4) and the
+//! intermediates of the first windows (STFT magnitude, encoder, LSTM h / c, probability;
+//! relative error <= 1e-4); `get_speech_timestamps` for each reference option set, exact from
+//! our probabilities and (segment logic alone) from the reference ones; `VADIterator` events
+//! of a stream fed in odd-sized chunks, exact; stream vs whole-buffer probabilities identical.
+//! Bench: the input tiled to 60 s; whole-buffer probabilities, its device / host halves,
+//! `process`, and streaming one window per call and 100 ms per call.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 use std::time::Instant;
 
-use lapid::{Device, Error, Result};
-use lapid_convert::OutDType;
-use lapid_verify::timing::ms;
-use lapid_verify::{Activations, Comparison, Stages, diff};
-use serde_json::{Value, json};
+use lapid::{Device, Result};
+use lapid_convert::engine::ConvertSpec;
+use lapid_nn::Precision;
+use lapid_verify::{Descriptor, diff};
+use serde_json::{Map, Value, json};
 
+use super::model::LstmState;
 use super::segments::{SpeechSegment, VadEvent, VadOptions, speech_timestamps};
-use super::{Vad, convert};
-use crate::model::Model;
+use super::{BATCH_WINDOWS, Vad};
+use crate::runtime::audio::{AudioDef, BenchRun, Check, EndToEnd, Row, Sample, Stages};
 
 /// Max abs difference of a speech probability (fp32 weights).
-pub const PROB_TOLERANCE: f32 = 1e-4;
-/// Relative error of the traced intermediates.
-pub const LAYER_TOLERANCE: f32 = 1e-4;
+const PROB_TOLERANCE: f32 = 1e-4;
+/// Relative error of the probabilities and traced intermediates.
+const LAYER_TOLERANCE: f32 = 1e-4;
 /// Chunk size the stream check feeds (not a multiple of the window on purpose).
-pub const STREAM_CHUNK: usize = 1000;
+const STREAM_CHUNK: usize = 1000;
+/// Seconds of audio benchmarked (the input is tiled to this length).
+const BENCH_SECONDS: usize = 60;
 
-/// Open `model`: a `.lapid` file, an exported directory (converted in memory) or a hub repo.
-pub fn open_model(model: &str, device: &Device) -> Result<(Vad, Option<f64>)> {
-    let p = Path::new(model);
-    if p.extension().is_some_and(|e| e == "lapid") {
-        return Ok((Vad::load(p, device)?, None));
-    }
-    if p.is_dir() {
-        let t = Instant::now();
-        let tmp = std::env::temp_dir().join(format!("lapid-vad-{}-{}.lapid", std::process::id(), unique()));
-        let r = convert::convert_hf(model, OutDType::F32, &tmp).and_then(|_| {
-            std::fs::read(&tmp).map_err(|e| Error::new("io", format!("{}: {e}", tmp.display())))
-        });
-        std::fs::remove_file(&tmp).ok();
-        let bytes = r?;
-        let convert_ms = ms(t);
-        return Ok((Vad::load_bytes(Arc::new(bytes), device)?, Some(convert_ms)));
-    }
-    Ok((Vad::from_hub(model, "fp32", device)?, None))
-}
-
-fn unique() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    N.fetch_add(1, Ordering::Relaxed)
-}
-
-/// silero option names (as in `result.json`) → [`VadOptions`].
+/// silero option names (as in `result.json`) -> [`VadOptions`].
 pub fn options_from_json(v: &Value) -> VadOptions {
     let d = VadOptions::default();
     let f = |k: &str| v.get(k).and_then(Value::as_f64);
@@ -73,40 +46,14 @@ pub fn options_from_json(v: &Value) -> VadOptions {
     }
 }
 
-fn segments_from_json(v: &Value) -> Vec<SpeechSegment> {
-    v.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|s| Some(SpeechSegment { start: s.get(0)?.as_u64()? as usize, end: s.get(1)?.as_u64()? as usize }))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn events_from_json(v: &Value) -> Vec<VadEvent> {
-    v.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|e| {
-                    if let Some(s) = e.get("start").and_then(Value::as_u64) {
-                        Some(VadEvent::SpeechStart { sample: s as usize })
-                    } else {
-                        e.get("end").and_then(Value::as_u64).map(|s| VadEvent::SpeechEnd { sample: s as usize })
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Stream `samples` in `chunk`-sized pieces, then zeros up to a whole window (what the
 /// reference `VADIterator` loop is fed), then flush: (events before flush, flush events,
 /// probabilities).
 pub fn run_stream(vad: &Vad, samples: &[f32], chunk: usize, opts: &VadOptions) -> Result<(Vec<VadEvent>, Vec<VadEvent>, Vec<f32>)> {
     let mut s = vad.stream(opts);
-    let mut events = Vec::new();
-    let mut probs = Vec::new();
-    let pad = vec![0f32; (vad.window_size() - samples.len() % vad.window_size()) % vad.window_size()];
+    let (mut events, mut probs) = (Vec::new(), Vec::new());
+    let w = vad.window_size();
+    let pad = vec![0f32; (w - samples.len() % w) % w];
     for c in samples.chunks(chunk.max(1)).chain(std::iter::once(&pad[..])) {
         events.extend(s.accept_waveform(c)?);
         probs.extend_from_slice(s.last_probabilities());
@@ -116,137 +63,174 @@ pub fn run_stream(vad: &Vad, samples: &[f32], chunk: usize, opts: &VadOptions) -
     Ok((events, tail, probs))
 }
 
-fn verify_sample(dir: &Path, vad: &Vad, stages: &mut Stages) -> Result<Value> {
-    let path = dir.join("result.json");
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| Error::new("io", format!("{}: {e} (run tools/reference/silero_vad_ref.py)", path.display())))?;
-    let r: Value = serde_json::from_str(&raw)?;
-    let audio = r.get("audio").and_then(Value::as_str).ok_or_else(|| Error::new("reference", "result.json: no \"audio\""))?;
-    let samples = crate::audio::load_audio_16k_mono(&dir.join(audio))?;
-    let acts = Activations::open(&dir.join("activations.safetensors"))?;
-    let ref_probs = acts.get("probs")?;
-
-    let probs = stages.time("probabilities", || vad.probabilities(&samples))?;
-    let mut cmp = Comparison::new();
-    cmp.compare("probs", &probs, &ref_probs, LAYER_TOLERANCE);
-    let prob_max_abs = diff(&probs, &ref_probs).map(|d| d.max_abs).unwrap_or(f32::INFINITY);
-
-    let k = acts.shape("prob")?.first().copied().unwrap_or(0);
-    let tr = stages.time("trace", || vad.trace(&samples, k))?;
-    for (name, ours) in [("stft", &tr.stft), ("encoder", &tr.encoder), ("lstm.h", &tr.h), ("lstm.c", &tr.c), ("prob", &tr.probs)] {
-        cmp.compare(name, ours, &acts.get(name)?, LAYER_TOLERANCE);
-    }
-
-    let mut seg_rows = Vec::new();
-    let mut segments_ok = true;
-    for set in r.get("speech_timestamps").and_then(Value::as_array).into_iter().flatten() {
-        let opts = options_from_json(set.get("options").unwrap_or(&Value::Null));
-        let want = segments_from_json(set.get("segments").unwrap_or(&Value::Null));
-        let got = speech_timestamps(&probs, samples.len(), vad.sample_rate(), vad.window_size(), &opts);
-        let logic = speech_timestamps(&ref_probs, samples.len(), vad.sample_rate(), vad.window_size(), &opts);
-        let (exact, logic_exact) = (got == want, logic == want);
-        segments_ok &= exact && logic_exact;
-        seg_rows.push(json!({
-            "options": opts, "exact": exact, "logic_exact": logic_exact,
-            "segments": got.iter().map(|s| [s.start, s.end]).collect::<Vec<_>>(),
-            "reference": want.iter().map(|s| [s.start, s.end]).collect::<Vec<_>>(),
-        }));
-    }
-
-    let mut it_rows = Vec::new();
-    let mut events_ok = true;
-    let mut stream_max_abs = 0f32;
-    let mut stream_exact = true;
-    for set in r.get("iterator").and_then(Value::as_array).into_iter().flatten() {
-        let opts = options_from_json(set.get("options").unwrap_or(&Value::Null));
-        let want = events_from_json(set.get("events").unwrap_or(&Value::Null));
-        let (events, tail, sprobs) = stages.time("stream", || run_stream(vad, &samples, STREAM_CHUNK, &opts))?;
-        let d = diff(&sprobs, &probs).map(|d| d.max_abs).unwrap_or(f32::INFINITY);
-        stream_max_abs = stream_max_abs.max(d);
-        stream_exact &= sprobs == probs;
-        let exact = events == want;
-        events_ok &= exact;
-        it_rows.push(json!({ "options": opts, "exact": exact, "events": events, "flush": tail, "reference": want }));
-    }
-
-    let ok = cmp.ok() && prob_max_abs <= PROB_TOLERANCE && segments_ok && events_ok && stream_exact;
-    Ok(json!({
-        "sample": dir.display().to_string(),
-        "ok": ok,
-        "windows": probs.len(),
-        "prob_max_abs": prob_max_abs,
-        "segments_exact": segments_ok,
-        "iterator_events_exact": events_ok,
-        "stream_vs_batch_max_abs": stream_max_abs,
-        "stream_vs_batch_exact": stream_exact,
-        "first_failing_layer": cmp.first_failing(),
-        "layers": cmp.layers,
-        "notes": cmp.notes,
-        "speech_timestamps": seg_rows,
-        "iterator": it_rows,
-    }))
+fn segments_of(v: &Value) -> Vec<SpeechSegment> {
+    let seg = |s: &Value| Some(SpeechSegment { start: s.get(0)?.as_u64()? as usize, end: s.get(1)?.as_u64()? as usize });
+    v.as_array().map(|a| a.iter().filter_map(seg).collect()).unwrap_or_default()
 }
 
-/// Full verification as JSON; check `"ok"`.
-pub fn verify(reference_dir: &Path, model: &str, device: Option<&str>) -> Result<Value> {
-    let dev = lapid_verify::open_device(device)?;
-    let mut stages = Stages::new();
+fn events_of(v: &Value) -> Vec<VadEvent> {
+    let ev = |e: &Value| match e.get("start").and_then(Value::as_u64) {
+        Some(s) => Some(VadEvent::SpeechStart { sample: s as usize }),
+        None => e.get("end").and_then(Value::as_u64).map(|s| VadEvent::SpeechEnd { sample: s as usize }),
+    };
+    v.as_array().map(|a| a.iter().filter_map(ev).collect()).unwrap_or_default()
+}
+
+/// (front-end ms, recurrence ms) of the whole-buffer path, timed separately.
+fn split_ms(vad: &Vad, samples: &[f32]) -> Result<(f64, f64)> {
+    let (net, cfg) = (vad.net(), vad.config());
+    let (w, c, n) = (vad.window_size(), cfg.context_size, samples.len().div_ceil(vad.window_size()));
+    let zeros = vec![0f32; c];
+    let (mut front_ms, mut rec_ms, mut inputs) = (0.0, 0.0, Vec::new());
+    let mut state = LstmState::zeros(cfg.hidden_size);
+    for first in (0..n).step_by(BATCH_WINDOWS) {
+        let count = BATCH_WINDOWS.min(n - first);
+        inputs.clear();
+        let t = Instant::now();
+        for i in first..first + count {
+            let s = i * w;
+            net.push_input(if i == 0 { &zeros[..] } else { &samples[s - c..s] }, &samples[s..samples.len().min(s + w)], &mut inputs);
+        }
+        let f = net.front(crate::model::Model::device(vad), &inputs, count, false)?;
+        front_ms += t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        let acc: f32 = f.gates.chunks_exact(4 * cfg.hidden_size).map(|gx| net.step(&mut state, gx)).sum();
+        std::hint::black_box(acc);
+        rec_ms += t.elapsed().as_secs_f64() * 1e3;
+    }
+    Ok((front_ms, rec_ms))
+}
+
+fn stream_ms(vad: &Vad, samples: &[f32], chunk: usize) -> Result<f64> {
     let t = Instant::now();
-    let (vad, convert_ms) = open_model(model, &dev)?;
-    stages.record("load", ms(t));
-    if let Some(c) = convert_ms {
-        stages.record("convert", c);
+    let mut s = vad.stream(&VadOptions::default());
+    for c in samples.chunks(chunk) {
+        s.accept_waveform(c)?;
     }
-    let rd = std::fs::read_dir(reference_dir).map_err(|e| Error::new("io", format!("{}: {e}", reference_dir.display())))?;
-    let mut dirs: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|d| d.join("result.json").is_file()).collect();
-    dirs.sort();
-    if dirs.is_empty() {
-        return Err(Error::new("not_found", format!("{}: no sample with result.json (run tools/reference/silero_vad_ref.py)", reference_dir.display())));
+    s.flush()?;
+    Ok(t.elapsed().as_secs_f64() * 1e3)
+}
+
+impl AudioDef for Vad {
+    const DESCRIPTOR: Descriptor = Descriptor {
+        name: "vad",
+        default_model: "data/reference/vad/model",
+        default_dtype: "fp32",
+        reference_dir: "data/reference/vad",
+        reference_script: "tools/reference/silero_vad_ref.py",
+        reference_label: "silero-vad 5.1.2 TorchScript fp32",
+        strict_dtypes: &["fp32"],
+        bench_prompt_tokens: 0,
+        bench_gen_tokens: 0,
+    };
+    const CONVERT: &'static ConvertSpec = &super::convert::CONVERT;
+
+    fn load_with(path: &Path, device: &Device, _: Precision) -> Result<Self> {
+        Vad::load(path, device)
     }
-    let samples: Vec<Value> = dirs.iter().map(|d| verify_sample(d, &vad, &mut stages)).collect::<Result<_>>()?;
-    let ok = samples.iter().all(|s| s.get("ok").and_then(Value::as_bool).unwrap_or(false));
-    Ok(json!({
-        "ok": ok,
-        "device": dev.description(),
-        "model": model,
-        "info": vad.info(),
-        "prob_tolerance": PROB_TOLERANCE,
-        "layer_tolerance": LAYER_TOLERANCE,
-        "samples": samples,
-        "timings_ms": stages.to_json(),
-    }))
+
+    fn sample_rate(&self) -> u32 {
+        self.config().sample_rate
+    }
+
+    fn stages(&self, s: &Sample, audio: &[f32]) -> Result<Stages> {
+        let probs = self.probabilities(audio)?;
+        let k = s.acts.shape("prob")?.first().copied().unwrap_or(0);
+        let tr = self.trace(audio, k)?;
+        let mut rows = vec![Row::front("probs", probs.clone(), LAYER_TOLERANCE)];
+        for (name, v) in [("stft", tr.stft), ("encoder", tr.encoder), ("lstm.h", tr.h), ("lstm.c", tr.c), ("prob", tr.probs)] {
+            rows.push(Row::front(name, v, LAYER_TOLERANCE));
+        }
+        let max_abs = diff(&probs, &s.get("probs")?).map_or(f32::INFINITY, |d| d.max_abs);
+        Ok(Stages { rows, argmax: Vec::new(), checks: vec![Check::new("prob_max_abs", max_abs <= PROB_TOLERANCE, true)] })
+    }
+
+    /// Segments and stream events for every reference option set.
+    fn end_to_end(&self, s: &Sample, audio: &[f32]) -> Result<EndToEnd> {
+        let (probs, ref_probs) = (self.probabilities(audio)?, s.get("probs")?);
+        let (sr, w) = (self.sample_rate(), self.window_size());
+        let (mut segments_ok, mut events_ok, mut stream_exact) = (true, true, true);
+        let mut info = Map::new();
+        let mut seg_rows = Vec::new();
+        for set in s.result["speech_timestamps"].as_array().into_iter().flatten() {
+            let opts = options_from_json(&set["options"]);
+            let want = segments_of(&set["segments"]);
+            let got = speech_timestamps(&probs, audio.len(), sr, w, &opts);
+            let logic = speech_timestamps(&ref_probs, audio.len(), sr, w, &opts);
+            segments_ok &= got == want && logic == want;
+            seg_rows.push(json!({"options": opts, "exact": got == want, "logic_exact": logic == want}));
+        }
+        let mut it_rows = Vec::new();
+        for set in s.result["iterator"].as_array().into_iter().flatten() {
+            let opts = options_from_json(&set["options"]);
+            let (events, tail, sprobs) = run_stream(self, audio, STREAM_CHUNK, &opts)?;
+            stream_exact &= sprobs == probs;
+            events_ok &= events == events_of(&set["events"]);
+            it_rows.push(json!({"options": opts, "exact": events == events_of(&set["events"]), "events": events, "flush": tail}));
+        }
+        info.insert("windows".into(), json!(probs.len()));
+        info.insert("speech_timestamps".into(), Value::Array(seg_rows));
+        info.insert("iterator".into(), Value::Array(it_rows));
+        let checks = vec![
+            Check::new("segments_exact", segments_ok, true),
+            Check::new("iterator_events_exact", events_ok, true),
+            Check::new("stream_vs_batch_exact", stream_exact, true),
+        ];
+        Ok(EndToEnd { checks, info, ..EndToEnd::default() })
+    }
+
+    fn bench_input(&self, audio: Vec<f32>) -> Vec<f32> {
+        audio.iter().copied().cycle().take(BENCH_SECONDS * self.sample_rate() as usize).collect()
+    }
+
+    fn bench_run(&self, audio: &[f32]) -> Result<BenchRun> {
+        let t = Instant::now();
+        self.probabilities(audio)?;
+        let probabilities = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        let segments = self.process(audio, &VadOptions::default())?;
+        let process = t.elapsed().as_secs_f64() * 1e3;
+        let (front, recurrence) = split_ms(self, audio)?;
+        let (stream_512, stream_100ms) = (stream_ms(self, audio, 512)?, stream_ms(self, audio, 1600)?);
+        Ok(BenchRun {
+            times: vec![("total", probabilities), ("probabilities", probabilities), ("front", front), ("recurrence", recurrence), ("process", process), ("stream_512", stream_512), ("stream_100ms", stream_100ms)],
+            values: vec![("segments", segments.len() as f64)],
+            text: String::new(),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/reference/vad")
     }
 
-    /// Runs whenever the reference data exists (it is small: the real 1.2 MB model + 2 clips).
+    /// Runs whenever the reference data exists (the real 1.2 MB model + 2 clips).
     #[test]
     fn vad_verify_reference_cpu() {
-        let root = root();
-        if !root.join("model/config.json").is_file() {
-            eprintln!("skipping: {} missing (run tools/reference/silero_vad_ref.py)", root.display());
+        if !root().join("model/config.json").is_file() {
             return;
         }
-        let model = root.join("model");
-        let v = verify(&root, model.to_str().expect("utf8"), Some("cpu")).expect("verify");
+        let args = crate::cmd::ModelArgs { model: Some(root().join("model").display().to_string()), dtype: None, device: Some("cpu".into()) };
+        let v = crate::runtime::audio_verify::verify::<Vad>(Some(&root()), &args).expect("verify");
         assert_eq!(v["ok"], true, "{}", serde_json::to_string_pretty(&v).unwrap_or_default());
     }
 
     /// Stream and whole-buffer probabilities agree bit for bit for any chunking (CPU).
     #[test]
     fn vad_stream_equals_batch() {
-        let root = root();
-        if !root.join("model/config.json").is_file() {
+        if !root().join("model/config.json").is_file() {
             return;
         }
-        let (vad, _) = open_model(root.join("model").to_str().expect("utf8"), &Device::cpu()).expect("model");
-        let samples = crate::audio::load_audio_16k_mono(&root.join("../../jfk.wav")).expect("audio");
+        let path = std::env::temp_dir().join(format!("lapid-vad-stream-{}.lapid", std::process::id()));
+        super::super::convert::CONVERT.convert(root().join("model").to_str().expect("utf8"), lapid_convert::OutDType::F32, &path).expect("convert");
+        let vad = Vad::load(&path, &Device::cpu()).expect("model");
+        std::fs::remove_file(&path).ok();
+        let samples = crate::audio::load_audio_16k_mono(&root().join("../../jfk.wav")).expect("audio");
         let samples = &samples[..512 * 40 + 300];
         let batch = vad.probabilities(samples).expect("probs");
         for chunk in [160, 512, 1000, 512 * 3, 512 * 9 + 7, 512 * 20] {
@@ -258,11 +242,7 @@ mod tests {
     #[test]
     fn options_parse() {
         let o = options_from_json(&json!({"threshold": 0.6, "neg_threshold": 0.3, "max_speech_duration_s": 2.0}));
-        assert_eq!(o.threshold, 0.6);
-        assert_eq!(o.neg_threshold, Some(0.3));
-        assert_eq!(o.min_speech_duration_ms, 250);
-        assert_eq!(o.max_speech_duration_s, 2.0);
+        assert_eq!((o.threshold, o.neg_threshold, o.min_speech_duration_ms, o.max_speech_duration_s), (0.6, Some(0.3), 250, 2.0));
         assert_eq!(options_from_json(&json!({})), VadOptions::default());
     }
 }
-

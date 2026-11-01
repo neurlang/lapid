@@ -1,367 +1,259 @@
-//! Google Gemma 4 (text decoder of `google/gemma-4-E2B-it` & co.): model graphs (per-layer
-//! embeddings, sliding / full attention with KV sharing), streaming chat generation, chat
-//! template rendering (the LFM3 Jinja interpreter), conversion from Hugging Face safetensors
-//! and GGUF (K-quants kept as stored), and the verification / benchmark wiring.
+//! Google Gemma 4: one model for the dense (E2B, E4B, 31B) and MoE (26B-A4B) text decoders
+//! and the vision tower (`config`: `moe`, `vision`). Only the model's math, config,
+//! conversion tables and verification descriptors; the rest is `crate::runtime`
+//! (`Llm` for text chat, `runtime::vlm` for image + text chat).
 //!
 //! ```no_run
-//! use lapid_hub::gemma4::{ChatOptions, Gemma4, Message};
+//! use lapid_hub::gemma4::{ChatOptions, Gemma4};
+//! use lapid_hub::vision::{Image, Message};
 //! let device = lapid::Device::best();
 //! let llm = Gemma4::from_hub("google/gemma-4-E2B-it", "int8", &device)?;
+//! let msg = Message::user_with_images(vec![Image::open("photo.jpg".as_ref())?], "Describe this image.");
 //! let mut session = llm.new_session();
-//! let messages = [Message::user("Write a haiku about rust.")];
-//! for token in llm.chat_stream(&mut session, &messages, &ChatOptions::default())? {
+//! for token in llm.mm_chat_stream(&mut session, &[msg], &ChatOptions::default())? {
 //!     print!("{}", token?.text);
 //! }
 //! # Ok::<(), lapid::Error>(())
 //! ```
+//!
+//! Verification names: `gemma4` (text reference, plus its `inject` case), `gemma4moe` (the
+//! tiny MoE text reference by default), `gemma4vl` (image references).
 
-pub mod bench;
-pub mod cmd;
 pub mod config;
 pub mod convert;
-mod model;
-pub mod verify;
+pub mod model;
+pub mod vision;
 
 use std::path::Path;
 
-use lapid::{Device, Error, LapidFile, Result};
-use lapid_nn::{Loader, SamplingParams, Tokenizer};
-use serde::{Deserialize, Serialize};
+use lapid::{Error, Result, Tensor, bail};
+use lapid_convert::engine::ConvertSpec;
+use lapid_nn::Loader;
+use lapid_verify::Descriptor;
+use lapid_verify::harness::Reference;
 use serde_json::Value;
 
-use crate::lfm3::jinja::{self, Template};
-use crate::model::{Bytes, Model, ModelInfo};
-pub use crate::lfm3::{CancelToken, FinishReason, GenerateOptions, GenerationStats, Token, TokenStream};
+pub use crate::runtime::{CancelToken, ChatOptions, FinishReason, GenerateOptions, GenerationStats, Message, Token, TokenStream};
 pub use config::{Gemma4Config, LayerType};
-pub use lapid_nn::Precision;
-use model::{Gemma4Model, State};
+use crate::cmd::ModelArgs;
+use crate::runtime::{CausalLm, LmCache, LmDef, LmDims, Llm, Media, ModelEntry, Rows, Taps, VisionLm, lm_bench, vlm_verify};
+use config::ImageProcessorConfig;
+use model::Decoder;
+use vision::{PreparedImage, VisionTower};
 
-/// One chat message (`role`: "system" | "user" | "assistant"; `reasoning_content` is the
-/// assistant's thinking, which the template drops from earlier turns).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Message {
-    pub role: String,
-    pub content: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_content: Option<String>,
+/// A loaded Gemma 4 model (text, and images when the file has the vision tower).
+pub type Gemma4 = Llm<Gemma4Model>;
+/// The MoE variants are the same model.
+pub type Gemma4Moe = Gemma4;
+/// Image + text chat: `Gemma4::mm_chat_stream` (`runtime::vlm`).
+pub type Gemma4Vl = Gemma4;
+pub type Session = crate::runtime::Session<LmCache>;
+
+pub struct Gemma4Model {
+    pub decoder: Decoder,
+    tower: Option<VisionTower>,
+    processor: ImageProcessorConfig,
+    image_tokens: (u32, u32, u32),
 }
 
-impl Message {
-    pub fn new(role: &str, content: impl Into<String>) -> Message {
-        Message { role: role.to_string(), content: content.into(), reasoning_content: None }
+impl Gemma4Model {
+    pub fn config(&self) -> &Gemma4Config {
+        &self.decoder.cfg
     }
 
-    pub fn system(content: impl Into<String>) -> Message {
-        Message::new("system", content)
-    }
-
-    pub fn user(content: impl Into<String>) -> Message {
-        Message::new("user", content)
-    }
-
-    pub fn assistant(content: impl Into<String>) -> Message {
-        Message::new("assistant", content)
-    }
-
-    fn to_value(&self) -> jinja::Value {
-        let mut m = vec![("role".to_string(), jinja::Value::str(&self.role)), ("content".to_string(), jinja::Value::str(&self.content))];
-        if let Some(r) = &self.reasoning_content {
-            m.push(("reasoning_content".to_string(), jinja::Value::str(r)));
+    /// Soft-token budget per image (HF `max_soft_tokens`: 70, 140, 280, 560 or 1120; more
+    /// tokens = higher resolution). GGUF projectors do not record it (default 280).
+    pub fn set_max_soft_tokens(&mut self, n: usize) -> Result<()> {
+        if ![70, 140, 280, 560, 1120].contains(&n) {
+            bail!("invalid_argument", "gemma4: max_soft_tokens {n} (expected 70, 140, 280, 560 or 1120)");
         }
-        jinja::Value::map(m)
+        self.processor.max_soft_tokens = n;
+        Ok(())
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct ChatOptions {
-    /// Template `enable_thinking` (`None` = the template default: off).
-    pub enable_thinking: Option<bool>,
-    pub generate: GenerateOptions,
-}
+impl CausalLm for Gemma4Model {
+    const ARCH: &'static str = "gemma4";
+    type State = LmCache;
 
-/// A sequence being generated: the KV cache plus the tokens it has consumed.
-pub struct Session {
-    state: State,
-    tokens: Vec<u32>,
-}
-
-impl Session {
-    /// Tokens fed to the model so far.
-    pub fn tokens(&self) -> &[u32] {
-        &self.tokens
-    }
-
-    /// Absolute position of the next token.
-    pub fn position(&self) -> usize {
-        self.state.offset()
-    }
-
-    pub fn reset(&mut self) {
-        self.state.clear();
-        self.tokens.clear();
-    }
-
-    /// Keep the cache when the consumed tokens are a strict prefix of `prompt`, otherwise
-    /// start over. Returns how many prompt tokens are already consumed.
-    fn reuse_prefix(&mut self, prompt: &[u32]) -> usize {
-        let n = self.tokens.len();
-        if n > 0 && n < prompt.len() && prompt[..n] == self.tokens[..] {
-            return n;
+    fn load(l: &Loader<'_>, meta: &Value) -> Result<Gemma4Model> {
+        let cfg = Gemma4Config::from_json(meta)?;
+        let decoder = Decoder::load(l, &cfg)?;
+        // The tower is optional: text-only files (and GGUFs without a projector) have none.
+        let tower = match &cfg.vision {
+            Some(vc) if l.contains(vision::EMBED_PROJ) => Some(VisionTower::load(l, vc, cfg.hidden_size)?),
+            _ => None,
+        };
+        let [image, boi, eoi] = cfg.image_tokens;
+        let image_tokens = match (image, boi, eoi) {
+            (Some(i), Some(b), Some(e)) => (i, b, e),
+            _ if tower.is_none() => (u32::MAX, u32::MAX, u32::MAX),
+            _ => bail!("metadata", "gemma4: the vision tower needs image_token_id, boi_token_id and eoi_token_id"),
+        };
+        if let Some(t) = &tower
+            && (cfg.processor.patch_size != t.cfg.patch_size || cfg.processor.pooling_kernel_size != t.cfg.pooling_kernel_size)
+        {
+            bail!("metadata", "gemma4: image_processor patch / pooling sizes differ from vision_config");
         }
-        self.reset();
-        0
+        Ok(Gemma4Model { processor: cfg.processor.clone(), decoder, tower, image_tokens })
+    }
+
+    fn dims(&self) -> LmDims {
+        let c = self.config();
+        LmDims { vocab: c.vocab_size, hidden: c.hidden_size, layers: c.n_layers }
+    }
+
+    fn new_state(&self) -> LmCache {
+        LmCache::new(self.decoder.new_cache(), 0)
+    }
+
+    fn end_of_turn(&self) -> &'static [&'static str] {
+        &["<turn|>"]
+    }
+
+    fn think_markers(&self) -> (&'static str, &'static str) {
+        ("<|channel>thought\n", "<channel|>")
+    }
+
+    /// Taps: `embed`, `layers.{i}.attn`, `layers.{i}`, `norm`.
+    fn forward(&self, ids: &[u32], st: &mut LmCache, rows: Rows, taps: &mut Taps) -> Result<Option<Tensor>> {
+        self.decoder.forward(ids, &[], &mut st.kv, rows, taps)
     }
 }
 
-/// Parse the chat template. The LFM3 Jinja interpreter has no `dictsort` filter (Gemma 4's
-/// template uses it only as `for k, v in m | dictsort`): it is rewritten to `items` and the
-/// render inputs get every map sorted by key (case-insensitive, as `dictsort`). Safe for
-/// templates that never iterate or dump maps any other way. Gap → candidate for the shared
-/// Jinja interpreter (lapid-nn).
-fn parse_template(source: &str) -> Result<(Template, bool)> {
-    if !source.contains("dictsort") {
-        return Ok((Template::parse(source)?, false));
-    }
-    let rewritten = source.replace("| dictsort", "| items").replace("|dictsort", "| items");
-    if rewritten.contains("dictsort") {
-        return Err(Error::new("template", "gemma4: unsupported use of the dictsort filter"));
-    }
-    Ok((Template::parse(&rewritten)?, true))
-}
+impl VisionLm for Gemma4Model {
+    type Image = PreparedImage;
 
-/// `v` with every map's keys sorted (case-insensitive, stable), recursively.
-fn sort_maps(v: jinja::Value) -> jinja::Value {
-    match v {
-        jinja::Value::Map(m) => {
-            let mut m: Vec<(String, jinja::Value)> = m.into_iter().map(|(k, x)| (k, sort_maps(x))).collect();
-            m.sort_by_key(|(k, _)| k.to_lowercase());
-            jinja::Value::Map(m)
+    fn has_vision(&self) -> bool {
+        self.tower.is_some()
+    }
+
+    fn image_tokens(&self) -> (u32, Option<u32>, Option<u32>) {
+        let (i, b, e) = self.image_tokens;
+        (i, Some(b), Some(e))
+    }
+
+    fn prepare_image(&self, img: &crate::vision::Image) -> Result<PreparedImage> {
+        vision::prepare(img, &self.processor)
+    }
+
+    fn image_size(&self, img: &PreparedImage) -> (usize, (usize, usize)) {
+        let k = self.processor.pooling_kernel_size;
+        (img.n_soft, (img.grid.0 / k, img.grid.1 / k))
+    }
+
+    fn encode_image(&self, img: &PreparedImage, taps: &mut Taps) -> Result<Vec<Tensor>> {
+        let t = self.tower.as_ref().ok_or_else(|| Error::new("unsupported", "gemma4: no vision tower"))?;
+        Ok(vec![t.build(img, taps)?])
+    }
+
+    fn forward_media(&self, ids: &[u32], media: &[Media], st: &mut LmCache, rows: Rows, taps: &mut Taps) -> Result<Option<Tensor>> {
+        self.decoder.forward(ids, media, &mut st.kv, rows, taps)
+    }
+
+    fn image_pixels<'a>(&self, img: &'a PreparedImage) -> &'a [f32] {
+        &img.patches
+    }
+
+    /// `<case>.pixel_values` [N, 3 p p] and `<case>.positions` [N, 2] (x, y).
+    fn reference_image(&self, r: &Reference, case: &str) -> Result<PreparedImage> {
+        let positions: Vec<[usize; 2]> = r.acts.get(&format!("{case}.positions"))?.chunks(2).map(|c| [c[0] as usize, c[1] as usize]).collect();
+        let k = self.processor.pooling_kernel_size;
+        let (cols, rows) = (positions.iter().map(|p| p[0] + 1).max().unwrap_or(0), positions.iter().map(|p| p[1] + 1).max().unwrap_or(0));
+        if rows * cols != positions.len() || rows % k != 0 || cols % k != 0 {
+            bail!("reference", "gemma4: patch grid {rows}x{cols} for {} patches", positions.len());
         }
-        jinja::Value::List(l) => jinja::Value::List(l.into_iter().map(sort_maps).collect()),
-        other => other,
+        Ok(PreparedImage { patches: r.acts.get(&format!("{case}.pixel_values"))?, n_soft: positions.len() / (k * k), positions, grid: (rows, cols) })
+    }
+
+    fn media_taps(&self) -> Vec<String> {
+        vec!["vision.projected".into()]
+    }
+
+    /// The resize is torchvision-exact.
+    fn preprocess_tolerance(&self) -> (f32, f32) {
+        (1e-6, 1e-6)
+    }
+
+    fn configure(&mut self, reference: &Value) -> Result<()> {
+        match reference.get("max_soft_tokens").and_then(Value::as_u64) {
+            Some(n) => self.set_max_soft_tokens(n as usize),
+            None => Ok(()),
+        }
     }
 }
 
-/// A loaded Gemma 4 model bound to a device.
-pub struct Gemma4 {
-    device: Device,
-    info: ModelInfo,
-    model: Gemma4Model,
-    tokenizer: Tokenizer,
-    template: Template,
-    /// The template used `dictsort` (rewritten to `items`; maps are pre-sorted by key).
-    sort_maps: bool,
-    special_tokens: Vec<(String, String)>,
-    generation: Value,
-    stop: Vec<u32>,
+const fn descriptor(name: &'static str, model: &'static str, dtype: &'static str, dir: &'static str, script: &'static str) -> Descriptor {
+    Descriptor {
+        name,
+        default_model: model,
+        default_dtype: dtype,
+        reference_dir: dir,
+        reference_script: script,
+        reference_label: "PyTorch fp32 (HF transformers Gemma 4)",
+        strict_dtypes: &["fp32", "fp16"],
+        bench_prompt_tokens: 512,
+        bench_gen_tokens: 128,
+    }
 }
 
-pub(crate) const TOKENIZER_BLOB: &str = "tokenizer/tokenizer.json";
-pub(crate) const TEMPLATE_BLOB: &str = "tokenizer/chat_template.jinja";
-
-fn meta_err(m: impl Into<String>) -> Error {
-    Error::new("metadata", format!("gemma4: {}", m.into()))
+impl LmDef for Gemma4Model {
+    const DESCRIPTOR: Descriptor = descriptor("gemma4", "google/gemma-4-E2B-it", "int8", "data/reference/gemma4", "tools/reference/gemma4_ref.py");
+    const CONVERT: &'static ConvertSpec = &convert::CONVERT;
 }
+
+const MOE: Descriptor = descriptor("gemma4moe", "google/gemma-4-26B-A4B-it", "int4", "data/reference/gemma4moe/tiny", "tools/reference/gemma4moe_ref.py");
+const VL: Descriptor = descriptor("gemma4vl", "google/gemma-4-E2B-it", "fp16", "data/reference/gemma4vl", "tools/reference/gemma4vl_ref.py");
+
+fn verify(r: Option<&Path>, a: &ModelArgs) -> Result<Value> {
+    vlm_verify::verify_text::<Gemma4Model>(&Gemma4Model::DESCRIPTOR, r, a)
+}
+
+fn verify_moe(r: Option<&Path>, a: &ModelArgs) -> Result<Value> {
+    vlm_verify::verify_text::<Gemma4Model>(&MOE, r, a)
+}
+
+fn bench_moe(i: Option<&Path>, a: &ModelArgs, runs: usize) -> Result<Value> {
+    lm_bench::bench::<Gemma4Model>(&MOE, i, a, runs)
+}
+
+fn verify_vl(r: Option<&Path>, a: &ModelArgs) -> Result<Value> {
+    vlm_verify::verify::<Gemma4Model>(&VL, r, a)
+}
+
+fn bench_vl(i: Option<&Path>, a: &ModelArgs, runs: usize) -> Result<Value> {
+    vlm_verify::bench::<Gemma4Model>(&VL, i, a, runs)
+}
+
+pub static ENTRY: ModelEntry = ModelEntry { verify, ..ModelEntry::causal_lm::<Gemma4Model>() };
+pub static MOE_ENTRY: ModelEntry = ModelEntry { name: "gemma4moe", verify: verify_moe, bench: bench_moe, ..ModelEntry::causal_lm::<Gemma4Model>() };
+pub static VL_ENTRY: ModelEntry = ModelEntry { name: "gemma4vl", verify: verify_vl, bench: bench_vl, ..ModelEntry::causal_lm::<Gemma4Model>() };
 
 impl Gemma4 {
-    /// Load `repo` (e.g. "google/gemma-4-E2B-it") from the lapid cache, converting it from the
-    /// Hugging Face hub first if missing.
-    pub fn from_hub(repo: &str, dtype: &str, device: &Device) -> Result<Gemma4> {
-        Gemma4::load(&crate::model::hub_model_path(repo, dtype, convert::convert_hf)?, device)
-    }
-
-    /// Load a converted `.lapid` file.
-    pub fn load(path: &Path, device: &Device) -> Result<Gemma4> {
-        Gemma4::load_with(path, device, Precision::Stored)
-    }
-
-    /// Load a `.lapid` image from memory (zero copy).
-    pub fn load_bytes(bytes: Bytes, device: &Device) -> Result<Gemma4> {
-        Gemma4::from_file(LapidFile::from_bytes(bytes)?, device, Precision::Stored)
-    }
-
-    /// Load with a weight precision (the fake-quant modes build verification references).
-    pub fn load_with(path: &Path, device: &Device, precision: Precision) -> Result<Gemma4> {
-        Gemma4::from_file(LapidFile::open(path)?, device, precision)
-    }
-
-    fn from_file(file: LapidFile, device: &Device, precision: Precision) -> Result<Gemma4> {
-        let meta = file.metadata.get("gemma4").ok_or_else(|| meta_err("no \"gemma4\" metadata object"))?;
-        let cfg = Gemma4Config::from_json(meta)?;
-        let blob = |key: &str, default: &str| -> Result<String> {
-            let name = meta.get(key).and_then(Value::as_str).unwrap_or(default);
-            let bytes = file.blob(name).ok_or_else(|| meta_err(format!("blob {name:?} missing")))?;
-            String::from_utf8(bytes.to_vec()).map_err(|_| meta_err(format!("blob {name:?} is not UTF-8")))
-        };
-        let tokenizer = Tokenizer::from_tokenizer_json(&blob("tokenizer_blob", TOKENIZER_BLOB)?)?;
-        let (template, sort_maps) = parse_template(&blob("chat_template_blob", TEMPLATE_BLOB)?)?;
-        let mut special_tokens = Vec::new();
-        if let Some(m) = meta.get("special_tokens").and_then(Value::as_object) {
-            for (k, v) in m {
-                if let Some(s) = v.as_str() {
-                    special_tokens.push((k.clone(), s.to_string()));
-                }
-            }
-        }
-        let generation = meta.get("generation").cloned().unwrap_or(Value::Null);
-        let mut stop = cfg.special.eos.clone();
-        let gen_eos: Vec<u32> = match generation.get("eos_token_id") {
-            Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_u64().map(|x| x as u32)).collect(),
-            Some(v) => v.as_u64().map(|x| x as u32).into_iter().collect(),
-            None => Vec::new(),
-        };
-        let turn_end = tokenizer.token_to_id("<turn|>");
-        for id in gen_eos.into_iter().chain(turn_end) {
-            if !stop.contains(&id) {
-                stop.push(id);
-            }
-        }
-        let model = Gemma4Model::load(&Loader::new(&file, device, precision), &cfg)?;
-        Ok(Gemma4 {
-            device: device.clone(),
-            info: ModelInfo::from_file(&file, "text-generation"),
-            model,
-            tokenizer,
-            template,
-            sort_maps,
-            special_tokens,
-            generation,
-            stop,
-        })
-    }
-
     pub fn config(&self) -> &Gemma4Config {
-        &self.model.cfg
-    }
-
-    pub fn tokenizer(&self) -> &Tokenizer {
-        &self.tokenizer
-    }
-
-    /// Default stop tokens (eos ids, generation_config eos ids, `<turn|>`).
-    pub fn stop_tokens(&self) -> &[u32] {
-        &self.stop
-    }
-
-    /// Sampling recommended by `generation_config.json` (temperature 1.0, top_k 64, top_p 0.95).
-    pub fn recommended_sampling(&self) -> SamplingParams {
-        let g = &self.generation;
-        let f = |k: &str, d: f64| g.get(k).and_then(Value::as_f64).unwrap_or(d) as f32;
-        let do_sample = g.get("do_sample").and_then(Value::as_bool).unwrap_or(false);
-        SamplingParams {
-            temperature: if do_sample { f("temperature", 1.0) } else { 0.0 },
-            top_k: g.get("top_k").and_then(Value::as_u64).unwrap_or(0) as usize,
-            top_p: f("top_p", 1.0),
-            repetition_penalty: f("repetition_penalty", 1.0),
-            seed: 0,
-        }
-    }
-
-    /// Render the chat template for typed messages.
-    pub fn render_chat(&self, messages: &[Message], add_generation_prompt: bool, enable_thinking: Option<bool>) -> Result<String> {
-        let msgs = jinja::Value::List(messages.iter().map(Message::to_value).collect());
-        self.render_values(msgs, jinja::Value::None, add_generation_prompt, enable_thinking)
-    }
-
-    /// Render the chat template for HF-style messages / tools given as JSON (any fields,
-    /// key order kept), e.g. tool calls and multimodal content parts.
-    pub fn render_chat_json(
-        &self,
-        messages_json: &str,
-        tools_json: Option<&str>,
-        add_generation_prompt: bool,
-        enable_thinking: Option<bool>,
-    ) -> Result<String> {
-        let msgs = jinja::Value::from_json_str(messages_json)?;
-        let tools = match tools_json {
-            Some(t) => jinja::Value::from_json_str(t)?,
-            None => jinja::Value::None,
-        };
-        self.render_values(msgs, tools, add_generation_prompt, enable_thinking)
-    }
-
-    fn render_values(
-        &self,
-        messages: jinja::Value,
-        tools: jinja::Value,
-        add_generation_prompt: bool,
-        enable_thinking: Option<bool>,
-    ) -> Result<String> {
-        let (messages, tools) = if self.sort_maps { (sort_maps(messages), sort_maps(tools)) } else { (messages, tools) };
-        let mut globals: Vec<(&str, jinja::Value)> = vec![
-            ("messages", messages),
-            ("tools", tools),
-            ("add_generation_prompt", jinja::Value::Bool(add_generation_prompt)),
-        ];
-        for (k, v) in &self.special_tokens {
-            globals.push((k.as_str(), jinja::Value::str(v)));
-        }
-        if let Some(t) = enable_thinking {
-            globals.push(("enable_thinking", jinja::Value::Bool(t)));
-        }
-        self.template.render(&globals)
-    }
-
-    /// Token ids of rendered chat text (special tokens recognized; nothing added).
-    pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        self.tokenizer.encode(text, false)
-    }
-
-    pub fn decode(&self, ids: &[u32], skip_special: bool) -> String {
-        self.tokenizer.decode(ids, skip_special)
-    }
-
-    /// A fresh sequence (empty KV cache).
-    pub fn new_session(&self) -> Session {
-        Session { state: self.model.new_state(), tokens: Vec::new() }
-    }
-
-    /// Stream tokens after `prompt`. When the session already consumed a prefix of `prompt`
-    /// (e.g. the earlier turns of a chat), only the rest is prefilled.
-    pub fn generate<'a>(&'a self, session: &'a mut Session, prompt: &[u32], opts: GenerateOptions) -> Result<TokenStream<'a>> {
-        let cached = session.reuse_prefix(prompt);
-        let model = &self.model;
-        let device = &self.device;
-        let step = move |ids: &[u32]| -> Result<Vec<f32>> {
-            let logits = model.step(device, ids, &mut session.state)?;
-            session.tokens.extend_from_slice(ids);
-            Ok(logits)
-        };
-        TokenStream::new(step, &self.tokenizer, prompt, cached, opts, &self.stop)
-    }
-
-    /// Stream the assistant reply to `messages` (template with the generation prompt).
-    pub fn chat_stream<'a>(&'a self, session: &'a mut Session, messages: &[Message], opts: &ChatOptions) -> Result<TokenStream<'a>> {
-        let text = self.render_chat(messages, true, opts.enable_thinking)?;
-        let ids = self.encode(&text)?;
-        self.generate(session, &ids, opts.generate.clone())
-    }
-
-    /// The full assistant reply (non-streaming convenience).
-    pub fn chat(&self, messages: &[Message], opts: &ChatOptions) -> Result<String> {
-        let mut session = self.new_session();
-        let (text, _, _) = self.chat_stream(&mut session, messages, opts)?.collect_text()?;
-        Ok(text)
-    }
-
-    /// Logits of the last position after feeding `ids` to `session` (low-level step).
-    pub fn step(&self, session: &mut Session, ids: &[u32]) -> Result<Vec<f32>> {
-        let logits = self.model.step(&self.device, ids, &mut session.state)?;
-        session.tokens.extend_from_slice(ids);
-        Ok(logits)
-    }
-
-    pub(crate) fn model(&self) -> &Gemma4Model {
-        &self.model
+        self.model().config()
     }
 }
 
-impl Model for Gemma4 {
-    fn info(&self) -> ModelInfo {
-        self.info.clone()
-    }
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
 
-    fn device(&self) -> &Device {
-        &self.device
+    use crate::cmd::ModelArgs;
+
+    /// The tiny references end to end on the CPU (skipped when `data/reference` lacks them).
+    #[test]
+    fn tiny_references_verify() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/reference");
+        for (entry, dir) in [(&super::ENTRY, "gemma4/tiny"), (&super::MOE_ENTRY, "gemma4moe/tiny"), (&super::VL_ENTRY, "gemma4vl/tiny"), (&super::VL_ENTRY, "gemma4vl/tiny_causal")] {
+            let dir = root.join(dir);
+            if !dir.join("model").is_dir() {
+                eprintln!("skipped: {} not found", dir.display());
+                continue;
+            }
+            let args = ModelArgs { model: Some(dir.join("model").display().to_string()), dtype: Some("fp32".into()), device: Some("cpu".into()) };
+            let r = (entry.verify)(Some(&dir), &args).expect("verify");
+            assert_eq!(r["ok"], true, "{}: {r:#}", dir.display());
+        }
     }
 }

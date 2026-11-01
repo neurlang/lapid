@@ -1,118 +1,31 @@
-//! `verify zipformer`: compare lapid's streaming Zipformer2 with the icefall reference written
-//! by `tools/reference/zipformer_ref.py` (`run` / `tiny`), for one reference directory (with
-//! `result.json`) or every sub-directory that has one (`data/reference/zipformer/{tiny,en,..}`).
-//!
-//! Per sample:
-//! * fbank of the audio vs lhotse;
-//! * chunk by chunk on the reference fbank (icefall's schedule and tail padding): the embed and
-//!   stack outputs of the traced chunks, the projected encoder output of every chunk, and every
-//!   cached state (keys, nonlinear-attention inputs, values, conv caches, ConvNeXt cache) after
-//!   the reference's state chunks;
-//! * greedy tokens of that run (overall and per chunk) vs icefall;
-//! * end to end from the audio file, fed in odd-sized pieces: tokens and text must equal the
-//!   reference (fp32 / fp16 / int8; int4 reported).
-//!
-//! Quantized files are also checked against the fake-quant model (same weights dequantized,
-//! CPU) at `KERNEL_TOLERANCE` (encoder output of all chunks).
+//! Zipformer on the generic audio harness: the verification descriptor (fbank, every chunk
+//! on the reference fbank with all caches traced, tokens overall and per chunk, end to end
+//! from odd-sized audio pieces) and the streaming benchmark.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::time::Instant;
 
-use lapid::{Error, Result};
-use lapid_convert::OutDType;
-use lapid_verify::{Activations, Comparison, KERNEL_TOLERANCE, tolerance};
-use serde_json::{Value, json};
+use lapid::{Device, Error, Result};
+use lapid_convert::engine::ConvertSpec;
+use lapid_nn::Precision;
+use lapid_verify::Descriptor;
+use serde_json::{Map, Value, json};
 
 use super::config::{LOG_EPS, PAD_FRAMES, TAIL_FRAMES};
-use super::fbank::Fbank;
-use super::{Precision, StreamOptions, Zipformer};
+use lapid_nn::audio::Fbank;
+use super::stream::greedy;
+use super::{StreamOptions, Zipformer};
+use crate::runtime::audio::{AsrModel, AudioDef, BenchRun, Check, EndToEnd, Row, Sample, Stages, find_path};
+use crate::runtime::serve::{AsrParams, AsrSegment, TranscriptOut};
+use crate::runtime::transducer::{GreedyDecoder, Transducer};
 
 /// Tolerance of our fbank against lhotse (f64 vs f32 math).
-pub const FBANK_TOLERANCE: f32 = 1e-4;
+const FBANK_TOLERANCE: f32 = 1e-4;
+/// Samples per `accept_waveform` call: odd in verification, 100 ms in benchmarks.
+const VERIFY_PIECE: usize = 1013;
+const BENCH_PIECE: usize = 1600;
 
-/// Whether the transcript must match the reference exactly for this dtype.
-pub fn text_must_match(dtype: &str) -> bool {
-    matches!(dtype, "fp32" | "fp16" | "int8")
-}
-
-/// `.lapid` for `model` (a `.lapid` path or an exported directory / repo converted into the
-/// cache; re-converted when the source weights are newer).
-pub(crate) fn resolve_model(model: &str, dtype: &str) -> Result<PathBuf> {
-    let p = Path::new(model);
-    if p.extension().is_some_and(|e| e == "lapid") {
-        return Ok(p.to_path_buf());
-    }
-    let out_dtype = OutDType::parse(dtype)?;
-    let path = crate::runtime::resolve::cache_path(model, out_dtype).0;
-    let stale = |src: &Path| -> bool {
-        let m = |q: &Path| std::fs::metadata(q).and_then(|m| m.modified()).ok();
-        matches!((m(src), m(&path)), (Some(s), Some(o)) if s > o)
-    };
-    if path.is_file() && crate::runtime::resolve::cached_matches(&path, model) && !(p.is_dir() && stale(&p.join("model.safetensors"))) {
-        return Ok(path);
-    }
-    super::convert::convert_hf(model, out_dtype, &path)?;
-    Ok(path)
-}
-
-struct Reference {
-    dir: PathBuf,
-    audio: PathBuf,
-    model: Option<String>,
-    chunk: usize,
-    left: usize,
-    chunks: usize,
-    tokens: Vec<u32>,
-    chunk_tokens: Vec<Vec<u32>>,
-    text: String,
-    states_chunks: Vec<usize>,
-    random: bool,
-}
-
-fn u32s(v: &Value) -> Vec<u32> {
-    v.as_array().map(|a| a.iter().filter_map(Value::as_u64).map(|x| x as u32).collect()).unwrap_or_default()
-}
-
-/// `rel` as given (absolute or from the working directory), else relative to `dir` or one of
-/// its ancestors (reference files name repo-root-relative paths).
-fn find_path(dir: &Path, rel: &str) -> Option<PathBuf> {
-    let p = PathBuf::from(rel);
-    if p.exists() {
-        return Some(p);
-    }
-    dir.ancestors().map(|a| a.join(rel)).find(|q| q.exists())
-}
-
-fn read_reference(dir: &Path) -> Result<Reference> {
-    let path = dir.join("result.json");
-    let raw = std::fs::read_to_string(&path).map_err(|e| Error::new("io", format!("{}: {e} (run tools/reference/zipformer_ref.py)", path.display())))?;
-    let v: Value = serde_json::from_str(&raw)?;
-    let num = |k: &str| v.get(k).and_then(Value::as_u64).map(|x| x as usize).ok_or_else(|| Error::new("reference", format!("result.json: no {k:?}")));
-    let audio = v.get("audio").and_then(Value::as_str).ok_or_else(|| Error::new("reference", "result.json: no \"audio\""))?;
-    let audio = find_path(dir, audio).ok_or_else(|| Error::new("not_found", format!("{}: audio {audio:?} not found", dir.display())))?;
-    Ok(Reference {
-        dir: dir.to_path_buf(),
-        audio,
-        model: v.get("model").and_then(Value::as_str).map(|m| find_path(dir, m).map_or_else(|| m.to_string(), |p| p.display().to_string())),
-        chunk: num("chunk_size")?,
-        left: num("left_context_frames")?,
-        chunks: num("chunks")?,
-        tokens: u32s(&v["tokens"]),
-        chunk_tokens: v.get("chunk_tokens").and_then(Value::as_array).map(|a| a.iter().map(u32s).collect()).unwrap_or_default(),
-        text: v.get("text").and_then(Value::as_str).unwrap_or("").trim().to_string(),
-        random: v.get("random").and_then(Value::as_bool).unwrap_or(false),
-        states_chunks: v.get("states_chunks").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(|x| x as usize).collect()).unwrap_or_default(),
-    })
-}
-
-/// Our run over the reference fbank: rows (name -> concatenated values) and tokens per chunk.
-struct Run {
-    rows: BTreeMap<String, Vec<f32>>,
-    chunk_tokens: Vec<Vec<u32>>,
-    tokens: Vec<u32>,
-}
-
-/// Row name of a traced / state tensor: per-kind aggregation over chunks and layers.
+/// Row of a traced / state tensor: per-kind aggregation over chunks and layers.
 fn row_of(name: &str) -> String {
     match name.strip_prefix("state.") {
         Some(rest) if rest != "embed" => format!("state.{}", rest.rsplit('.').next().unwrap_or(rest)),
@@ -120,199 +33,182 @@ fn row_of(name: &str) -> String {
     }
 }
 
-fn run_chunks(z: &Zipformer, r: &Reference, acts: &Activations, fbank: &[f32]) -> Result<Run> {
-    let f = z.config().feature_dim;
-    let opts = StreamOptions { chunk_size: Some(r.chunk), left_context_frames: Some(r.left), endpoint: None };
-    let mut s = z.stream(&opts)?;
-    let mut padded = fbank.to_vec();
-    padded.extend(std::iter::repeat_n(LOG_EPS, (PAD_FRAMES + TAIL_FRAMES) * f));
-    let total = padded.len() / f;
-    let window = 2 * r.chunk + PAD_FRAMES;
-    let mut run = Run { rows: BTreeMap::new(), chunk_tokens: Vec::new(), tokens: Vec::new() };
-    let (mut n, mut c) = (0, 0);
-    while n < total {
-        let end = (n + window).min(total);
-        let mut x = padded[n * f..end * f].to_vec();
-        x.resize(window * f, LOG_EPS);
-        let before = s.result().tokens.len();
+fn num(s: &Sample, k: &str) -> Result<usize> {
+    s.result[k].as_u64().map(|v| v as usize).ok_or_else(|| Error::new("reference", format!("result.json: no {k:?}")))
+}
+
+fn stream_options(s: &Sample) -> Result<StreamOptions> {
+    Ok(StreamOptions { chunk_size: Some(num(s, "chunk_size")?), left_context_frames: Some(num(s, "left_context_frames")?), endpoint: None })
+}
+
+impl AudioDef for Zipformer {
+    const DESCRIPTOR: Descriptor = Descriptor {
+        name: "zipformer",
+        default_model: "data/hf/zipformer2-en-streaming-2023-05-17",
+        default_dtype: "fp16",
+        reference_dir: "data/reference/zipformer",
+        reference_script: "tools/reference/zipformer_ref.py",
+        reference_label: "icefall fp32 streaming decode (PyTorch)",
+        strict_dtypes: &["fp32", "fp16", "int8"],
+        bench_prompt_tokens: 0,
+        bench_gen_tokens: 0,
+    };
+    const CONVERT: &'static ConvertSpec = &super::convert::CONVERT;
+    const QUALITY_REQUIRED: bool = true;
+
+    fn load_with(path: &Path, device: &Device, precision: Precision) -> Result<Self> {
+        Zipformer::load_with(path, device, precision)
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.config().sample_rate
+    }
+
+    fn sample_model(s: &Sample) -> Option<String> {
+        let m = s.result["model"].as_str()?;
+        Some(find_path(&s.dir, m).map_or_else(|| m.to_string(), |p| p.display().to_string()))
+    }
+
+    /// Chunks `chunk.{c}.{name}` aggregated per row like [`AudioDef::stages`].
+    fn reference_row(s: &Sample, name: &str) -> Result<Vec<f32>> {
+        if name == "fbank" {
+            return s.get("fbank");
+        }
+        let states = s.u32s("/states_chunks").unwrap_or_default();
         let mut out = Vec::new();
-        let trace = s.step(&x, true, &mut out)?.ok_or_else(|| Error::new("internal", "no chunk trace"))?;
-        run.chunk_tokens.push(s.result().tokens[before..].to_vec());
-        run.rows.entry("encoder_out".into()).or_default().extend(&trace.encoder_out);
-        for (name, v) in &trace.traced {
-            if acts.has(&format!("chunk.{c}.{name}")) {
-                run.rows.entry(name.clone()).or_default().extend(v);
+        for c in 0..num(s, "chunks")? {
+            let p = format!("chunk.{c}.");
+            for n in s.acts.names().iter().filter(|n| n.starts_with(&p)) {
+                let rest = &n[p.len()..];
+                if row_of(rest) == name && (!rest.starts_with("state.") || states.contains(&(c as u32))) {
+                    out.extend(s.get(n)?);
+                }
             }
         }
-        if r.states_chunks.contains(&c) {
-            for (name, v) in &trace.state {
-                run.rows.entry(row_of(name)).or_default().extend(v);
+        Ok(out)
+    }
+
+    /// Fbank from the audio; chunk by chunk on the reference fbank (icefall's schedule and
+    /// tail padding): encoder output of every chunk, stack outputs of the traced chunks,
+    /// every cache after the state chunks; greedy tokens overall and per chunk.
+    fn stages(&self, s: &Sample, audio: &[f32]) -> Result<Stages> {
+        let (m, cfg) = (self.model(), self.config());
+        let fbank = Fbank::new(cfg.feature_dim, cfg.sample_rate).compute(audio);
+        let mut rows = vec![Row::front("fbank", fbank, FBANK_TOLERANCE)];
+        let (chunk, f) = (num(s, "chunk_size")?, cfg.feature_dim);
+        let mut st = m.chunk_state(chunk, num(s, "left_context_frames")?)?;
+        let mut feats = s.get("fbank")?;
+        feats.extend(std::iter::repeat_n(LOG_EPS, (PAD_FRAMES + TAIL_FRAMES) * f));
+        let (total, window, states) = (feats.len() / f, 2 * chunk + PAD_FRAMES, s.u32s("/states_chunks").unwrap_or_default());
+        let mut dec = GreedyDecoder::new(m, greedy())?;
+        let mut agg: Vec<(String, Vec<f32>)> = vec![("encoder_out".into(), Vec::new())];
+        let mut chunk_tokens: Vec<Vec<u32>> = Vec::new();
+        let (mut n, mut c) = (0, 0);
+        while n < total {
+            let mut x = feats[n * f..(n + window).min(total) * f].to_vec();
+            x.resize(window * f, LOG_EPS);
+            let (enc, tr) = m.run_chunk(&x, &mut st, true)?;
+            let tr = tr.ok_or_else(|| Error::new("internal", "no chunk trace"))?;
+            chunk_tokens.push(dec.decode_chunk(m, &enc)?.iter().map(|s| s.token).collect());
+            agg[0].1.extend(m.device().to_vec_f32(&enc)?);
+            let state_rows = if states.contains(&(c as u32)) { &tr.state[..] } else { &[][..] };
+            for (name, v) in tr.traced.iter().filter(|(n, _)| s.acts.has(&format!("chunk.{c}.{n}"))).chain(state_rows) {
+                let row = row_of(name);
+                match agg.iter_mut().find(|(k, _)| *k == row) {
+                    Some((_, acc)) => acc.extend(v),
+                    None => agg.push((row, v.clone())),
+                }
             }
+            n += 2 * chunk;
+            c += 1;
         }
-        n += 2 * r.chunk;
-        c += 1;
+        // only the projected encoder output is compared with the fake-quant model
+        rows.extend(agg.into_iter().map(|(k, v)| if k == "encoder_out" { Row::new(k, v) } else { Row::new(k, v).quality_only() }));
+        let ref_chunks: Vec<Vec<u32>> = s.result["chunk_tokens"].as_array().into_iter().flatten().map(|a| a.as_array().into_iter().flatten().filter_map(Value::as_u64).map(|v| v as u32).collect()).collect();
+        let tokens: Vec<u32> = chunk_tokens.concat();
+        let random_int8 = s.result["random"].as_bool() == Some(true) && s.dtype == "int8";
+        let checks = vec![
+            Check::new("tokens_match", tokens == s.u32s("/tokens")?, s.strict && !random_int8),
+            // lower precisions may move a token by one frame across a chunk boundary
+            Check::new("chunk_tokens_match", chunk_tokens == ref_chunks, s.dtype == "fp32"),
+        ];
+        Ok(Stages { rows, argmax: Vec::new(), checks })
     }
-    run.tokens = s.result().tokens;
-    Ok(run)
-}
 
-/// Reference rows in the same aggregation as `run_chunks`.
-fn reference_rows(acts: &Activations, r: &Reference) -> Result<BTreeMap<String, Vec<f32>>> {
-    let mut rows: BTreeMap<String, Vec<f32>> = BTreeMap::new();
-    for c in 0..r.chunks {
-        let p = format!("chunk.{c}.");
-        rows.entry("encoder_out".into()).or_default().extend(acts.get(&format!("{p}encoder_out"))?);
-        for name in acts.names().iter().filter(|n| n.starts_with(&p)) {
-            let rest = &name[p.len()..];
-            if rest == "encoder_out" {
-                continue;
-            }
-            if rest.starts_with("state.") && !r.states_chunks.contains(&c) {
-                continue;
-            }
-            rows.entry(row_of(rest)).or_default().extend(acts.get(name)?);
+    fn end_to_end(&self, s: &Sample, audio: &[f32]) -> Result<EndToEnd> {
+        let mut st = self.stream(&stream_options(s)?)?;
+        for piece in audio.chunks(VERIFY_PIECE) {
+            st.accept_waveform(piece)?;
         }
+        st.input_finished()?;
+        let r = st.result();
+        let random_int8 = s.result["random"].as_bool() == Some(true) && s.dtype == "int8";
+        let reference_text = s.text("text");
+        let ok = r.tokens == s.u32s("/tokens")? && r.text == reference_text;
+        let info = json!({"chunk_size": num(s, "chunk_size")?, "left_context_frames": num(s, "left_context_frames")?, "tokens": r.tokens.len()});
+        Ok(EndToEnd { text: r.text, reference_text, checks: vec![Check::new("e2e_match", ok, s.strict && !random_int8)], info: info.as_object().cloned().unwrap_or_default() })
     }
-    Ok(rows)
-}
 
-/// Rows in their own order (names sorted by `reference_rows`): reorder our state rows to the
-/// reference's tensor order (both iterate stacks, layers, kinds in the same order).
-fn compare_rows(ours: &Run, reference: &BTreeMap<String, Vec<f32>>, tol: f32) -> Comparison {
-    let mut c = Comparison::new();
-    for (name, want) in reference {
-        match ours.rows.get(name) {
-            Some(got) => {
-                c.compare(name, got, want, tol);
+    /// The WAV fed in 100 ms pieces as fast as possible: wall time, stage times, and the
+    /// first partial (audio fed when the first token appeared, its time, that call's compute).
+    fn bench_run(&self, audio: &[f32]) -> Result<BenchRun> {
+        let sr = f64::from(self.config().sample_rate);
+        let chunk = std::env::var("LAPID_ZIPFORMER_CHUNK").ok().and_then(|v| v.parse().ok());
+        let mut s = self.stream(&StreamOptions { chunk_size: chunk, left_context_frames: None, endpoint: None })?;
+        let t = Instant::now();
+        let (mut fed, mut first) = (0usize, None::<(f64, f64, f64)>);
+        let mut note = |out: &[super::StreamResult], fed: usize, tc: Instant| {
+            if first.is_none()
+                && let Some(r) = out.iter().find(|r| !r.tokens.is_empty())
+            {
+                first = Some((fed as f64 / sr, f64::from(r.timestamps[0]), tc.elapsed().as_secs_f64() * 1e3));
             }
-            None => {
-                c.notes.push(format!("{name}: not produced"));
-                c.layers.push(lapid_verify::LayerReport::failed(name.as_str()));
-            }
+        };
+        for piece in audio.chunks(BENCH_PIECE) {
+            let tc = Instant::now();
+            let out = s.accept_waveform(piece)?;
+            fed += piece.len();
+            note(&out, fed, tc);
         }
-    }
-    c
-}
-
-fn verify_sample(r: &Reference, model_arg: Option<&str>, dtype: &str, device: Option<&str>) -> Result<Value> {
-    let Some(model) = model_arg.map(str::to_string).or_else(|| r.model.clone()) else {
-        return Ok(json!({"sample": r.dir.display().to_string(), "skipped": "no model (pass --model)"}));
-    };
-    if !Path::new(&model).exists() {
-        return Ok(json!({"sample": r.dir.display().to_string(), "skipped": format!("model {model} not found (export it with tools/reference/zipformer_ref.py)")}));
-    }
-    let path = resolve_model(&model, dtype)?;
-    let dev = lapid_verify::open_device(device)?;
-    let z = Zipformer::load(&path, &dev)?;
-    let acts = Activations::open(&r.dir.join("activations.safetensors"))?;
-    let ref_fbank = acts.get("fbank")?;
-
-    let samples = lapid_nn::audio::load_audio(&r.audio, z.config().sample_rate)?;
-    let mut fb = Comparison::new();
-    fb.compare("fbank", &Fbank::new(z.config().feature_dim, z.config().sample_rate).compute(&samples), &ref_fbank, FBANK_TOLERANCE);
-
-    let ours = run_chunks(&z, r, &acts, &ref_fbank)?;
-    let reference = reference_rows(&acts, r)?;
-    let quality = compare_rows(&ours, &reference, tolerance(dtype)?);
-    let chunk_tokens_match = ours.chunk_tokens == r.chunk_tokens;
-    // Relative error of the encoder output per chunk (where a drift starts).
-    let per = ours.rows["encoder_out"].len() / r.chunks.max(1);
-    let per_chunk: Vec<f32> = (0..r.chunks)
-        .map(|c| {
-            let range = c * per..(c + 1) * per;
-            match (ours.rows["encoder_out"].get(range.clone()), reference["encoder_out"].get(range)) {
-                (Some(a), Some(b)) => lapid_verify::diff(a, b).map_or(f32::NAN, |d| d.rel),
-                _ => f32::NAN,
-            }
+        let tc = Instant::now();
+        let out = s.input_finished()?;
+        note(&out, fed, tc);
+        let total = t.elapsed().as_secs_f64() * 1e3;
+        let (st, (fa, ft, fc)) = (s.stats(), first.unwrap_or((f64::NAN, f64::NAN, f64::NAN)));
+        Ok(BenchRun {
+            times: vec![("total", total), ("fbank", st.frontend_ms), ("encoder", st.encoder_ms), ("decode", st.decode_ms)],
+            values: vec![
+                ("chunks", st.chunks as f64),
+                ("encoder_ms_per_chunk", if st.chunks > 0 { st.encoder_ms / st.chunks as f64 } else { 0.0 }),
+                ("first_partial_audio_s", fa),
+                ("first_token_time_s", ft),
+                ("first_partial_compute_ms", fc),
+            ],
+            text: s.result().text,
         })
-        .collect();
-
-    // End to end from audio, odd-sized pieces.
-    let opts = StreamOptions { chunk_size: Some(r.chunk), left_context_frames: Some(r.left), endpoint: None };
-    let mut s = z.stream(&opts)?;
-    for piece in samples.chunks(1013) {
-        s.accept_waveform(piece)?;
-    }
-    s.input_finished()?;
-    let e2e = s.result();
-
-    let mut kernel = Value::Null;
-    let mut kernel_ok = true;
-    if matches!(dtype, "int8" | "int4") {
-        let cpu = lapid::Device::cpu();
-        let mut best: Option<Comparison> = None;
-        for p in [Precision::FakeQuantWeights, Precision::FakeQuantActivations] {
-            let fq = run_chunks(&Zipformer::load_with(&path, &cpu, p)?, r, &acts, &ref_fbank)?;
-            let mut c = Comparison::new();
-            c.compare("encoder_out", &ours.rows["encoder_out"], &fq.rows["encoder_out"], KERNEL_TOLERANCE);
-            if best.as_ref().is_none_or(|b| c.max_rel() < b.max_rel()) {
-                best = Some(c);
-            }
-        }
-        if let Some(b) = best {
-            kernel_ok = b.ok();
-            kernel = b.to_json();
-        }
     }
 
-    let tokens_match = ours.tokens == r.tokens;
-    let e2e_match = e2e.tokens == r.tokens && e2e.text == r.text;
-    // A random-weight model has near-tied logits: quantization noise may flip a token, so
-    // its tokens must match only at fp32 / fp16.
-    let must = text_must_match(dtype) && !(r.random && dtype == "int8");
-    // Per-chunk grouping is exact in fp32; lower precisions may move a token by one frame
-    // across a chunk boundary (reported).
-    let chunks_must = dtype == "fp32";
-    let ok = fb.ok() && quality.ok() && kernel_ok && (!must || (tokens_match && e2e_match)) && (!chunks_must || chunk_tokens_match);
-    Ok(json!({
-        "sample": r.dir.display().to_string(),
-        "ok": ok,
-        "model": path.display().to_string(),
-        "chunk_size": r.chunk,
-        "left_context_frames": r.left,
-        "chunks": r.chunks,
-        "fbank": fb.to_json(),
-        "quality": quality.to_json(),
-        "kernel": kernel,
-        "encoder_out_rel_per_chunk": per_chunk,
-        "tokens_match": tokens_match,
-        "chunk_tokens_match": chunk_tokens_match,
-        "e2e_match": e2e_match,
-        "text": e2e.text,
-        "reference_text": r.text,
-        "tokens": e2e.tokens.len(),
-    }))
+    fn bench_info(&self) -> Map<String, Value> {
+        let chunk: Option<usize> = std::env::var("LAPID_ZIPFORMER_CHUNK").ok().and_then(|v| v.parse().ok());
+        let v = json!({"chunk_size": chunk.unwrap_or(self.config().chunk_size), "left_context_frames": self.config().left_context_frames});
+        v.as_object().cloned().unwrap_or_default()
+    }
 }
 
-/// Verify one reference directory or every sub-directory with a `result.json`.
-pub fn verify(reference: &Path, model: Option<&str>, dtype: &str, device: Option<&str>) -> Result<Value> {
-    let dirs: Vec<PathBuf> = if reference.join("result.json").is_file() {
-        vec![reference.to_path_buf()]
-    } else {
-        let mut v: Vec<PathBuf> = std::fs::read_dir(reference)
-            .map_err(|e| Error::new("io", format!("{}: {e}", reference.display())))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.join("result.json").is_file())
+impl AsrModel for Zipformer {
+    /// One stream over the whole signal; segments at sherpa-onnx endpoints.
+    fn recognize(&self, samples: &[f32], _: &AsrParams) -> Result<TranscriptOut> {
+        let mut s = self.stream(&StreamOptions::default())?;
+        let mut finals = s.accept_waveform(samples)?;
+        finals.extend(s.input_finished()?);
+        let segments: Vec<AsrSegment> = finals
+            .into_iter()
+            .filter(|r| r.is_final && !r.tokens.is_empty())
+            .map(|r| AsrSegment { start: r.start, end: r.timestamps.last().copied().unwrap_or(r.start) + 0.04, text: r.text, tokens: r.tokens })
             .collect();
-        v.sort();
-        v
-    };
-    if dirs.is_empty() {
-        return Err(Error::new("not_found", format!("{}: no result.json (run tools/reference/zipformer_ref.py)", reference.display())));
+        let text = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+        Ok(TranscriptOut { text, language: None, segments, words: Vec::new() })
     }
-    let mut samples = Vec::new();
-    let mut ok = true;
-    let mut ran = 0;
-    for d in &dirs {
-        let r = read_reference(d)?;
-        let v = verify_sample(&r, model, dtype, device)?;
-        if v.get("skipped").is_none() {
-            ran += 1;
-            ok &= v.get("ok").and_then(Value::as_bool).unwrap_or(false);
-        }
-        samples.push(v);
-    }
-    Ok(json!({ "ok": ok && ran > 0, "dtype": dtype, "device": device.unwrap_or("best"), "samples": samples }))
 }
 
 #[cfg(test)]
@@ -331,11 +227,10 @@ mod tests {
     fn tiny_reference_cpu() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/reference/zipformer/tiny");
         if !dir.join("result.json").is_file() {
-            eprintln!("skipping: {} missing", dir.display());
             return;
         }
-        let model = dir.join("model");
-        let v = verify(&dir, model.to_str(), "fp32", Some("cpu")).expect("verify");
+        let args = crate::cmd::ModelArgs { model: Some(dir.join("model").display().to_string()), dtype: Some("fp32".into()), device: Some("cpu".into()) };
+        let v = crate::runtime::audio_verify::verify::<Zipformer>(Some(&dir), &args).expect("verify");
         assert_eq!(v["ok"], json!(true), "{v:#}");
     }
 }

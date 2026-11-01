@@ -81,11 +81,14 @@ pub struct GreedyOptions {
     pub keep_logits: bool,
     /// Also return blank steps (the full path).
     pub record_blanks: bool,
+    /// Argmax on the host over downloaded joint rows (cheaper than device argmax kernels
+    /// for a wide joint evaluated one frame at a time on a GPU).
+    pub host_argmax: bool,
 }
 
 impl Default for GreedyOptions {
     fn default() -> Self {
-        GreedyOptions { max_symbols_per_frame: 10, joint_window: 16, keep_logits: false, record_blanks: false }
+        GreedyOptions { max_symbols_per_frame: 10, joint_window: 16, keep_logits: false, record_blanks: false, host_argmax: false }
     }
 }
 
@@ -158,12 +161,11 @@ impl GreedyDecoder {
         &self.history
     }
 
-    /// Encoder frames decoded so far.
+    /// (encoder frames decoded so far, frame of the last emitted token).
     pub fn frames(&self) -> usize {
         self.frames
     }
 
-    /// Frame of the last emitted token.
     pub fn last_emission(&self) -> Option<usize> {
         self.last_emission
     }
@@ -172,7 +174,6 @@ impl GreedyDecoder {
     pub fn predictor_state(&self) -> &[Tensor] {
         &self.pred_state
     }
-
     /// Joint logits kept so far (`keep_logits`), drained.
     pub fn take_logits(&mut self) -> Vec<Vec<f32>> {
         std::mem::take(&mut self.logits)
@@ -188,17 +189,14 @@ impl GreedyDecoder {
         if enc.shape().len() != 2 {
             bail!("shape_mismatch", "transducer: encoder frames must be [T, H], got {:?}", enc.shape());
         }
-        let n = enc.shape()[0];
-        let blank = m.blank_id();
+        let (n, blank) = (enc.shape()[0], m.blank_id());
         let full = self.opts.keep_logits || forced.is_some();
         let width = if full { 1 } else { self.opts.joint_window.max(1) };
         let max_symbols = self.opts.max_symbols_per_frame.max(1);
-        let limit = n * (max_symbols + 1) + 1;
-        let mut out = Vec::new();
+        let (limit, mut out) = (n * (max_symbols + 1) + 1, Vec::new());
         let mut t = self.skip.min(n);
         self.skip -= t;
-        let mut win: Option<Window> = None;
-        let mut taken = 0usize;
+        let (mut win, mut taken): (Option<Window>, usize) = (None, 0);
         while t < n {
             taken += 1;
             if taken > limit {
@@ -207,7 +205,7 @@ impl GreedyDecoder {
             let covered = self.pending.is_none() && win.as_ref().is_some_and(|w| t >= w.start && t < w.start + w.tokens.len());
             if !covered {
                 let pending = self.pending.take();
-                match self.eval_window(m, enc, t, (t + width).min(n), full, pending) {
+                match self.eval_window(m, enc, t, (t + width).min(n), full || self.opts.host_argmax, pending) {
                     Ok(w) => win = Some(w),
                     Err(e) => {
                         self.pending = pending;
@@ -267,7 +265,9 @@ impl GreedyDecoder {
         } else if durs.is_empty() {
             vec![logits.argmax_last()?]
         } else {
-            vec![logits.slice(1, 0, v)?.argmax_last()?, logits.slice(1, v, v + durs.len())?.argmax_last()?]
+            // token and duration argmax as one [n, 2] download
+            let am = |lo, hi| logits.slice(1, lo, hi)?.argmax_last()?.reshape(&[b - a, 1]);
+            vec![Tensor::cat(&[&am(0, v)?, &am(v, v + durs.len())?], 1)?]
         };
         let n_main = outs.len();
         if let Some(s) = &state {
@@ -294,17 +294,20 @@ impl GreedyDecoder {
             for row in host.chunks_exact(width) {
                 w.tokens.push(argmax(&row[..v]) as u32);
                 w.durations.push(if durs.is_empty() { 0 } else { duration(argmax(&row[v..]))? });
-                w.logits.push(row.to_vec());
+                if self.opts.keep_logits {
+                    w.logits.push(row.to_vec());
+                }
             }
         } else {
-            let toks = dev.to_vec_i32(&realized[0])?;
-            if toks.len() != n {
-                bail!("shape_mismatch", "joint argmax gave {} frames, expected {n}", toks.len());
+            let am = dev.to_vec_i32(&realized[0])?;
+            let per = if durs.is_empty() { 1 } else { 2 };
+            if am.len() != n * per {
+                bail!("shape_mismatch", "joint argmax gave {} values, expected {}", am.len(), n * per);
             }
-            w.tokens = toks.iter().map(|&x| x as u32).collect();
-            w.durations = match realized.get(1) {
-                Some(d) => dev.to_vec_i32(d)?.iter().map(|&i| duration(i.max(0) as usize)).collect::<Result<_>>()?,
-                None => vec![0; n],
+            w.tokens = am.iter().step_by(per).map(|&x| x as u32).collect();
+            w.durations = match per {
+                2 => am.iter().skip(1).step_by(2).map(|&i| duration(i.max(0) as usize)).collect::<Result<_>>()?,
+                _ => vec![0; n],
             };
         }
         if state.is_some() {

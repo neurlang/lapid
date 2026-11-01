@@ -11,6 +11,14 @@
 //! * greedy continuation: token-exact for the descriptor's strict dtypes, reported otherwise;
 //! * `long` prompt: `long.<tap>.tail` rows, `long.logits.last`, decode steps, greedy.
 //!
+//! Reference conventions: `result.json` `template_globals` (object) and `date_string` are
+//! passed to every template render (fixed values the reference rendered with); a top-level
+//! `chat_template` that differs from the file's (e.g. a GGUF carrying an older revision)
+//! reports `template_cases` without counting them. Without `--model` / `--dtype`, the
+//! reference's own `model` (a checkpoint directory next to `result.json`, also as the first
+//! word of a label like `"x-tiny (random)"`, or a repo id) and
+//! `default_dtype` are used, so tiny references verify with just `--reference`.
+//!
 //! Quantized models (int8 / int4 / k-quants) are checked for kernel correctness against the
 //! fake-quant reference (same file, weights dequantized to f32 on the CPU; per tensor the
 //! closer of f32 and int8 activations); the PyTorch comparison is then informational.
@@ -26,22 +34,34 @@ use lapid_verify::{Comparison, Stages, argmax_rows, tolerance};
 use serde_json::{Value, json};
 
 use super::causal_lm::{CausalLm, Llm, Rows};
+use super::chat::ChatOptions;
 use super::generate::GenerateOptions;
 use super::resolve::{file_dtype, resolve};
 use crate::cmd::ModelArgs;
 
+/// Template options of a reference case: its `enable_thinking` plus the reference's fixed
+/// template globals (`template_globals`, `date_string`).
+fn template_opts(r: &Value, c: &Value) -> ChatOptions {
+    let mut vars: Vec<(String, Value)> = r.get("template_globals").and_then(Value::as_object).into_iter().flatten().map(|(k, v)| (k.clone(), v.clone())).collect();
+    if let Some(d) = r.get("date_string").filter(|d| d.is_string()) {
+        vars.push(("date_string".to_string(), d.clone()));
+    }
+    ChatOptions { enable_thinking: c.get("enable_thinking").and_then(Value::as_bool), template_vars: vars, ..Default::default() }
+}
+
 /// Template and tokenizer checks. Returns (ok, details).
-fn check_text<M: CausalLm>(llm: &Llm<M>, r: &Value) -> Result<(bool, Value)> {
+pub(crate) fn check_text<M: CausalLm>(llm: &Llm<M>, r: &Value) -> Result<(bool, Value)> {
     let mut ok = true;
+    let same_template = r.get("chat_template").and_then(Value::as_str).is_none_or(|t| t == llm.template().source());
+    let mut templates_ok = true;
     let mut templates = Vec::new();
     for (i, c) in r.get("template_cases").and_then(Value::as_array).into_iter().flatten().enumerate() {
         let tools = c.get("tools_json").and_then(Value::as_str);
         let add_gen = c.get("add_generation_prompt").and_then(Value::as_bool).unwrap_or(false);
-        let thinking = c.get("enable_thinking").and_then(Value::as_bool);
         let want = str_of(c, "text")?;
-        let got = llm.render_chat_json(str_of(c, "messages_json")?, tools, add_gen, thinking);
+        let got = llm.render_chat_json_with(str_of(c, "messages_json")?, tools, add_gen, &template_opts(r, c));
         let m = got.as_deref().is_ok_and(|g| g == want);
-        ok &= m;
+        templates_ok &= m;
         let mut e = json!({"case": i, "match": m});
         if !m {
             e["got"] = match got {
@@ -52,6 +72,7 @@ fn check_text<M: CausalLm>(llm: &Llm<M>, r: &Value) -> Result<(bool, Value)> {
         }
         templates.push(e);
     }
+    ok &= templates_ok || !same_template;
     let mut tokenizer = Vec::new();
     for c in r.get("tokenizer_cases").and_then(Value::as_array).into_iter().flatten() {
         let want = ids(c, "ids")?;
@@ -62,14 +83,13 @@ fn check_text<M: CausalLm>(llm: &Llm<M>, r: &Value) -> Result<(bool, Value)> {
     }
     let mut prompts = serde_json::Map::new();
     for (name, c) in r.get("cases").and_then(Value::as_object).into_iter().flatten() {
-        let thinking = c.get("enable_thinking").and_then(Value::as_bool);
-        let text = llm.render_chat_json(str_of(c, "messages_json")?, None, true, thinking)?;
+        let text = llm.render_chat_json_with(str_of(c, "messages_json")?, None, true, &template_opts(r, c))?;
         let text_ok = text == str_of(c, "prompt_text")?;
         let ids_ok = llm.encode(&text)? == ids(c, "prompt_tokens")?;
         ok &= text_ok && ids_ok;
         prompts.insert(name.clone(), json!({"template": text_ok, "tokens": ids_ok}));
     }
-    Ok((ok, json!({"template_cases": templates, "tokenizer_cases": tokenizer, "prompts": prompts})))
+    Ok((ok, json!({"template_cases": templates, "template_cases_counted": same_template, "tokenizer_cases": tokenizer, "prompts": prompts})))
 }
 
 /// Teacher-forced cached decoding: logits after the prompt, then after each reference token.
@@ -110,22 +130,45 @@ fn run_traced<M: CausalLm>(llm: &Llm<M>, r: &Reference, short: &[u32], long: &[u
     Ok(out)
 }
 
+/// Model and dtype to verify: the arguments, else the reference's own `model` (a checkpoint
+/// directory next to `result.json`, or a repo id) and `default_dtype`, else the descriptor's.
+pub(crate) fn model_and_dtype(desc: &Descriptor, r: &Reference, args: &ModelArgs) -> (String, String) {
+    let model = args.model.clone().unwrap_or_else(|| {
+        let m = r.result.get("model").and_then(Value::as_str).unwrap_or("");
+        // "<dir> (random)" labels name the checkpoint directory first.
+        let local = r.dir.join(m.split_whitespace().next().unwrap_or(""));
+        if !m.is_empty() && local.exists() {
+            local.display().to_string()
+        } else if r.dir.join("model/config.json").exists() {
+            r.dir.join("model").display().to_string()
+        } else if m.contains('/') && !m.contains(char::is_whitespace) {
+            m.to_string()
+        } else {
+            desc.default_model.to_string()
+        }
+    });
+    // A checkpoint shipped with the reference is checked at the reference's own dtype.
+    let own = (args.model.is_none() && model.starts_with(&*r.dir.display().to_string())).then(|| r.result.get("dtype").and_then(Value::as_str)).flatten();
+    let dtype = args.dtype.clone().unwrap_or_else(|| r.result.get("default_dtype").and_then(Value::as_str).or(own).unwrap_or(desc.default_dtype).to_string());
+    (model, dtype)
+}
+
 /// Full verification report as JSON; check `"ok"`.
 pub fn verify<M: CausalLm>(desc: &Descriptor, reference: Option<&Path>, args: &ModelArgs) -> Result<Value> {
-    let model = args.model.as_deref().unwrap_or(desc.default_model);
-    let dtype_arg = args.dtype.as_deref().unwrap_or(desc.default_dtype);
     let reference_dir = reference.unwrap_or(Path::new(desc.reference_dir));
     let r = Reference::open(reference_dir, desc.reference_script)?;
+    let (model, dtype_arg) = model_and_dtype(desc, &r, args);
     let dev = lapid_verify::open_device(args.device.as_deref())?;
     let mut stages = Stages::new();
-    let res = resolve(model, Some(dtype_arg))?;
+    let res = resolve(&model, Some(&dtype_arg))?;
     if let Some(t) = res.convert_ms {
         stages.record("convert", t);
     }
     let path = res.path;
     let dtype = file_dtype(&path)?;
     let quantized = !matches!(dtype.as_str(), "fp32" | "fp16");
-    let quality_tol = tolerance(&dtype)?;
+    // Other ggml types (q5_0, q8_k mixes, ...) get the 4-bit budget (informational anyway).
+    let quality_tol = tolerance(&dtype).or_else(|_| tolerance("int4"))?;
     let llm = stages.time("load", || Llm::<M>::load(&path, &dev))?;
     let (text_ok, text) = stages.time("text", || check_text(&llm, &r.result))?;
 

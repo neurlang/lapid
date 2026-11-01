@@ -185,6 +185,17 @@ impl Image {
         }
         out
     }
+
+    /// FNV-1a over size and pixels (identifies an image in a session's cache).
+    pub fn fingerprint(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let bytes = (self.width as u64).to_le_bytes().into_iter().chain((self.height as u64).to_le_bytes());
+        for b in bytes.chain(self.rgb.iter().copied()) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        h
+    }
 }
 
 #[cfg(test)]

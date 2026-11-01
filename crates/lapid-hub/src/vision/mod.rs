@@ -4,11 +4,10 @@
 
 pub mod encoder;
 pub mod image;
-pub mod mmproj;
 pub mod processor;
 
-use crate::lfm3::jinja;
-pub use encoder::{VisionConfig, VisionEncoder, VisionOutput};
+use crate::runtime::jinja;
+pub use encoder::{VisionConfig, VisionEncoder};
 pub use image::{Filter, Image};
 pub use processor::{ImageProcessor, Patches};
 

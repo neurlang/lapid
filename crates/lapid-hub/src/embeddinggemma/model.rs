@@ -3,14 +3,15 @@
 //!
 //! A batch is right-padded to a common length S. Padded keys are masked out of every
 //! attention; sliding layers additionally hide keys with `|i - j| >= window` from real
-//! queries (padded queries keep every real key, so their rows stay finite). Pooling is a
-//! batched matmul with per-row weights `1 / len` on real tokens and 0 on padding.
+//! queries (padded queries keep every real key, so their rows stay finite). Mean pooling,
+//! normalization and Matryoshka truncation are the shared pipeline (`runtime::embedding`).
 
 use lapid::{Result, Tensor, bail};
-use lapid_nn::attention::key_padding_mask;
 use lapid_nn::{Activation, Attention, Embedding, GatedMlp, Linear, Loader, Mask, RmsNorm, Rope};
 
 use super::config::{DenseActivation, EmbeddingGemmaConfig};
+use crate::runtime::Taps;
+use crate::runtime::embedding::TokenBatch;
 
 struct Layer {
     input_norm: RmsNorm,
@@ -20,43 +21,6 @@ struct Layer {
     mlp: GatedMlp,
     post_ff_norm: RmsNorm,
     sliding: bool,
-}
-
-/// One padded batch of token ids.
-pub(crate) struct Batch {
-    /// Row-major [B, S] ids (padding = pad id).
-    pub ids: Vec<i32>,
-    /// Real token count per row (each >= 1).
-    pub lengths: Vec<usize>,
-    pub seq: usize,
-}
-
-impl Batch {
-    /// Right-pad `rows` to `seq` (>= the longest row) with `pad`.
-    pub fn new(rows: &[&[u32]], seq: usize, pad: u32) -> Result<Batch> {
-        let mut ids = Vec::with_capacity(rows.len() * seq);
-        let mut lengths = Vec::with_capacity(rows.len());
-        for r in rows {
-            if r.is_empty() || r.len() > seq {
-                bail!("invalid_argument", "batch row of {} tokens does not fit 1..={seq}", r.len());
-            }
-            ids.extend(r.iter().map(|&t| t as i32));
-            ids.extend(std::iter::repeat_n(pad as i32, seq - r.len()));
-            lengths.push(r.len());
-        }
-        if rows.is_empty() {
-            bail!("invalid_argument", "empty batch");
-        }
-        Ok(Batch { ids, lengths, seq })
-    }
-
-    pub fn size(&self) -> usize {
-        self.lengths.len()
-    }
-
-    fn padded(&self) -> bool {
-        self.lengths.iter().any(|&l| l != self.seq)
-    }
 }
 
 /// Additive [B, 1, S, S] mask of a bidirectional sliding window: key j is visible to a
@@ -75,24 +39,6 @@ pub(crate) fn sliding_padding_mask(lengths: &[usize], seq: usize, window: usize)
         }
     }
     Tensor::from_f32(&data, &[lengths.len(), 1, seq, seq])
-}
-
-/// Pooling weights [B, 1, S]: `1 / len` on real tokens, 0 on padding.
-fn mean_weights(lengths: &[usize], seq: usize) -> Result<Tensor> {
-    let mut data = vec![0.0f32; lengths.len() * seq];
-    for (b, &len) in lengths.iter().enumerate() {
-        data[b * seq..b * seq + len].fill(1.0 / len as f32);
-    }
-    Tensor::from_f32(&data, &[lengths.len(), 1, seq])
-}
-
-/// Graph outputs of one batch.
-pub(crate) struct Outputs {
-    /// [B, out_dim] head output (before L2 normalization).
-    pub embedding: Tensor,
-    /// Named intermediates when traced: "embed", "layers.{i}", "norm" ([B, S, D]),
-    /// "pooled", "dense.{k}" ([B, D_k]).
-    pub traced: Vec<Tensor>,
 }
 
 pub(crate) struct Model {
@@ -169,79 +115,48 @@ impl Model {
         })
     }
 
-    /// Build the graph of one batch; `trace` collects named intermediates.
-    pub fn graph(&self, batch: &Batch, trace: bool) -> Result<Outputs> {
-        let (b, s) = (batch.size(), batch.seq);
-        let mut traced = Vec::new();
-        let mut keep = |t: Tensor, name: String| -> Tensor {
-            let t = t.named(name);
-            if trace {
-                traced.push(t.clone());
-            }
-            t
-        };
-        let ids = Tensor::from_i32(&batch.ids, &[b, s])?;
-        let mut x = keep(self.embed.forward(&ids)?.mul_scalar(f64::from(self.embed_scale))?, "embed".into());
-
-        let full_mask = if batch.padded() {
-            Mask::Custom { additive: key_padding_mask(&batch.lengths, s)?, causal: false }
-        } else {
-            Mask::None
-        };
+    /// Encoder token states [B, S, D] of a right-padded batch.
+    pub fn encode(&self, batch: &TokenBatch, taps: &mut Taps) -> Result<Tensor> {
+        let s = batch.seq;
+        let mut x = self.embed.forward(&batch.ids_tensor()?)?.mul_scalar(f64::from(self.embed_scale))?;
+        taps.tap("embed", &x);
+        let full_mask = if batch.padded() { Mask::Custom { additive: batch.key_padding_mask()?, causal: false } } else { Mask::None };
         // Within the window everywhere: the sliding layers see what full layers see.
         let sliding_mask = if s <= self.window {
             full_mask.clone()
         } else {
             Mask::Custom { additive: sliding_padding_mask(&batch.lengths, s, self.window)?, causal: false }
         };
-
         for (i, layer) in self.layers.iter().enumerate() {
-            let (rope, mask) =
-                if layer.sliding { (&self.rope_local, &sliding_mask) } else { (&self.rope_global, &full_mask) };
+            let (rope, mask) = if layer.sliding { (&self.rope_local, &sliding_mask) } else { (&self.rope_global, &full_mask) };
             let h = layer.input_norm.forward(&x)?;
             let a = layer.attn.forward(&h, Some(rope), None, mask)?;
             x = x.add(&layer.post_attn_norm.forward(&a)?)?;
-            let h = layer.pre_ff_norm.forward(&x)?;
-            let m = layer.mlp.forward(&h)?;
-            x = keep(x.add(&layer.post_ff_norm.forward(&m)?)?, format!("layers.{i}"));
+            let m = layer.mlp.forward(&layer.pre_ff_norm.forward(&x)?)?;
+            x = x.add(&layer.post_ff_norm.forward(&m)?)?;
+            taps.tap(format_args!("layers.{i}"), &x);
         }
-        let tokens = keep(self.norm.forward(&x)?, "norm".into());
-
-        let d = tokens.shape()[2];
-        let pooled = mean_weights(&batch.lengths, s)?.matmul(&tokens)?.reshape(&[b, d])?;
-        let mut y = keep(pooled, "pooled".into());
-        for (k, (lin, act)) in self.dense.iter().enumerate() {
-            let z = lin.forward(&y)?;
-            let z = match act {
-                DenseActivation::Identity => z,
-                DenseActivation::Tanh => z.tanh()?,
-            };
-            y = keep(z, format!("dense.{k}"));
-        }
-        Ok(Outputs { embedding: y, traced })
+        let tokens = self.norm.forward(&x)?;
+        taps.tap("norm", &tokens);
+        Ok(tokens)
     }
-}
 
-/// `x / max(||x||, 1e-12)` (torch `F.normalize`), in place.
-pub(crate) fn l2_normalize(x: &mut [f32]) {
-    let n = x.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>().sqrt().max(1e-12);
-    for v in x {
-        *v = (f64::from(*v) / n) as f32;
+    /// The sentence-transformers Dense head on pooled [B, D].
+    pub fn project(&self, mut y: Tensor, taps: &mut Taps) -> Result<Tensor> {
+        for (k, (lin, act)) in self.dense.iter().enumerate() {
+            y = lin.forward(&y)?;
+            if *act == DenseActivation::Tanh {
+                y = y.tanh()?;
+            }
+            taps.tap(format_args!("dense.{k}"), &y);
+        }
+        Ok(y)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn batch_padding() {
-        let b = Batch::new(&[&[2, 5, 1], &[2, 1]], 4, 0).expect("batch");
-        assert_eq!(b.ids, vec![2, 5, 1, 0, 2, 1, 0, 0]);
-        assert_eq!(b.lengths, vec![3, 2]);
-        assert!(Batch::new(&[&[1, 2, 3]], 2, 0).is_err());
-        assert!(Batch::new(&[], 2, 0).is_err());
-    }
 
     #[test]
     fn sliding_mask_rule() {
@@ -252,15 +167,5 @@ mod tests {
         assert!(!vis(2, 4), "padded key hidden");
         // Padded query 4 keeps every real key (no all -inf rows).
         assert!((0..4).all(|j| vis(4, j)));
-    }
-
-    #[test]
-    fn normalize() {
-        let mut v = vec![3.0, 4.0];
-        l2_normalize(&mut v);
-        assert!((v[0] - 0.6).abs() < 1e-7 && (v[1] - 0.8).abs() < 1e-7);
-        let mut z = vec![0.0, 0.0];
-        l2_normalize(&mut z);
-        assert_eq!(z, vec![0.0, 0.0]);
     }
 }

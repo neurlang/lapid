@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{ApiError, ApiResult, Shared, now_secs, parse_json};
-use crate::served::{Capability, EmbedParams, Embeddings};
+use lapid_hub::runtime::serve::{Capability, EmbedParams, Embeddings};
 use crate::worker::Worker;
 
 pub async fn health() -> Json<Value> {

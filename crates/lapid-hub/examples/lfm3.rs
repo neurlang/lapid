@@ -1,151 +1,61 @@
-//! Interactive streaming chat with LFM3, library first: load (converting from the Hugging
-//! Face hub or a GGUF file on first use), then stream each reply token by token. The KV cache
-//! and conv state are reused across turns when the new prompt extends the previous one.
+//! Streaming chat with LFM3. The KV cache and conv state are reused across turns when the new
+//! prompt extends the previous one; `--timeout-s N` cancels a reply that runs too long
+//! (a `CancelToken` set from a timer thread).
 //!
 //! ```text
-//! cargo run --release -p lapid-hub --example lfm3 -- [model (LiquidAI/LFM3-1.7B | x.lapid | x.gguf)] [dtype (int8)]
-//!     [--device cuda] [--think] [--greedy] [--max-tokens 1024] [--timeout-s 60] [--system "..."]
+//! cargo run --release -p lapid-hub --example lfm3 -- [LiquidAI/LFM3-1.7B | dir | x.gguf | x.lapid] [int8] [--think] [--timeout-s 60]
 //! ```
-//! Commands: `/reset` clears the conversation, `/quit` exits. `--timeout-s` cancels a reply
-//! that runs too long (CancelToken from a timer thread).
+//! `/reset` clears the conversation, `/quit` exits. `LAPID_DEVICE` picks the device.
 
 use std::io::{BufRead, Write};
-use std::path::Path;
 use std::time::Duration;
 
-use lapid::Device;
 use lapid_hub::lfm3::{CancelToken, ChatOptions, GenerateOptions, Lfm3, Message};
 
-struct Args {
-    model: String,
-    dtype: String,
-    device: Option<String>,
-    think: bool,
-    greedy: bool,
-    max_tokens: usize,
-    timeout_s: Option<u64>,
-    system: Option<String>,
-}
-
-fn parse_args() -> Args {
-    let mut a = Args {
-        model: "LiquidAI/LFM3-1.7B".into(),
-        dtype: "int8".into(),
-        device: None,
-        think: false,
-        greedy: false,
-        max_tokens: 1024,
-        timeout_s: None,
-        system: None,
-    };
-    let mut pos = 0;
-    let mut it = std::env::args().skip(1);
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--device" => a.device = it.next(),
-            "--think" => a.think = true,
-            "--greedy" => a.greedy = true,
-            "--max-tokens" => a.max_tokens = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.max_tokens),
-            "--timeout-s" => a.timeout_s = it.next().and_then(|v| v.parse().ok()),
-            "--system" => a.system = it.next(),
-            _ if pos == 0 => {
-                a.model = arg;
-                pos += 1;
-            }
-            _ => a.dtype = arg,
-        }
-    }
-    a
-}
-
-fn load(args: &Args, device: &Device) -> lapid::Result<Lfm3> {
-    let p = Path::new(&args.model);
-    if p.extension().is_some_and(|e| e == "lapid") {
-        return Lfm3::load(p, device);
-    }
-    if p.is_file() {
-        // GGUF (or another convertible file): convert into the lapid cache once.
-        let out = lapid_hub::convert::convert(&args.model, &args.dtype, None)?;
-        return Lfm3::load(&out, device);
-    }
-    Lfm3::from_hub(&args.model, &args.dtype, device)
-}
-
-/// Split a thinking reply into (reasoning, answer).
-fn split_thinking(text: &str) -> (Option<String>, String) {
-    match text.split_once("</think>") {
-        Some((r, a)) => (Some(r.trim_start_matches("<think>").trim().to_string()), a.trim().to_string()),
-        // Kept verbatim so the next turn's prompt extends the cached tokens exactly.
-        None => (None, text.to_string()),
-    }
-}
-
 fn main() -> lapid::Result<()> {
-    let args = parse_args();
-    let device = match &args.device {
-        Some(d) => Device::from_name(d)?,
-        None => Device::best(),
-    };
-    eprintln!("device: {}", device.description());
-    let llm = load(&args, &device)?;
-    let mut sampling = llm.recommended_sampling();
-    if args.greedy {
-        sampling = Default::default();
-    }
-    let mut session = llm.new_session();
-    let mut messages: Vec<Message> = args.system.iter().map(|s| Message::system(s.clone())).collect();
-    let stdin = std::io::stdin();
-    let mut out = std::io::stdout();
-    eprintln!("ready ({} layers, thinking {}). /reset, /quit", llm.config().layer_types.len(), if args.think { "on" } else { "off" });
-    loop {
-        eprint!("\n> ");
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line).map_err(|e| lapid::Error::new("io", e.to_string()))? == 0 {
-            break;
-        }
-        let line = line.trim();
-        match line {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
+    let timeout = value("--timeout-s").and_then(|v| v.parse::<u64>().ok());
+    let pos: Vec<&String> = args.iter().enumerate().filter(|(i, a)| !a.starts_with("--") && (*i == 0 || args[i - 1] != "--timeout-s")).map(|(_, a)| a).collect();
+    let (model, dtype) = (pos.first().map_or("LiquidAI/LFM3-1.7B", |s| s.as_str()), pos.get(1).map_or("int8", |s| s.as_str()));
+    let device = lapid::Device::best();
+    // HF repo / directory / GGUF: converted into the lapid cache on first use.
+    let llm = Lfm3::load(&lapid_hub::runtime::resolve::resolve(model, Some(dtype))?.path, &device)?;
+    eprintln!("{model} on {} ({} layers). /reset, /quit", device.description(), llm.config().layer_types.len());
+    let (mut session, mut messages) = (llm.new_session(), Vec::<Message>::new());
+    for line in std::io::stdin().lock().lines() {
+        let line = line.map_err(|e| lapid::Error::new("io", e.to_string()))?;
+        match line.trim() {
             "" => continue,
-            "/quit" | "/exit" => break,
+            "/quit" => break,
             "/reset" => {
-                messages.retain(|m| m.role == "system");
+                messages.clear();
                 session.reset();
                 continue;
             }
-            _ => {}
+            l => messages.push(Message::user(l)),
         }
-        messages.push(Message::user(line));
         let cancel = CancelToken::new();
-        if let Some(s) = args.timeout_s {
+        if let Some(s) = timeout {
             let c = cancel.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(s));
                 c.cancel();
             });
         }
-        let opts = ChatOptions {
-            enable_thinking: Some(args.think),
-            generate: GenerateOptions { max_new_tokens: args.max_tokens, sampling: sampling.clone(), stop_tokens: None, cancel: Some(cancel), ..Default::default() },
-        };
+        let generate = GenerateOptions { max_new_tokens: 1024, sampling: llm.recommended_sampling(), cancel: Some(cancel), ..Default::default() };
+        let opts = ChatOptions { enable_thinking: Some(args.iter().any(|a| a == "--think")), generate, ..Default::default() };
         let mut stream = llm.chat_stream(&mut session, &messages, &opts)?;
         for token in stream.by_ref() {
-            let token = token?;
-            print!("{}", token.text);
-            let _ = out.flush();
+            print!("{}", token?.text);
+            std::io::stdout().flush().ok();
         }
         let s = stream.stats();
-        let reason = stream.finish_reason();
-        let (reasoning, answer) = split_thinking(stream.text());
+        eprintln!("\n[{:?}: ttft {:.0} ms, {} cached tokens, decode {:.1} tok/s]", stream.finish_reason(), s.time_to_first_token_ms, s.cached_tokens, s.decode_tokens_per_s());
+        // Kept verbatim (thinking included) so the next prompt extends the cached tokens.
+        let reply = Message::assistant(stream.text());
         drop(stream);
-        eprintln!(
-            "\n[{reason:?}: {} new prompt tokens ({} cached), ttft {:.0} ms, prefill {:.0} tok/s, decode {:.1} tok/s]",
-            s.prompt_tokens,
-            s.cached_tokens,
-            s.time_to_first_token_ms,
-            s.prefill_tokens_per_s(),
-            s.decode_tokens_per_s()
-        );
-        messages.push(Message { role: "assistant".into(), content: answer, reasoning_content: reasoning });
+        messages.push(reply);
     }
     Ok(())
 }

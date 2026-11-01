@@ -6,9 +6,16 @@
 //! of a padded [`TokenBatch`] (use [`TokenBatch::key_padding_mask`] for attention) and
 //! returns token states `[B, S, D]`; `project` optionally maps pooled `[B, D]` to the
 //! output (e.g. EmbeddingGemma's two Dense layers). [`embed`] does the rest, with pooling
-//! as one batched matmul on the device.
+//! as one batched matmul on the device. Both emit named taps (`embed`, `layers.{i}`, `norm`,
+//! `dense.{k}`; the pipeline adds `pooled`) for `lapid verify`. [`EmbedderDef`] adds loading,
+//! verification, benchmarks, calibrated int4 and serving (`runtime::embedding_harness`).
 
-use lapid::{Device, Error, Result, Tensor, bail};
+use lapid::{Device, Error, LapidFile, Result, Tensor, bail};
+use lapid_convert::engine::ConvertSpec;
+use lapid_nn::Precision;
+use lapid_verify::harness::Descriptor;
+
+use super::causal_lm::Taps;
 
 /// How token states become one vector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,12 +50,33 @@ pub trait TextEmbedder {
     fn default_prompt_name(&self) -> Option<String> {
         None
     }
+    /// Names accepted by [`prompt`](Self::prompt).
+    fn prompt_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Matryoshka sizes the model was trained with (besides [`dim`](Self::dim)).
+    fn matryoshka_dims(&self) -> Vec<usize> {
+        Vec::new()
+    }
     /// Lazy encoder graph: token states `[B, S, D]`.
-    fn encode(&self, batch: &TokenBatch) -> Result<Tensor>;
+    fn encode(&self, batch: &TokenBatch, taps: &mut Taps) -> Result<Tensor>;
     /// Optional head on pooled `[B, D]` (lazy) -> `[B, dim]`.
-    fn project(&self, pooled: Tensor) -> Result<Tensor> {
+    fn project(&self, pooled: Tensor, _taps: &mut Taps) -> Result<Tensor> {
         Ok(pooled)
     }
+}
+
+/// What the shared tooling (verify, bench, calibration, serving) needs from an embedder.
+pub trait EmbedderDef: TextEmbedder + Sized + Send + 'static {
+    const DESCRIPTOR: Descriptor;
+    const CONVERT: &'static ConvertSpec;
+    /// Build from a `.lapid` file (fake-quant precisions build verification references).
+    fn from_file(file: &LapidFile, device: &Device, precision: Precision) -> Result<Self>;
+}
+
+/// Load an embedder from a `.lapid` file.
+pub fn load<M: EmbedderDef>(path: &std::path::Path, device: &Device, precision: Precision) -> Result<M> {
+    M::from_file(&LapidFile::open(path)?, device, precision)
 }
 
 /// How over-long inputs are cut to `max_seq_len`.
@@ -82,6 +110,33 @@ pub struct EmbedOptions {
 impl Default for EmbedOptions {
     fn default() -> Self {
         EmbedOptions { prompt_name: None, prompt: None, dim: None, batch_size: 32, pad_multiple: 8, truncation: Truncation::KeepLast }
+    }
+}
+
+impl EmbedOptions {
+    /// Prompt by name (see [`TextEmbedder::prompt`]).
+    pub fn named(prompt_name: &str) -> EmbedOptions {
+        EmbedOptions { prompt_name: Some(prompt_name.to_string()), ..Default::default() }
+    }
+
+    /// Retrieval query prompt (`"query"`).
+    pub fn query() -> EmbedOptions {
+        EmbedOptions::named("query")
+    }
+
+    /// Retrieval document prompt (`"document"`).
+    pub fn document() -> EmbedOptions {
+        EmbedOptions::named("document")
+    }
+
+    pub fn with_dim(mut self, dim: usize) -> EmbedOptions {
+        self.dim = Some(dim);
+        self
+    }
+
+    pub fn with_batch_size(mut self, batch_size: usize) -> EmbedOptions {
+        self.batch_size = batch_size;
+        self
     }
 }
 
@@ -187,14 +242,41 @@ pub fn embed<M: TextEmbedder + ?Sized>(model: &M, texts: &[&str], opts: &EmbedOp
 }
 
 /// Lazy embedding graph of one batch (pooled and projected, before normalization) `[B, dim]`.
-pub fn embedding_graph<M: TextEmbedder + ?Sized>(model: &M, batch: &TokenBatch) -> Result<Tensor> {
-    let tokens = model.encode(batch)?;
+pub fn embedding_graph<M: TextEmbedder + ?Sized>(model: &M, batch: &TokenBatch, taps: &mut Taps) -> Result<Tensor> {
+    let tokens = model.encode(batch, taps)?;
     let shape = tokens.shape().to_vec();
     if shape.len() != 3 || shape[0] != batch.size() || shape[1] != batch.seq {
         bail!("shape_mismatch", "encoder gave {shape:?}, expected [{}, {}, D]", batch.size(), batch.seq);
     }
     let pooled = batch.pool_weights(model.pooling())?.matmul(&tokens)?.reshape(&[shape[0], shape[2]])?;
-    model.project(pooled)
+    taps.tap("pooled", &pooled);
+    model.project(pooled, taps)
+}
+
+/// A traced intermediate: (name, host values, shape).
+pub type TracedTensor = (String, Vec<f32>, Vec<usize>);
+
+/// One batch padded to its longest row with every tap realized (graph order), then the final
+/// (normalized) embeddings. For verification.
+pub fn embed_traced<M: TextEmbedder + ?Sized>(model: &M, ids: &[&[u32]]) -> Result<(Vec<TracedTensor>, Vec<Vec<f32>>)> {
+    let longest = ids.iter().map(|r| r.len()).max().unwrap_or(1);
+    let batch = TokenBatch::new(ids, longest, model.pad_id())?;
+    let mut taps = Taps::on();
+    let out = embedding_graph(model, &batch, &mut taps)?;
+    let taps = taps.into_vec();
+    let mut refs: Vec<&Tensor> = taps.iter().map(|(_, t)| t).collect();
+    refs.push(&out);
+    let dev = model.device();
+    let realized = dev.eval(&refs)?;
+    let mut traced = Vec::with_capacity(taps.len());
+    for ((name, _), t) in taps.iter().zip(&realized) {
+        traced.push((name.clone(), dev.to_vec_f32(t)?, t.shape().to_vec()));
+    }
+    let last = realized.last().ok_or_else(|| Error::new("backend", "device.eval returned no outputs"))?;
+    let host = dev.to_vec_f32(last)?;
+    let full = model.dim();
+    let emb = host.chunks_exact(full).map(|r| finish(r, full, model.normalize())).collect();
+    Ok((traced, emb))
 }
 
 /// Embed pre-tokenized inputs (prompt already applied).
@@ -223,7 +305,7 @@ pub fn embed_ids<M: TextEmbedder + ?Sized>(model: &M, ids: &[&[u32]], opts: &Emb
         let longest = rows.iter().map(|r| r.len()).max().unwrap_or(1);
         let seq = longest.div_ceil(multiple) * multiple;
         let batch = TokenBatch::new(&rows, seq, model.pad_id())?;
-        let graph = embedding_graph(model, &batch)?;
+        let graph = embedding_graph(model, &batch, &mut Taps::off())?;
         let dev = model.device();
         let realized = dev.eval(&[&graph])?;
         let r = realized.first().ok_or_else(|| Error::new("backend", "device.eval returned no outputs"))?;
@@ -275,6 +357,11 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if na == 0.0 || nb == 0.0 { 0.0 } else { (dot / (na.sqrt() * nb.sqrt())) as f32 }
 }
 
+/// Pairwise cosine similarities: `m[i][j] = cos(a[i], b[j])`.
+pub fn similarity_matrix(a: &[Vec<f32>], b: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    a.iter().map(|x| b.iter().map(|y| cosine_similarity(x, y)).collect()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,7 +405,7 @@ mod tests {
         fn prompt(&self, name: &str) -> Option<String> {
             (name == "query").then(|| "9".to_string())
         }
-        fn encode(&self, batch: &TokenBatch) -> Result<Tensor> {
+        fn encode(&self, batch: &TokenBatch, _: &mut Taps) -> Result<Tensor> {
             assert!(batch.seq.is_multiple_of(8));
             let mut x = Vec::new();
             for &id in &batch.ids {
@@ -326,7 +413,7 @@ mod tests {
             }
             Tensor::from_f32(&x, &[batch.size(), batch.seq, 4])
         }
-        fn project(&self, pooled: Tensor) -> Result<Tensor> {
+        fn project(&self, pooled: Tensor, _: &mut Taps) -> Result<Tensor> {
             pooled.mul_scalar(2.0)
         }
     }

@@ -19,11 +19,6 @@ pub(crate) mod layer;
 use lapid::{BinaryOp, Error, Result, Tensor, UnaryOp};
 use lapid_nn::{Linear, Loader};
 
-/// First tensor of an eval result.
-pub(crate) fn first(v: Vec<Tensor>) -> Result<Tensor> {
-    v.into_iter().next().ok_or_else(|| Error::new("backend", "device.eval returned no outputs"))
-}
-
 /// `{prefix}.weight` [out, in] + `{prefix}.bias` (when present), shape-checked.
 pub(crate) fn linear(l: &Loader<'_>, prefix: &str, out: usize, inp: usize) -> Result<Linear> {
     let bias = l.contains(&format!("{prefix}.bias"));

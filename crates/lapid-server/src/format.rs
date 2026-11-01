@@ -1,7 +1,7 @@
 //! Output formats shared by the server and `lapid run`: subtitles (SRT / WebVTT) and
 //! 16-bit PCM WAV.
 
-use crate::served::AsrSegment;
+use lapid_hub::runtime::serve::AsrSegment;
 
 fn timestamp(t: f32, sep: char) -> String {
     let ms = (t.max(0.0) * 1000.0).round() as u64;

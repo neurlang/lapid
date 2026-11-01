@@ -6,13 +6,10 @@
 //!             x = hc_ffn.post(moe(ffn_norm(hc_ffn.pre(x))), x)
 //! logits = head(norm(hc_head(x)))
 //! ```
-//! Streaming state ([`State`]): per layer the raw sliding window and the compressor /
-//! indexer states (see `compress.rs`). One step is build → eval (logits + staged state) →
-//! commit; prompts are fed in chunks of [`PREFILL_CHUNK`].
-//!
-//! Tensor names follow the upstream checkpoints (`embed.weight`, `layers.{i}.attn.wq_a.weight`,
-//! `layers.{i}.ffn.experts.w1` `[E, I, D]` stacks, `layers.{i}.attn.wo_a.weight` as
-//! `[G, o_lora, H / G * head_dim]`, ...; see `convert`).
+//! State ([`State`]): per layer the raw sliding window and the compressor / indexer states
+//! (see `compress.rs`); not rewindable. Tensor names follow the upstream checkpoints
+//! (`layers.{i}.ffn.experts.w1` `[E, I, D]` stacks, `attn.wo_a.weight` `[G, o_lora, H / G *
+//! head_dim]`, ...; see `convert.rs`).
 
 pub(crate) mod attention;
 pub(crate) mod compress;
@@ -22,10 +19,13 @@ pub(crate) mod rope;
 #[cfg(test)]
 mod tests;
 
-use lapid::{DType, Device, Error, Result, Tensor};
+use lapid::{DType, Error, Result, Tensor};
 use lapid_nn::{Embedding, Linear, Loader, RmsNorm};
+use serde_json::Value;
 
 use super::config::Deepseek4Config;
+use super::encoding;
+use crate::runtime::{CausalLm, ChatOptions, LmDims, LmState, Rows, Taps};
 use attention::{Attention, Indexer, LayerState};
 use compress::Compressor;
 use hc::{HyperConn, HyperHead};
@@ -34,8 +34,6 @@ use rope::TailRope;
 
 pub(crate) const EMBED: &str = "embed.weight";
 pub(crate) const HEAD: &str = "head.weight";
-/// Prompt tokens per evaluation during prefill.
-pub(crate) const PREFILL_CHUNK: usize = 512;
 
 struct Layer {
     attn_hc: HyperConn,
@@ -46,33 +44,54 @@ struct Layer {
     moe: Moe,
 }
 
-/// Mutable per-sequence state.
+/// Per-sequence state: committed per-layer states, plus the ones staged by the last forward
+/// (`(layer, slot, tensor)` to realize).
+#[derive(Default)]
 pub struct State {
     layers: Vec<LayerState>,
+    next: Option<Vec<LayerState>>,
+    staged: Vec<(usize, usize, Tensor)>,
     pos: usize,
 }
 
-impl State {
-    /// Tokens consumed so far (absolute position of the next token).
-    pub fn offset(&self) -> usize {
+impl LmState for State {
+    fn offset(&self) -> usize {
         self.pos
     }
 
-    pub fn clear(&mut self) {
+    fn staged(&self) -> Vec<&Tensor> {
+        self.staged.iter().map(|(_, _, t)| t).collect()
+    }
+
+    fn commit(&mut self, realized: Vec<Tensor>, n_tokens: usize) -> Result<()> {
+        let mut next = self.next.take().ok_or_else(|| Error::new("internal", "deepseek4: commit without a forward"))?;
+        if realized.len() != self.staged.len() {
+            self.discard();
+            return Err(Error::new("backend", "deepseek4: wrong number of realized state tensors"));
+        }
+        for ((i, j, _), t) in self.staged.drain(..).zip(realized) {
+            if let Some(slot) = next[i].slots_mut().into_iter().nth(j) {
+                *slot = Some(t);
+            }
+        }
+        self.layers = next;
+        self.pos += n_tokens;
+        Ok(())
+    }
+
+    fn discard(&mut self) {
+        self.next = None;
+        self.staged.clear();
+    }
+
+    fn clear(&mut self) {
         self.layers.iter_mut().for_each(|l| *l = LayerState::default());
+        self.discard();
         self.pos = 0;
     }
 }
 
-/// Which logit rows to compute.
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub(crate) enum Rows {
-    Last,
-    All,
-    None,
-}
-
-pub(crate) struct Deepseek4Model {
+pub struct Deepseek4Model {
     pub cfg: Deepseek4Config,
     embed: Embedding,
     head: Linear,
@@ -81,35 +100,17 @@ pub(crate) struct Deepseek4Model {
     layers: Vec<Layer>,
 }
 
-fn norm(l: &Loader<'_>, name: &str, d: usize, eps: f32) -> Result<RmsNorm> {
-    let n = RmsNorm::new(l.tensor(name)?, eps);
-    l.expect_shape(&n.weight, name, &[d])?;
-    Ok(n)
-}
-
-fn linear(l: &Loader<'_>, name: &str, out: usize, inp: usize) -> Result<Linear> {
-    let lin = Linear::new(l.tensor(name)?, None).with_act_quant(l.act_quant(name)?);
-    l.expect_shape(&lin.weight, name, &[out, inp])?;
-    Ok(lin)
-}
-
-fn tensor(l: &Loader<'_>, name: &str, shape: &[usize]) -> Result<Tensor> {
-    let t = l.tensor(name)?;
-    l.expect_shape(&t, name, shape)?;
-    Ok(t)
-}
-
 fn f32_param(l: &Loader<'_>, name: &str, shape: &[usize]) -> Result<Tensor> {
-    tensor(l, name, shape)?.cast(DType::F32)
+    l.tensor_checked(name, shape)?.cast(DType::F32)
 }
 
 fn load_compressor(l: &Loader<'_>, p: &str, d: usize, ratio: usize, hd: usize, eps: f32) -> Result<Compressor> {
     let c = Deepseek4Config::compress_coff(ratio) * hd;
     Ok(Compressor {
-        wkv: linear(l, &format!("{p}.wkv.weight"), c, d)?,
-        wgate: linear(l, &format!("{p}.wgate.weight"), c, d)?,
+        wkv: l.linear_checked(&format!("{p}.wkv"), c, d, false)?,
+        wgate: l.linear_checked(&format!("{p}.wgate"), c, d, false)?,
         ape: f32_param(l, &format!("{p}.ape"), &[ratio, c])?,
-        norm: norm(l, &format!("{p}.norm.weight"), hd, eps)?,
+        norm: l.rms_norm_checked(&format!("{p}.norm"), hd, eps)?,
         ratio,
         head_dim: hd,
         overlap: ratio == 4,
@@ -120,6 +121,7 @@ fn load_attention(l: &Loader<'_>, cfg: &Deepseek4Config, i: usize) -> Result<Att
     let p = format!("layers.{i}.attn");
     let (d, h, hd, eps) = (cfg.hidden_size, cfg.n_head, cfg.head_dim, cfg.norm_eps);
     let (ql, g, ol) = (cfg.q_lora_rank, cfg.o_groups, cfg.o_lora_rank);
+    let lin = |n: &str, o: usize, inp: usize| l.linear_checked(&format!("{p}.{n}"), o, inp, false);
     let ratio = cfg.compress_ratios[i];
     let comp_rope = TailRope::new(cfg.rope_dim, cfg.compress_rope_theta, cfg.yarn.as_ref());
     let rope = if ratio == 0 { TailRope::new(cfg.rope_dim, cfg.rope_theta, None) } else { comp_rope.clone() };
@@ -127,8 +129,8 @@ fn load_attention(l: &Loader<'_>, cfg: &Deepseek4Config, i: usize) -> Result<Att
     let indexer = if ratio == 4 {
         let (ih, id) = (cfg.index_n_heads, cfg.index_head_dim);
         Some(Indexer {
-            wq_b: linear(l, &format!("{p}.indexer.wq_b.weight"), ih * id, ql)?,
-            weights_proj: linear(l, &format!("{p}.indexer.weights_proj.weight"), ih, d)?,
+            wq_b: lin("indexer.wq_b", ih * id, ql)?,
+            weights_proj: lin("indexer.weights_proj", ih, d)?,
             comp: load_compressor(l, &format!("{p}.indexer.compressor"), d, ratio, id, eps)?,
             heads: ih,
             dim: id,
@@ -137,16 +139,16 @@ fn load_attention(l: &Loader<'_>, cfg: &Deepseek4Config, i: usize) -> Result<Att
     } else {
         None
     };
-    let wo_a_name = format!("{p}.wo_a.weight");
+    let wo_a = format!("{p}.wo_a.weight");
     Ok(Attention {
-        wq_a: linear(l, &format!("{p}.wq_a.weight"), ql, d)?,
-        q_norm: norm(l, &format!("{p}.q_norm.weight"), ql, eps)?,
-        wq_b: linear(l, &format!("{p}.wq_b.weight"), h * hd, ql)?,
-        wkv: linear(l, &format!("{p}.wkv.weight"), hd, d)?,
-        kv_norm: norm(l, &format!("{p}.kv_norm.weight"), hd, eps)?,
-        wo_a: tensor(l, &wo_a_name, &[g, ol, h / g * hd])?,
-        wo_a_act_quant: l.act_quant(&wo_a_name)?,
-        wo_b: linear(l, &format!("{p}.wo_b.weight"), d, g * ol)?,
+        wq_a: lin("wq_a", ql, d)?,
+        q_norm: l.rms_norm_checked(&format!("{p}.q_norm"), ql, eps)?,
+        wq_b: lin("wq_b", h * hd, ql)?,
+        wkv: lin("wkv", hd, d)?,
+        kv_norm: l.rms_norm_checked(&format!("{p}.kv_norm"), hd, eps)?,
+        wo_a: l.tensor_checked(&wo_a, &[g, ol, h / g * hd])?,
+        wo_a_act_quant: l.act_quant(&wo_a)?,
+        wo_b: lin("wo_b", d, g * ol)?,
         sinks: f32_param(l, &format!("{p}.attn_sink"), &[h])?.reshape(&[1, h, 1])?,
         comp,
         indexer,
@@ -162,33 +164,38 @@ fn load_attention(l: &Loader<'_>, cfg: &Deepseek4Config, i: usize) -> Result<Att
     })
 }
 
+/// Hash routing table `[vocab, k]`: i32 (round-5 files) or f32 (exact small integers).
+fn tid2eid(l: &Loader<'_>, name: &str, shape: [usize; 2]) -> Result<Vec<i32>> {
+    let t = l.file.get(name)?;
+    let b = l.file.bytes(name)?;
+    let v: Vec<i32> = match t.dtype() {
+        DType::I32 => b.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c)).collect(),
+        DType::F32 => b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c) as i32).collect(),
+        other => return Err(Error::new("format", format!("{name}: hash table dtype {}", other.name()))),
+    };
+    if t.shape() != shape {
+        return Err(Error::new("format", format!("{name}: expected [{}, {}], got {:?}", shape[0], shape[1], t.shape())));
+    }
+    Ok(v)
+}
+
 fn load_moe(l: &Loader<'_>, cfg: &Deepseek4Config, i: usize) -> Result<Moe> {
     let p = format!("layers.{i}.ffn");
     let (d, e, inter, k) = (cfg.hidden_size, cfg.n_experts, cfg.moe_intermediate, cfg.top_k);
     let hash = i < cfg.n_hash_layers;
-    let tid2eid = if hash {
-        let name = format!("{p}.gate.tid2eid");
-        let t = l.file.get(&name)?;
-        if t.dtype() != DType::I32 || t.shape() != [cfg.vocab_size, k] {
-            return Err(Error::new("format", format!("{name}: expected i32 [{}, {k}], got {} {:?}", cfg.vocab_size, t.dtype().name(), t.shape())));
-        }
-        let b = l.file.bytes(&name)?;
-        Some(b.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c)).collect())
-    } else {
-        None
-    };
     let w1 = format!("{p}.experts.w1");
+    let shared = |w: &str, o: usize, inp: usize| l.linear_checked(&format!("{p}.shared_experts.{w}"), o, inp, false);
     Ok(Moe {
         router: f32_param(l, &format!("{p}.gate.weight"), &[e, d])?,
         bias: if hash { None } else { Some(f32_param(l, &format!("{p}.gate.bias"), &[e])?) },
-        tid2eid,
+        tid2eid: if hash { Some(tid2eid(l, &format!("{p}.gate.tid2eid"), [cfg.vocab_size, k])?) } else { None },
         act_quant: l.act_quant(&w1)?,
-        w1: tensor(l, &w1, &[e, inter, d])?,
-        w3: tensor(l, &format!("{p}.experts.w3"), &[e, inter, d])?,
-        w2: tensor(l, &format!("{p}.experts.w2"), &[e, d, inter])?,
-        shared_w1: linear(l, &format!("{p}.shared_experts.w1.weight"), inter, d)?,
-        shared_w3: linear(l, &format!("{p}.shared_experts.w3.weight"), inter, d)?,
-        shared_w2: linear(l, &format!("{p}.shared_experts.w2.weight"), d, inter)?,
+        w1: l.tensor_checked(&w1, &[e, inter, d])?,
+        w3: l.tensor_checked(&format!("{p}.experts.w3"), &[e, inter, d])?,
+        w2: l.tensor_checked(&format!("{p}.experts.w2"), &[e, d, inter])?,
+        shared_w1: shared("w1", inter, d)?,
+        shared_w3: shared("w3", inter, d)?,
+        shared_w2: shared("w2", d, inter)?,
         top_k: k,
         n_experts: e,
         route_scale: cfg.route_scale,
@@ -196,10 +203,12 @@ fn load_moe(l: &Loader<'_>, cfg: &Deepseek4Config, i: usize) -> Result<Moe> {
     })
 }
 
-type Staged = Vec<(usize, usize, Tensor)>;
+impl CausalLm for Deepseek4Model {
+    const ARCH: &'static str = "deepseek4";
+    type State = State;
 
-impl Deepseek4Model {
-    pub fn load(l: &Loader<'_>, cfg: &Deepseek4Config) -> Result<Deepseek4Model> {
+    fn load(l: &Loader<'_>, meta: &Value) -> Result<Deepseek4Model> {
+        let cfg = Deepseek4Config::from_json(meta)?;
         let (d, eps, hc) = (cfg.hidden_size, cfg.norm_eps, cfg.hc_mult);
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
@@ -208,134 +217,84 @@ impl Deepseek4Model {
             layers.push(Layer {
                 attn_hc: conn("attn")?,
                 ffn_hc: conn("ffn")?,
-                attn_norm: norm(l, &format!("{p}.attn_norm.weight"), d, eps)?,
-                ffn_norm: norm(l, &format!("{p}.ffn_norm.weight"), d, eps)?,
-                attn: load_attention(l, cfg, i)?,
-                moe: load_moe(l, cfg, i)?,
+                attn_norm: l.rms_norm_checked(&format!("{p}.attn_norm"), d, eps)?,
+                ffn_norm: l.rms_norm_checked(&format!("{p}.ffn_norm"), d, eps)?,
+                attn: load_attention(l, &cfg, i)?,
+                moe: load_moe(l, &cfg, i)?,
             });
         }
         Ok(Deepseek4Model {
-            cfg: cfg.clone(),
-            embed: Embedding::new(tensor(l, EMBED, &[cfg.vocab_size, d])?),
-            head: linear(l, HEAD, cfg.vocab_size, d)?,
-            norm: norm(l, "norm.weight", d, eps)?,
+            embed: Embedding::new(l.tensor_checked(EMBED, &[cfg.vocab_size, d])?),
+            head: l.linear_checked("head", cfg.vocab_size, d, false)?,
+            norm: l.rms_norm_checked("norm", d, eps)?,
             hc_head: HyperHead::load(l, hc, d, cfg.hc_eps, eps)?,
             layers,
+            cfg,
         })
     }
 
-    pub fn new_state(&self) -> State {
-        State { layers: vec![LayerState::default(); self.layers.len()], pos: 0 }
+    fn dims(&self) -> LmDims {
+        LmDims { vocab: self.cfg.vocab_size, hidden: self.cfg.hidden_size, layers: self.layers.len() }
     }
 
-    /// Graph for `ids` at positions `state.offset()..`. Returns the logits (per `rows`), the
-    /// next per-layer states and the new (lazy) state tensors to realize. With `trace`,
-    /// intermediates are collected as ("embed" | "layers.{i}.op" | "layers.{i}" | "norm", t).
-    fn build(
-        &self,
-        ids: &[u32],
-        state: &State,
-        rows: Rows,
-        mut trace: Option<&mut Vec<(String, Tensor)>>,
-    ) -> Result<(Option<Tensor>, Vec<LayerState>, Staged)> {
+    fn new_state(&self) -> State {
+        State { layers: vec![LayerState::default(); self.layers.len()], ..Default::default() }
+    }
+
+    fn end_of_turn(&self) -> &'static [&'static str] {
+        &[encoding::EOS]
+    }
+
+    /// V4 ships no Jinja template: prompts are the upstream `encoding_dsv4` format.
+    fn render_prompt(&self, messages_json: &str, tools_json: Option<&str>, _add_generation_prompt: bool, opts: &ChatOptions) -> Option<Result<String>> {
+        Some(encoding::render_json(messages_json, tools_json, opts.enable_thinking.unwrap_or(false)))
+    }
+
+    /// Taps: `embed`, `layers.{i}.op` (attention block), `layers.{i}` (the hc streams
+    /// flattened to `[n, hc * D]`), `norm` (all rows only).
+    fn forward(&self, ids: &[u32], st: &mut State, rows: Rows, taps: &mut Taps) -> Result<Option<Tensor>> {
         if ids.is_empty() {
             return Err(Error::new("invalid_argument", "deepseek4: forward of zero tokens"));
         }
         let (n, d, hc) = (ids.len(), self.cfg.hidden_size, self.cfg.hc_mult);
-        let pos = state.pos;
+        let pos = st.pos;
         let e = self.embed.lookup(ids)?.cast(DType::F32)?.reshape(&[n, d])?;
-        let mut push = |name: String, t: &Tensor| {
-            if let Some(tr) = trace.as_deref_mut() {
-                tr.push((name, t.clone()));
-            }
-        };
-        push("embed".into(), &e);
+        taps.tap("embed", &e);
         let mut x = e.unsqueeze(1)?.expand(&[n, hc, d])?.contiguous()?;
         let mut next = Vec::with_capacity(self.layers.len());
         for (i, layer) in self.layers.iter().enumerate() {
             let pre = layer.attn_hc.pre(&x)?;
-            let h = layer.attn_norm.forward(&pre.collapsed)?;
-            let (a, st) = layer.attn.forward(&h, pos, &state.layers[i])?;
-            next.push(st);
-            push(format!("layers.{i}.op"), &a);
+            let (a, s) = layer.attn.forward(&layer.attn_norm.forward(&pre.collapsed)?, pos, &st.layers[i])?;
+            next.push(s);
+            taps.tap(format_args!("layers.{i}.op"), &a);
             x = layer.attn_hc.post(&a, &x, &pre.post, &pre.comb)?;
             let pre = layer.ffn_hc.pre(&x)?;
-            let h = layer.ffn_norm.forward(&pre.collapsed)?;
-            let m = layer.moe.forward(&h, ids)?;
+            let m = layer.moe.forward(&layer.ffn_norm.forward(&pre.collapsed)?, ids)?;
             x = layer.ffn_hc.post(&m, &x, &pre.post, &pre.comb)?;
-            push(format!("layers.{i}"), &x.reshape(&[n, hc * d])?);
+            if taps.enabled() {
+                taps.tap(format_args!("layers.{i}"), &x.reshape(&[n, hc * d])?);
+            }
         }
-        let mut staged = Vec::new();
-        for (i, (old, new)) in state.layers.iter().zip(&next).enumerate() {
+        st.staged.clear();
+        for (i, (old, new)) in st.layers.iter().zip(&next).enumerate() {
             for (j, (o, nw)) in old.slots().into_iter().zip(new.slots()).enumerate() {
                 if let Some(t) = nw
                     && o.as_ref().is_none_or(|o| o.id() != t.id())
                 {
-                    staged.push((i, j, t.clone()));
+                    st.staged.push((i, j, t.clone()));
                 }
             }
         }
+        st.next = Some(next);
         let x = match rows {
-            Rows::None => return Ok((None, next, staged)),
+            Rows::None => return Ok(None),
             Rows::Last if n > 1 => x.slice(0, n - 1, n)?,
             _ => x,
         };
         let h = self.norm.forward(&self.hc_head.forward(&x)?)?;
         if rows == Rows::All {
-            push("norm".into(), &h);
+            taps.tap("norm", &h);
         }
-        Ok((Some(self.head.forward(&h)?), next, staged))
-    }
-
-    fn eval_commit(&self, device: &Device, outputs: &[&Tensor], state: &mut State, mut next: Vec<LayerState>, staged: Staged, n: usize) -> Result<Vec<Tensor>> {
-        let mut outs: Vec<&Tensor> = outputs.to_vec();
-        outs.extend(staged.iter().map(|(_, _, t)| t));
-        let mut realized = device.eval(&outs)?;
-        if realized.len() != outs.len() {
-            return Err(Error::new("backend", "deepseek4 eval returned the wrong number of outputs"));
-        }
-        let st = realized.split_off(outputs.len());
-        for ((i, j, _), t) in staged.into_iter().zip(st) {
-            if let Some(slot) = next[i].slots_mut().into_iter().nth(j) {
-                *slot = Some(t);
-            }
-        }
-        state.layers = next;
-        state.pos += n;
-        Ok(realized)
-    }
-
-    /// Feed `ids` (a prompt, chunked, or one token); f32 logits of the last position.
-    /// On error the state is left unchanged.
-    pub fn step(&self, device: &Device, ids: &[u32], state: &mut State) -> Result<Vec<f32>> {
-        if ids.is_empty() {
-            return Err(Error::new("invalid_argument", "deepseek4: step with no tokens"));
-        }
-        let chunks: Vec<&[u32]> = ids.chunks(PREFILL_CHUNK).collect();
-        let last = chunks.len() - 1;
-        for (ci, chunk) in chunks.into_iter().enumerate() {
-            let rows = if ci == last { Rows::Last } else { Rows::None };
-            let (out, next, staged) = self.build(chunk, state, rows, None)?;
-            let outputs: Vec<&Tensor> = out.iter().collect();
-            let realized = self.eval_commit(device, &outputs, state, next, staged, chunk.len())?;
-            if ci == last {
-                let logits = realized.first().ok_or_else(|| Error::new("backend", "deepseek4: no logits realized"))?;
-                return device.to_vec_f32(logits);
-            }
-        }
-        Err(Error::new("internal", "deepseek4: prefill produced no logits"))
-    }
-
-    /// One uncached forward over `ids` with every intermediate realized.
-    pub fn forward_traced(&self, device: &Device, ids: &[u32], rows: Rows) -> Result<Vec<(String, Vec<f32>)>> {
-        let state = self.new_state();
-        let mut trace = Vec::new();
-        let (logits, _, _) = self.build(ids, &state, rows, Some(&mut trace))?;
-        if let Some(l) = logits {
-            trace.push(("logits".to_string(), l));
-        }
-        let refs: Vec<&Tensor> = trace.iter().map(|(_, t)| t).collect();
-        let realized = device.eval(&refs)?;
-        trace.iter().zip(&realized).map(|((n, _), t)| Ok((n.clone(), device.to_vec_f32(t)?))).collect()
+        Ok(Some(self.head.forward(&h)?))
     }
 }

@@ -1,21 +1,20 @@
-//! Streaming synthesis: one graph evaluation per codec frame runs the backbone step, the
-//! flow head and the Mimi decoder together, so every 80 ms frame of PCM is available as
-//! soon as its latent is sampled.
+//! Phonon on the shared speech pipeline (`runtime::tts`): one graph evaluation per codec
+//! frame runs the backbone step, the flow head and the Mimi decoder together, so every 80 ms
+//! frame of PCM is available as soon as its latent is sampled. Chunking, end of speech,
+//! fade-in, streaming and cancellation are [`crate::runtime::tts::SpeechStream`].
 
-use std::collections::VecDeque;
-use std::time::Instant;
-
-use lapid::{DType, Error, Result, Tensor};
+use lapid::{DType, Error, Result, Tensor, bail};
+use lapid_nn::KvCache;
 use lapid_nn::sampling::Rng;
 
-use super::Phonon;
-use lapid_nn::KvCache;
 use super::mimi::MimiState;
+use super::{Phonon, SpeakOptions, text};
+use crate::runtime::tts::{Frame, Segment, SpeechModel, StreamOptions};
 
 /// Where the flow sampler's Gaussian noise comes from.
 #[derive(Clone)]
 pub(crate) enum Noise {
-    /// Seeded N(0, 1) (Box–Muller over xoshiro256**), scaled by sqrt(temperature).
+    /// Seeded N(0, 1) (Box-Muller over xoshiro256**), scaled by sqrt(temperature).
     Seeded(Rng),
     /// Pre-drawn noise, `latent_dim` values per frame, used as is (already scaled); frames
     /// past the end get zeros. Verification feeds the reference's noise this way.
@@ -48,221 +47,149 @@ impl Noise {
     }
 }
 
-/// One text chunk to synthesize.
-pub(crate) struct TextChunk {
-    pub ids: Vec<u32>,
-    pub frames_after_eos: usize,
-    pub max_frames: usize,
-}
-
-/// Generation state of the chunk being spoken.
-struct ChunkState {
-    chunk: TextChunk,
-    cache: KvCache,
-    /// Normalized latent of the previous frame [1, 1, ldim] (None before the prefill).
-    prev: Option<Tensor>,
-    frames: usize,
-    /// Frames left after end of speech was detected.
-    remaining: Option<usize>,
-}
-
-/// Timings of a stream (milliseconds since the stream was created).
-#[derive(Clone, Debug, Default, serde::Serialize)]
-pub struct StreamStats {
-    pub first_audio_ms: Option<f64>,
-    pub frames: usize,
-    pub samples: usize,
-    pub elapsed_ms: f64,
-}
-
-/// Iterator of PCM chunks (mono f32 at [`Phonon::sample_rate`]); see [`Phonon::speak_stream`].
-pub struct SpeechStream<'a> {
-    model: &'a Phonon,
-    chunks: VecDeque<TextChunk>,
-    cur: Option<ChunkState>,
+/// Utterance state: codec state, voice, conditioning, noise.
+pub struct Utterance {
     mimi: MimiState,
     voice: Option<Tensor>,
     cond: Tensor,
     time_conds: Vec<Tensor>,
     noise: Noise,
     noise_std: f32,
-    eos_threshold: f32,
-    min_frames_before_eos: usize,
-    frames_per_chunk: usize,
-    fade_samples: usize,
-    emitted: usize,
-    started: Instant,
-    stats: StreamStats,
-    done: bool,
+    max_chunk_tokens: usize,
+    max_frames: Option<usize>,
     /// Normalized latents and EOS logits of every frame (for verification).
     pub(crate) record: Option<(Vec<f32>, Vec<f32>)>,
 }
 
-/// Settings resolved from [`super::SpeakOptions`] and the model config.
-pub(crate) struct StreamSetup {
-    pub chunks: Vec<TextChunk>,
-    pub voice: Option<Tensor>,
-    pub cond: Tensor,
-    pub time_conds: Vec<Tensor>,
-    pub noise: Noise,
-    pub noise_std: f32,
-    pub eos_threshold: f32,
-    pub min_frames_before_eos: usize,
-    pub frames_per_chunk: usize,
-    pub fade_samples: usize,
+/// Generation state of the text chunk being spoken.
+pub struct ChunkState {
+    cache: KvCache,
+    /// Normalized latent of the previous frame [1, 1, ldim] (None before the prefill).
+    prev: Option<Tensor>,
 }
 
-impl<'a> SpeechStream<'a> {
-    pub(crate) fn new(model: &'a Phonon, s: StreamSetup) -> SpeechStream<'a> {
-        SpeechStream {
-            model,
-            chunks: s.chunks.into(),
-            cur: None,
-            mimi: model.mimi.new_state(),
-            voice: s.voice,
-            cond: s.cond,
-            time_conds: s.time_conds,
-            noise: s.noise,
-            noise_std: s.noise_std,
-            eos_threshold: s.eos_threshold,
-            min_frames_before_eos: s.min_frames_before_eos,
-            frames_per_chunk: s.frames_per_chunk.max(1),
-            fade_samples: s.fade_samples,
-            emitted: 0,
-            started: Instant::now(),
-            stats: StreamStats::default(),
-            done: false,
+impl Phonon {
+    /// Utterance state and stream options for `opts` with `noise`.
+    pub(crate) fn utterance(&self, opts: &SpeakOptions, noise: Noise) -> Result<(Utterance, StreamOptions)> {
+        let g = &self.cfg.generation;
+        let name = opts.voice.as_deref().unwrap_or(&self.cfg.assets.default_voice);
+        let voice = self.voices.get(name).cloned().ok_or_else(|| {
+            Error::new("not_found", format!("unknown voice {name:?} (have: {})", self.voices().join(", ")))
+        })?;
+        let steps = opts.num_flow_steps.unwrap_or(g.num_flow_steps).max(1);
+        let c = &self.cfg.conditions;
+        let mut lazy = vec![self.lm.condition(c.num_speakers, opts.duration_delta.unwrap_or(c.duration_delta), c)?];
+        for i in 0..steps {
+            lazy.push(self.lm.flow.time_condition(i as f32 / steps as f32, (i + 1) as f32 / steps as f32)?);
+        }
+        let mut realized = self.device.eval(&lazy.iter().collect::<Vec<_>>())?;
+        let time_conds = realized.split_off(1);
+        let cond = realized.pop().ok_or_else(|| Error::new("internal", "eval returned nothing"))?;
+        let utt = Utterance {
+            mimi: self.mimi.new_state(),
+            voice: Some(voice),
+            cond,
+            time_conds,
+            noise,
+            noise_std: opts.temperature.unwrap_or(g.temperature).max(0.0).sqrt(),
+            max_chunk_tokens: opts.max_chunk_tokens.unwrap_or(50).max(1),
+            max_frames: opts.max_frames,
             record: None,
-        }
-    }
-
-    pub fn stats(&self) -> StreamStats {
-        let mut s = self.stats.clone();
-        s.elapsed_ms = self.started.elapsed().as_secs_f64() * 1e3;
-        s
-    }
-
-    /// One frame: Ok(None) when every chunk is finished.
-    fn frame(&mut self) -> Result<Option<Vec<f32>>> {
-        if self.cur.is_none() {
-            match self.chunks.pop_front() {
-                Some(chunk) => {
-                    self.cur = Some(ChunkState {
-                        chunk,
-                        cache: self.model.lm.new_cache(),
-                        prev: None,
-                        frames: 0,
-                        remaining: None,
-                    })
-                }
-                None => return Ok(None),
-            }
-        }
-        let lm = &self.model.lm;
-        let st = self.cur.as_mut().ok_or_else(|| Error::new("internal", "no chunk state"))?;
-        let ldim = lm.latent_dim;
-        let x = match &st.prev {
-            None => lm.prompt_embeds(self.voice.as_ref(), &st.chunk.ids, &self.cond)?,
-            Some(prev) => lm.latent_embeds(prev, &self.cond)?,
         };
-        let built = (|| -> Result<(Tensor, Tensor, Tensor)> {
+        let so = StreamOptions {
+            frames_per_chunk: opts.frames_per_chunk.unwrap_or(1).max(1),
+            eos_threshold: Some(opts.eos_threshold.unwrap_or(g.eos_threshold)),
+            min_frames_before_eos: g.min_frames_before_eos,
+            fade_in_samples: (g.fade_in_duration * self.cfg.mimi.sample_rate as f32) as usize,
+            cancel: None,
+        };
+        Ok((utt, so))
+    }
+}
+
+impl SpeechModel for Phonon {
+    type Input = Vec<u32>;
+    type Stream = Utterance;
+    type SegmentState = ChunkState;
+    type Options = SpeakOptions;
+
+    fn sample_rate(&self) -> u32 {
+        self.cfg.mimi.sample_rate
+    }
+
+    fn new_stream(&self, opts: &SpeakOptions) -> Result<(Utterance, StreamOptions)> {
+        let seed = opts.seed.unwrap_or_else(|| {
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
+        });
+        self.utterance(opts, Noise::Seeded(Rng::new(seed)))
+    }
+
+    /// Prepared text split at sentence ends into chunks of at most `max_chunk_tokens`, each with
+    /// a frame budget of `ceil((tokens / 3 + 2) * frame_rate)`.
+    fn segments(&self, text: &str, utt: &Utterance) -> Result<Vec<Segment<Vec<u32>>>> {
+        let g = &self.cfg.generation;
+        let prepared = text::prepare(text);
+        if prepared.is_empty() {
+            bail!("invalid_argument", "nothing to say: the text is empty");
+        }
+        let mut out = Vec::new();
+        for piece in text::split(&self.tokenizer, &prepared, utt.max_chunk_tokens)? {
+            let ids = text::encode(&self.tokenizer, &piece)?;
+            let short = text::word_count(&piece) <= g.short_text_max_words;
+            let budget = ((ids.len() as f64 / 3.0 + 2.0) * self.cfg.mimi.frame_rate as f64).ceil() as usize;
+            out.push(Segment {
+                input: ids,
+                max_frames: utt.max_frames.unwrap_or(budget).max(1),
+                frames_after_eos: if short { g.frames_after_eos_short_text } else { g.frames_after_eos },
+            });
+        }
+        Ok(out)
+    }
+
+    fn begin_segment(&self, _: &mut Utterance, _: &Vec<u32>) -> Result<ChunkState> {
+        Ok(ChunkState { cache: self.lm.new_cache(), prev: None })
+    }
+
+    fn step(&self, u: &mut Utterance, ids: &Vec<u32>, st: &mut ChunkState, _frame: usize) -> Result<Frame> {
+        let lm = &self.lm;
+        let ldim = lm.latent_dim;
+        let built = (|| -> Result<[Tensor; 3]> {
+            let x = match &st.prev {
+                None => lm.prompt_embeds(u.voice.as_ref(), ids, &u.cond)?,
+                Some(prev) => lm.latent_embeds(prev, &u.cond)?,
+            };
             let step = lm.step(&x, &mut st.cache, None)?;
-            let noise = Tensor::from_f32(&self.noise.draw(ldim, self.noise_std), &[1, ldim])?;
-            let latent = lm.flow.sample(&step.hidden, &noise, &self.time_conds)?;
+            let noise = Tensor::from_f32(&u.noise.draw(ldim, u.noise_std), &[1, ldim])?;
+            let latent = lm.flow.sample(&step.hidden, &noise, &u.time_conds)?;
             let audio_latent = lm.denormalize(&latent)?.reshape(&[1, 1, ldim])?;
-            let pcm = self.model.mimi.decode(&audio_latent, &mut self.mimi, None)?;
-            Ok((latent, step.eos, pcm))
+            let pcm = self.mimi.decode(&audio_latent, &mut u.mimi, None)?;
+            Ok([latent, step.eos, pcm])
         })();
-        let (latent, eos, pcm) = match built {
-            Ok(v) => v,
+        let r = built.and_then(|outs| {
+            let mut all: Vec<&Tensor> = outs.iter().collect();
+            all.extend(st.cache.staged());
+            all.extend(u.mimi.staged());
+            self.device.eval(&all)
+        });
+        let mut r = match r {
+            Ok(r) => r,
             Err(e) => {
                 st.cache.discard();
-                self.mimi.discard();
+                u.mimi.discard();
                 return Err(e);
             }
         };
         let n_lm = st.cache.staged().len();
-        let mut outs: Vec<&Tensor> = vec![&latent, &eos, &pcm];
-        outs.extend(st.cache.staged());
-        outs.extend(self.mimi.staged());
-        let mut r = match self.model.device.eval(&outs) {
-            Ok(r) => r,
-            Err(e) => {
-                st.cache.discard();
-                self.mimi.discard();
-                return Err(e);
-            }
-        };
         let mimi_states = r.split_off(3 + n_lm);
-        let lm_states = r.split_off(3);
-        st.cache.commit(lm_states)?;
-        self.mimi.commit(mimi_states)?;
-        let dev = &self.model.device;
-        let eos_logit = dev.to_vec_f32(&r[1])?.first().copied().unwrap_or(f32::NEG_INFINITY);
-        let mut samples = dev.to_vec_f32(&r[2])?;
-        if let Some((lat, eo)) = self.record.as_mut() {
+        st.cache.commit(r.split_off(3))?;
+        u.mimi.commit(mimi_states)?;
+        let dev = &self.device;
+        let eos = dev.to_vec_f32(&r[1])?.first().copied().unwrap_or(f32::NEG_INFINITY);
+        if let Some((lat, eo)) = u.record.as_mut() {
             lat.extend(dev.to_vec_f32(&r[0])?);
-            eo.push(eos_logit);
+            eo.push(eos);
         }
         st.prev = Some(r[0].reshape(&[1, 1, ldim])?.cast(DType::F32)?);
-
-        // HF PocketTTSEosThresholdCriteria: the crossing frame and `frames_after_eos` more.
-        let can_end = st.frames >= self.min_frames_before_eos;
-        st.frames += 1;
-        if st.remaining.is_none() && can_end && eos_logit > self.eos_threshold {
-            st.remaining = Some(st.chunk.frames_after_eos);
-        }
-        let finished = match st.remaining {
-            Some(0) => true,
-            Some(n) => {
-                st.remaining = Some(n - 1);
-                false
-            }
-            None => false,
-        } || st.frames >= st.chunk.max_frames;
-        if finished {
-            self.cur = None;
-        }
-
-        // fade-in of the utterance start
-        for (i, s) in samples.iter_mut().enumerate() {
-            let pos = self.emitted + i;
-            if pos >= self.fade_samples {
-                break;
-            }
-            *s *= pos as f32 / (self.fade_samples.max(2) - 1) as f32;
-        }
-        self.emitted += samples.len();
-        self.stats.frames += 1;
-        self.stats.samples += samples.len();
-        if self.stats.first_audio_ms.is_none() {
-            self.stats.first_audio_ms = Some(self.started.elapsed().as_secs_f64() * 1e3);
-        }
-        Ok(Some(samples))
-    }
-}
-
-impl Iterator for SpeechStream<'_> {
-    type Item = Result<Vec<f32>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        let mut out = Vec::new();
-        for _ in 0..self.frames_per_chunk {
-            match self.frame() {
-                Ok(Some(pcm)) => out.extend(pcm),
-                Ok(None) => {
-                    self.done = true;
-                    break;
-                }
-                Err(e) => {
-                    self.done = true;
-                    return Some(Err(e));
-                }
-            }
-        }
-        if out.is_empty() { None } else { Some(Ok(out)) }
+        Ok(Frame { pcm: dev.to_vec_f32(&r[2])?, eos_logit: Some(eos), end: false })
     }
 }

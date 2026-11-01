@@ -1,11 +1,11 @@
 //! DeepSeek V4 hyper-parameters. Read from the upstream `config.json` (V4-Flash / V4-Pro keys:
 //! `compress_ratios`, `num_hash_layers`, `rope_scaling`, ...), from a transformers 5 style config
 //! (`layer_types` + `compress_rates`, `mlp_layer_types`, nested `rope_parameters`) or from the
-//! `.lapid` metadata object `"deepseek4"` (written by [`Deepseek4Config::to_json`] in the upstream
-//! key style), so one parser reads all of them.
+//! `.lapid` metadata object `"deepseek4"` (the source config as converted; round-5 files hold an
+//! upstream-style copy), so one parser reads all of them.
 
 use lapid::{Error, Result, bail};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 /// YaRN frequency interpolation of the compressed-attention RoPE (sliding layers use plain RoPE).
 #[derive(Clone, Debug, PartialEq)]
@@ -52,8 +52,6 @@ pub struct Deepseek4Config {
     pub index_topk: usize,
     pub norm_eps: f32,
     pub max_positions: usize,
-    pub bos: Option<u32>,
-    pub eos: Vec<u32>,
 }
 
 fn get_usize(v: &Value, key: &str) -> Result<usize> {
@@ -69,14 +67,6 @@ fn opt_usize(v: &Value, key: &str) -> Option<usize> {
 
 fn opt_f32(v: &Value, key: &str) -> Option<f32> {
     v.get(key).and_then(Value::as_f64).map(|x| x as f32)
-}
-
-fn ids(v: Option<&Value>) -> Vec<u32> {
-    match v {
-        Some(Value::Number(n)) => n.as_u64().map(|x| vec![x as u32]).unwrap_or_default(),
-        Some(Value::Array(a)) => a.iter().filter_map(Value::as_u64).map(|x| x as u32).collect(),
-        _ => Vec::new(),
-    }
 }
 
 /// Per-layer compression ratios: upstream `compress_ratios`, else transformers `layer_types`.
@@ -152,10 +142,6 @@ impl Deepseek4Config {
             .and_then(|m| opt_f32(m, "rope_theta"))
             .or_else(|| opt_f32(v, "rope_theta"))
             .unwrap_or(10000.0);
-        let mut eos = ids(v.get("eos_token_id"));
-        if eos.is_empty() {
-            eos = vec![1];
-        }
         let cfg = Deepseek4Config {
             vocab_size: get_usize(v, "vocab_size")?,
             hidden_size: get_usize(v, "hidden_size")?,
@@ -186,8 +172,6 @@ impl Deepseek4Config {
             index_topk: get_usize(v, "index_topk")?,
             norm_eps: opt_f32(v, "rms_norm_eps").unwrap_or(1e-6),
             max_positions: opt_usize(v, "max_position_embeddings").unwrap_or(1 << 20),
-            bos: v.get("bos_token_id").and_then(Value::as_u64).map(|x| x as u32),
-            eos,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -221,56 +205,12 @@ impl Deepseek4Config {
     pub fn compress_coff(ratio: usize) -> usize {
         if ratio == 4 { 2 } else { 1 }
     }
-
-    /// Upstream-style config JSON (stored in the `.lapid` metadata).
-    pub fn to_json(&self) -> Value {
-        let mut v = json!({
-            "model_type": "deepseek_v4",
-            "vocab_size": self.vocab_size,
-            "hidden_size": self.hidden_size,
-            "num_hidden_layers": self.n_layers,
-            "num_attention_heads": self.n_head,
-            "num_key_value_heads": 1,
-            "head_dim": self.head_dim,
-            "qk_rope_head_dim": self.rope_dim,
-            "q_lora_rank": self.q_lora_rank,
-            "o_groups": self.o_groups,
-            "o_lora_rank": self.o_lora_rank,
-            "n_routed_experts": self.n_experts,
-            "n_shared_experts": self.n_shared_experts,
-            "num_experts_per_tok": self.top_k,
-            "moe_intermediate_size": self.moe_intermediate,
-            "routed_scaling_factor": self.route_scale,
-            "swiglu_limit": self.swiglu_limit,
-            "scoring_func": "sqrtsoftplus",
-            "norm_topk_prob": true,
-            "sliding_window": self.sliding_window,
-            "compress_ratios": self.compress_ratios,
-            "num_hash_layers": self.n_hash_layers,
-            "rope_theta": self.rope_theta,
-            "compress_rope_theta": self.compress_rope_theta,
-            "hc_mult": self.hc_mult,
-            "hc_sinkhorn_iters": self.hc_sinkhorn_iters,
-            "hc_eps": self.hc_eps,
-            "index_n_heads": self.index_n_heads,
-            "index_head_dim": self.index_head_dim,
-            "index_topk": self.index_topk,
-            "rms_norm_eps": self.norm_eps,
-            "max_position_embeddings": self.max_positions,
-            "bos_token_id": self.bos,
-            "eos_token_id": self.eos,
-        });
-        if let Some(y) = &self.yarn {
-            v["rope_scaling"] = json!({"type": "yarn", "factor": y.factor, "original_max_position_embeddings": y.original_max_positions,
-                                       "beta_fast": y.beta_fast, "beta_slow": y.beta_slow});
-        }
-        v
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn flash() -> Value {
         json!({"model_type": "deepseek_v4", "vocab_size": 129280, "hidden_size": 4096, "num_hidden_layers": 4,
@@ -284,12 +224,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_and_roundtrip() {
+    fn parse() {
         let c = Deepseek4Config::from_json(&flash()).expect("cfg");
         assert_eq!(c.compress_ratios, vec![0, 4, 128, 4]);
         assert_eq!(c.hc_mix(), 24);
         assert_eq!(c.yarn.as_ref().map(|y| y.factor), Some(16.0));
-        assert_eq!(Deepseek4Config::from_json(&c.to_json()).expect("again"), c);
     }
 
     #[test]

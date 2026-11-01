@@ -34,20 +34,6 @@ pub fn verify(model: &str, reference: Option<&Path>, args: &ModelArgs) -> Result
         return (e.verify)(reference, args);
     }
     match model {
-        "whisper" => crate::whisper::cmd::verify(reference, args),
-        "embeddinggemma" => crate::embeddinggemma::cmd::verify(reference, args),
-        "parakeet" => crate::parakeet::cmd::verify(reference, args),
-        "phonon" => crate::phonon::cmd::verify(reference, args),
-        "qwen35" => crate::qwen35::cmd::verify(reference, args),
-        "deepseek4" => crate::deepseek4::cmd::verify(reference, args),
-        "qwen4exp" => crate::qwen4exp::cmd::verify(reference, args),
-        "gemma4" => crate::gemma4::cmd::verify(reference, args),
-        "llama" => crate::llama::cmd::verify(reference, args),
-        "gemma4moe" => crate::gemma4moe::cmd::verify(reference, args),
-        "gemma4vl" => crate::gemma4vl::cmd::verify(reference, args),
-        "qwen3vl" => crate::qwen3vl::cmd::verify(reference, args),
-        "vad" => crate::vad::cmd::verify(reference, args),
-        "zipformer" => crate::zipformer::cmd::verify(reference, args),
         _ => Err(unknown(model)),
     }
 }
@@ -61,20 +47,6 @@ pub fn bench(model: &str, input: Option<&Path>, args: &ModelArgs, runs: usize) -
         return (e.bench)(input, args, runs);
     }
     match model {
-        "whisper" => crate::whisper::cmd::bench(input, args, runs),
-        "embeddinggemma" => crate::embeddinggemma::cmd::bench(input, args, runs),
-        "parakeet" => crate::parakeet::cmd::bench(input, args, runs),
-        "phonon" => crate::phonon::cmd::bench(input, args, runs),
-        "qwen35" => crate::qwen35::cmd::bench(input, args, runs),
-        "deepseek4" => crate::deepseek4::cmd::bench(input, args, runs),
-        "qwen4exp" => crate::qwen4exp::cmd::bench(input, args, runs),
-        "gemma4" => crate::gemma4::cmd::bench(input, args, runs),
-        "llama" => crate::llama::cmd::bench(input, args, runs),
-        "gemma4moe" => crate::gemma4moe::cmd::bench(input, args, runs),
-        "gemma4vl" => crate::gemma4vl::cmd::bench(input, args, runs),
-        "qwen3vl" => crate::qwen3vl::cmd::bench(input, args, runs),
-        "vad" => crate::vad::cmd::bench(input, args, runs),
-        "zipformer" => crate::zipformer::cmd::bench(input, args, runs),
         _ => Err(unknown(model)),
     }
 }

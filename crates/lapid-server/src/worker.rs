@@ -9,10 +9,9 @@ use std::sync::mpsc;
 
 use lapid::{Device, Error, Result};
 
-use crate::load::{self, LoadOptions};
-use crate::served::{ModelMeta, Served};
+use lapid_hub::runtime::serve::{AnyModel, LoadOptions, ModelMeta, load_path};
 
-type Job = Box<dyn FnOnce(&mut dyn Served) + Send>;
+type Job = Box<dyn FnOnce(&mut dyn AnyModel) + Send>;
 
 /// Handle to a model's worker thread (cheap to clone).
 #[derive(Clone)]
@@ -36,7 +35,7 @@ impl Worker {
         std::thread::Builder::new()
             .name(name)
             .spawn(move || {
-                let mut served = match load::load(&path, id, &device, &opts) {
+                let mut served = match load_path(&path, id, &device, &opts) {
                     Ok(s) => s,
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -76,7 +75,7 @@ impl Worker {
     }
 
     /// Queue `job`; it runs after the requests already queued.
-    pub fn submit(&self, job: impl FnOnce(&mut dyn Served) + Send + 'static) -> Result<()> {
+    pub fn submit(&self, job: impl FnOnce(&mut dyn AnyModel) + Send + 'static) -> Result<()> {
         self.queued.fetch_add(1, Ordering::SeqCst);
         self.tx.send(Box::new(job)).map_err(|_| {
             self.queued.fetch_sub(1, Ordering::SeqCst);
@@ -86,7 +85,7 @@ impl Worker {
 
     /// Run `f` on the model and await its result. Skipped (never run) when the caller is
     /// dropped while queued.
-    pub async fn call<R: Send + 'static>(&self, f: impl FnOnce(&mut dyn Served) -> Result<R> + Send + 'static) -> Result<R> {
+    pub async fn call<R: Send + 'static>(&self, f: impl FnOnce(&mut dyn AnyModel) -> Result<R> + Send + 'static) -> Result<R> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.submit(move |s| {
             if tx.is_closed() {

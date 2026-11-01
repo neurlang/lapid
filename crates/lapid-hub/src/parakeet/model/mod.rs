@@ -15,11 +15,6 @@ use lapid_nn::{Linear, Loader};
 /// LayerNorm epsilon of every Parakeet LayerNorm (PyTorch default).
 pub(crate) const LN_EPS: f32 = 1e-5;
 
-/// First tensor of an eval result.
-pub(crate) fn first(v: Vec<Tensor>) -> Result<Tensor> {
-    v.into_iter().next().ok_or_else(|| Error::new("backend", "device.eval returned no outputs"))
-}
-
 /// `{prefix}.weight` with `{prefix}.bias` when the file has one.
 pub(crate) fn linear(l: &Loader<'_>, prefix: &str) -> Result<Linear> {
     let bias = l.contains(&format!("{prefix}.bias"));

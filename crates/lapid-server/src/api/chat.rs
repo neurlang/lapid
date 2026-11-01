@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{ApiError, ApiResult, Shared, new_id, now_secs, parse_json};
-use crate::served::{Capability, ChatParams, Delta, GenParams, GenSummary};
+use lapid_hub::runtime::serve::{Capability, ChatParams, Delta, GenParams, GenSummary};
 use crate::worker::Worker;
 
 #[derive(Deserialize)]
@@ -137,7 +137,7 @@ enum GenEvent {
 
 fn spawn_gen(
     worker: &Worker,
-    run: impl FnOnce(&mut dyn crate::served::Served, &mut dyn FnMut(Delta) -> bool) -> lapid::Result<GenSummary> + Send + 'static,
+    run: impl FnOnce(&mut dyn lapid_hub::AnyModel, &mut dyn FnMut(Delta) -> bool) -> lapid::Result<GenSummary> + Send + 'static,
 ) -> ApiResult<mpsc::Receiver<GenEvent>> {
     let (tx, rx) = mpsc::channel::<GenEvent>(256);
     worker.submit(move |s| {

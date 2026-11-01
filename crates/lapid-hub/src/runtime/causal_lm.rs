@@ -105,10 +105,20 @@ pub trait CausalLm: Sized + Send + Sync + 'static {
     fn think_markers(&self) -> (&'static str, &'static str) {
         ("<think>", "</think>")
     }
+    /// Default chat-template globals beyond messages / tools / thinking / special tokens
+    /// (per-call `ChatOptions::template_vars` override them).
+    fn template_globals(&self) -> Vec<(&'static str, Value)> {
+        Vec::new()
+    }
+    /// Own prompt format instead of the stored Jinja template (messages / tools as JSON), e.g.
+    /// DeepSeek V4's `encoding_dsv4`; `None` = render the template.
+    fn render_prompt(&self, _messages_json: &str, _tools_json: Option<&str>, _add_generation_prompt: bool, _opts: &ChatOptions) -> Option<Result<String>> {
+        None
+    }
 }
 
 /// Evaluate `outputs` with the staged state and commit it (`n` tokens fed).
-fn eval_commit<S: LmState>(device: &Device, outputs: &[&Tensor], state: &mut S, n: usize) -> Result<Vec<Tensor>> {
+pub(crate) fn eval_commit<S: LmState>(device: &Device, outputs: &[&Tensor], state: &mut S, n: usize) -> Result<Vec<Tensor>> {
     let mut outs: Vec<&Tensor> = outputs.to_vec();
     outs.extend(state.staged());
     let mut realized = match device.eval(&outs) {
@@ -209,13 +219,25 @@ impl<M: CausalLm> Llm<M> {
             .get(M::ARCH)
             .ok_or_else(|| Error::new("metadata", format!("{}: no {:?} metadata object", M::ARCH, M::ARCH)))?;
         let model = M::load(&Loader::new(&file, device, precision), meta)?;
-        let text = TextAssets::from_file(&file, M::ARCH, meta, model.end_of_turn())?;
+        let mut text = TextAssets::from_file(&file, M::ARCH, meta, model.end_of_turn())?;
+        for (k, v) in model.template_globals() {
+            text.template.set_global(k, super::jinja::Value::from_json(&v));
+        }
         Ok(Llm { device: device.clone(), info: ModelInfo::from_file(&file, "text-generation"), model, text })
     }
 
     /// The model's own math (config, ...).
     pub fn model(&self) -> &M {
         &self.model
+    }
+
+    /// Mutable model access (e.g. image budgets of a vision-language model).
+    pub fn model_mut(&mut self) -> &mut M {
+        &mut self.model
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     pub fn tokenizer(&self) -> &Tokenizer {
@@ -242,12 +264,28 @@ impl<M: CausalLm> Llm<M> {
 
     /// Render the chat template for typed messages.
     pub fn render_chat(&self, messages: &[Message], add_generation_prompt: bool, enable_thinking: Option<bool>) -> Result<String> {
-        self.text.template.render(messages, add_generation_prompt, enable_thinking)
+        self.render_chat_with(messages, add_generation_prompt, &ChatOptions { enable_thinking, ..Default::default() })
     }
 
     /// Render the chat template for HF-style messages / tools given as JSON.
     pub fn render_chat_json(&self, messages_json: &str, tools_json: Option<&str>, add_generation_prompt: bool, enable_thinking: Option<bool>) -> Result<String> {
-        self.text.template.render_json(messages_json, tools_json, add_generation_prompt, enable_thinking)
+        self.render_chat_json_with(messages_json, tools_json, add_generation_prompt, &ChatOptions { enable_thinking, ..Default::default() })
+    }
+
+    /// [`render_chat`](Self::render_chat) with per-call options (thinking, template vars).
+    pub fn render_chat_with(&self, messages: &[Message], add_generation_prompt: bool, opts: &ChatOptions) -> Result<String> {
+        if let Some(r) = self.model.render_prompt(&serde_json::to_string(messages)?, None, add_generation_prompt, opts) {
+            return r;
+        }
+        self.text.template.render_with(messages, add_generation_prompt, opts)
+    }
+
+    /// [`render_chat_json`](Self::render_chat_json) with per-call options.
+    pub fn render_chat_json_with(&self, messages_json: &str, tools_json: Option<&str>, add_generation_prompt: bool, opts: &ChatOptions) -> Result<String> {
+        if let Some(r) = self.model.render_prompt(messages_json, tools_json, add_generation_prompt, opts) {
+            return r;
+        }
+        self.text.template.render_json_with(messages_json, tools_json, add_generation_prompt, opts)
     }
 
     /// Token ids of rendered chat text (special tokens in the text are recognized; nothing added).
@@ -278,7 +316,7 @@ impl<M: CausalLm> Llm<M> {
 
     /// Stream the assistant reply to `messages` (template with the generation prompt).
     pub fn chat_stream<'a>(&'a self, session: &'a mut Session<M::State>, messages: &[Message], opts: &ChatOptions) -> Result<TokenStream<'a>> {
-        let ids = self.encode(&self.render_chat(messages, true, opts.enable_thinking)?)?;
+        let ids = self.encode(&self.render_chat_with(messages, true, opts)?)?;
         self.generate(session, &ids, opts.generate.clone())
     }
 

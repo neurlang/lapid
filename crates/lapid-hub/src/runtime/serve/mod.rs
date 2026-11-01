@@ -6,7 +6,6 @@
 //! thread, requests one at a time, so adapters may keep mutable state such as sessions
 //! without locking) and `lapid run`.
 
-pub mod adapters;
 pub mod llm;
 pub mod text;
 
@@ -67,15 +66,7 @@ pub fn load_path(path: &Path, id: String, device: &Device, opts: &LoadOptions) -
     let arch = meta.architecture.clone();
     let mut model: Box<dyn AnyModel> = match super::registry::find(&arch) {
         Some(entry) => (entry.serve)(path, device, meta, opts)?,
-        None => match arch.as_str() {
-            a if a.starts_with("qwen35") => Box::new(llm::LlmServed::new(crate::Qwen35::load(path, device)?, meta, opts)),
-            "gemma4" => Box::new(llm::LlmServed::new(crate::Gemma4::load(path, device)?, meta, opts)),
-            "whisper" => Box::new(adapters::WhisperServed::new(crate::Whisper::load(path, device)?, meta)),
-            a if a.starts_with("parakeet") => Box::new(adapters::ParakeetServed::new(crate::Parakeet::load(path, device)?, meta)),
-            "phonon" => Box::new(adapters::PhononServed::new(crate::Phonon::load(path, device)?, meta)),
-            "embeddinggemma" => Box::new(adapters::EmbedServed::new(crate::EmbeddingGemma::load(path, device)?, meta)),
-            other => bail!("unsupported_model", "{}: architecture {other:?} cannot be served", path.display()),
-        },
+        None => bail!("unsupported_model", "{}: architecture {arch:?} cannot be served", path.display()),
     };
     let meta = model.meta_mut();
     meta.load_ms = t0.elapsed().as_millis() as u64;

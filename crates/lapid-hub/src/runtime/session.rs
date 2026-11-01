@@ -121,11 +121,14 @@ impl LmState for LmCache {
 pub struct Session<S> {
     pub(crate) state: S,
     pub(crate) tokens: Vec<u32>,
+    /// (first token, fingerprint) of each image whose embeddings are in the state
+    /// (`runtime::vlm`); prefix reuse stops before a different image.
+    pub(crate) media: Vec<(usize, u64)>,
 }
 
 impl<S: LmState> Session<S> {
     pub fn new(state: S) -> Session<S> {
-        Session { state, tokens: Vec::new() }
+        Session { state, tokens: Vec::new(), media: Vec::new() }
     }
 
     /// Tokens fed to the model so far (prompt + generated, without a final unfed token).
@@ -149,6 +152,7 @@ impl<S: LmState> Session<S> {
     pub fn reset(&mut self) {
         self.state.clear();
         self.tokens.clear();
+        self.media.clear();
     }
 
     /// Prepare for `prompt`: keep the state for the longest common prefix of the consumed
@@ -161,6 +165,7 @@ impl<S: LmState> Session<S> {
         }
         if common > 0 && self.state.truncate(common) {
             self.tokens.truncate(common);
+            self.media.retain(|&(start, _)| start < common);
             return common;
         }
         self.reset();

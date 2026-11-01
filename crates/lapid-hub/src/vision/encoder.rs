@@ -16,14 +16,15 @@
 //! Forward for one image: patches [N, C*P*P] (merge-block order) → `patch_embd` (+ bias) →
 //! `+ pos` → blocks (`x += attn(ln1 x)`, `x += mlp(ln2 x)`, bidirectional, 2-D RoPE over
 //! (row, col) when configured) → merger → [N / m², O]; DeepStack layers emit their own
-//! merged features.
+//! merged features. Taps: `vision.blocks.{i}`, `vision.merged`, `vision.deepstack.{j}`.
 
-use lapid::{DType, Device, Error, Result, Tensor};
+use lapid::{DType, Error, Result, Tensor};
 use lapid_nn::attention::{Mask, merge_heads, scaled_dot_product_attention};
 use lapid_nn::{Activation, Embedding, LayerNorm, Linear, Loader, RmsNorm};
 use serde::{Deserialize, Serialize};
 
 use super::processor::{Patches, block_order_positions};
+use crate::runtime::Taps;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -219,13 +220,6 @@ impl Merger {
     }
 }
 
-/// Encoder output for one image: merged tokens [T, O] and DeepStack features (each [T, O]).
-#[derive(Clone)]
-pub struct VisionOutput {
-    pub merged: Tensor,
-    pub deepstack: Vec<Tensor>,
-}
-
 /// Rotate x [B, H, S, Dh] by host tables cos / sin [S, Dh/2] (HF `rotate_half` pairing:
 /// element i with i + Dh/2, both using angle i).
 pub fn apply_rope_tables(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
@@ -366,8 +360,8 @@ impl VisionEncoder {
         b.out.forward(&merge_heads(&a)?.reshape(&[n, d])?)
     }
 
-    /// Graph of one image. With `trace`, collects ("vision.blocks.{i}", [N, D]).
-    pub fn build(&self, p: &Patches, mut trace: Option<&mut Vec<(String, Tensor)>>) -> Result<VisionOutput> {
+    /// Graph of one image: the merged tokens [N / m^2, O], then each DeepStack feature.
+    pub fn build(&self, p: &Patches, taps: &mut Taps) -> Result<Vec<Tensor>> {
         let n = p.len();
         let m = self.cfg.spatial_merge_size;
         if p.dim != self.cfg.patch_dim() || p.data.len() != n * p.dim {
@@ -384,7 +378,7 @@ impl VisionEncoder {
             x = x.add(&pe)?;
         }
         let rope = self.rope(p.grid_h, p.grid_w)?;
-        let mut deepstack = Vec::new();
+        let mut deep = Vec::new();
         for (i, b) in self.blocks.iter().enumerate() {
             x = x.add(&self.attention(b, &b.ln1.forward(&x)?, rope.as_ref())?)?;
             let h = b.ln2.forward(&x)?;
@@ -393,39 +387,19 @@ impl VisionEncoder {
                 None => self.act.apply(&b.up.forward(&h)?)?,
             };
             x = x.add(&b.down.forward(&up)?)?;
-            if let Some(tr) = trace.as_deref_mut() {
-                tr.push((format!("vision.blocks.{i}"), x.clone()));
-            }
+            taps.tap(format_args!("vision.blocks.{i}"), &x);
             if let Some(j) = self.cfg.deepstack_layers.iter().position(|&l| l == i) {
-                deepstack.push(self.deepstack[j].forward(&x, m)?);
+                deep.push(self.deepstack[j].forward(&x, m)?);
             }
         }
         let merged = self.merger.forward(&x, m)?;
-        Ok(VisionOutput { merged, deepstack })
-    }
-
-    /// Run one image and realize the outputs on the device.
-    pub fn encode(&self, device: &Device, p: &Patches) -> Result<VisionOutput> {
-        let out = self.build(p, None)?;
-        let mut refs = vec![&out.merged];
-        refs.extend(out.deepstack.iter());
-        let mut r = device.eval(&refs)?.into_iter();
-        let merged = r.next().ok_or_else(|| Error::new("backend", "vision: no output realized"))?;
-        Ok(VisionOutput { merged, deepstack: r.collect() })
-    }
-
-    /// Uncached run with every block output, the merged tokens ("vision.merged") and the
-    /// DeepStack features ("vision.deepstack.{j}") realized as host vectors.
-    pub fn forward_traced(&self, device: &Device, p: &Patches) -> Result<Vec<(String, Vec<f32>)>> {
-        let mut trace = Vec::new();
-        let out = self.build(p, Some(&mut trace))?;
-        trace.push(("vision.merged".into(), out.merged));
-        for (j, t) in out.deepstack.into_iter().enumerate() {
-            trace.push((format!("vision.deepstack.{j}"), t));
+        taps.tap("vision.merged", &merged);
+        for (j, t) in deep.iter().enumerate() {
+            taps.tap(format_args!("vision.deepstack.{j}"), t);
         }
-        let refs: Vec<&Tensor> = trace.iter().map(|(_, t)| t).collect();
-        let realized = device.eval(&refs)?;
-        trace.iter().zip(&realized).map(|((n, _), t)| Ok((n.clone(), device.to_vec_f32(t)?))).collect()
+        let mut out = vec![merged];
+        out.extend(deep);
+        Ok(out)
     }
 }
 

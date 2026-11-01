@@ -83,13 +83,7 @@ fn opt_usize(v: &Value, key: &str) -> Option<usize> {
     v.get(key).and_then(Value::as_u64).map(|x| x as usize)
 }
 
-fn ids(v: Option<&Value>) -> Vec<u32> {
-    match v {
-        Some(Value::Number(n)) => n.as_u64().map(|x| vec![x as u32]).unwrap_or_default(),
-        Some(Value::Array(a)) => a.iter().filter_map(Value::as_u64).map(|x| x as u32).collect(),
-        _ => Vec::new(),
-    }
-}
+use crate::runtime::chat::id_list as ids;
 
 impl Qwen35Config {
     /// Parse an HF config (top level with `text_config`, or the text config itself) or the

@@ -89,14 +89,6 @@ fn opt_bool(v: &Value, key: &str) -> Option<bool> {
     v.get(key).and_then(Value::as_bool)
 }
 
-pub(crate) fn ids(v: Option<&Value>) -> Vec<u32> {
-    match v {
-        Some(Value::Number(n)) => n.as_u64().map(|x| vec![x as u32]).unwrap_or_default(),
-        Some(Value::Array(a)) => a.iter().filter_map(Value::as_u64).map(|x| x as u32).collect(),
-        _ => Vec::new(),
-    }
-}
-
 fn parse_scaling(v: &Value) -> Result<RopeScaling> {
     if let Some(f) = v.get("rope_freq_factors").and_then(Value::as_array) {
         return Ok(RopeScaling::FreqFactors(f.iter().filter_map(Value::as_f64).map(|x| x as f32).collect()));
@@ -187,7 +179,7 @@ impl LlamaConfig {
                 .unwrap_or_default(),
             decoder_sparse_step: opt_usize(v, "decoder_sparse_step").unwrap_or(1).max(1),
             max_positions: opt_usize(v, "max_position_embeddings").unwrap_or(32_768),
-            eos: ids(v.get("eos_token_id")),
+            eos: crate::runtime::chat::id_list(v.get("eos_token_id")),
             bos: v.get("bos_token_id").and_then(Value::as_u64).map(|x| x as u32),
             pad: v.get("pad_token_id").and_then(Value::as_u64).map(|x| x as u32),
             model_type,

@@ -197,6 +197,7 @@ def main() -> int:
             pv = inputs["pixel_values"]
             n = pv.shape[0]
             tensors[f"{cname}.pixel_values"] = f32(pv.reshape(n, 3, 2, 16 * 16)[:, :, 0, :].reshape(n, -1))
+            case["image"] = "test.png"
             case["grid_thw"] = inputs["image_grid_thw"][0].tolist()
             mm = inputs.get("mm_token_type_ids")
             if mm is None:

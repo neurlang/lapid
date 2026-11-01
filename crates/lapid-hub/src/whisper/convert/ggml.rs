@@ -1,4 +1,5 @@
-//! whisper.cpp legacy ggml model file (`ggml-*.bin`) parser and ggml block dequantizers.
+//! whisper.cpp legacy ggml model file (`ggml-*.bin`) parser (tensor types and dequantizers:
+//! `lapid_convert::ggml`).
 //!
 //! ```text
 //! u32 magic 0x67676d6c ("ggml" as LE u32)
@@ -14,7 +15,7 @@
 use std::path::Path;
 
 use lapid::{Error, Result, bail};
-use half::{bf16, f16};
+pub(crate) use lapid_convert::ggml::{GgmlType, dequantize};
 
 pub(crate) const GGML_MAGIC: u32 = 0x6767_6d6c;
 
@@ -27,47 +28,6 @@ pub(crate) fn is_ggml_file(path: &Path) -> Result<bool> {
         Ok(()) => Ok(u32::from_le_bytes(m) == GGML_MAGIC),
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
         Err(e) => Err(Error::new("io", format!("{}: {e}", path.display()))),
-    }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum GgmlType {
-    F32,
-    F16,
-    Q4_0,
-    Q4_1,
-    Q5_0,
-    Q5_1,
-    Q8_0,
-    BF16,
-}
-
-impl GgmlType {
-    fn from_id(id: i32) -> Result<GgmlType> {
-        Ok(match id {
-            0 => GgmlType::F32,
-            1 => GgmlType::F16,
-            2 => GgmlType::Q4_0,
-            3 => GgmlType::Q4_1,
-            6 => GgmlType::Q5_0,
-            7 => GgmlType::Q5_1,
-            8 => GgmlType::Q8_0,
-            30 => GgmlType::BF16,
-            _ => bail!("unsupported_dtype", "unsupported ggml tensor type {id}"),
-        })
-    }
-
-    /// (elements per block, bytes per block)
-    pub(crate) fn block(self) -> (usize, usize) {
-        match self {
-            GgmlType::F32 => (1, 4),
-            GgmlType::F16 | GgmlType::BF16 => (1, 2),
-            GgmlType::Q4_0 => (32, 18),
-            GgmlType::Q4_1 => (32, 20),
-            GgmlType::Q5_0 => (32, 22),
-            GgmlType::Q5_1 => (32, 24),
-            GgmlType::Q8_0 => (32, 34),
-        }
     }
 }
 
@@ -199,7 +159,7 @@ impl GgmlModel {
         while c.pos < c.b.len() {
             let n_dims = c.count("n_dims", 4)?;
             let name_len = c.count("name length", 4096)?;
-            let ttype = GgmlType::from_id(c.i32()?)?;
+            let ttype = GgmlType::from_id(c.i32()? as u32);
             if n_dims == 0 || name_len == 0 {
                 bail!("format", "ggml: tensor record at byte {} has n_dims={n_dims} name_len={name_len}", c.pos);
             }
@@ -210,7 +170,7 @@ impl GgmlModel {
             let name = String::from_utf8(c.take(name_len)?.to_vec())
                 .map_err(|_| Error::new("format", "ggml: tensor name is not UTF-8"))?;
             let numel = ne.iter().try_fold(1usize, |a, &d| a.checked_mul(d)).ok_or_else(|| Error::new("format", "ggml: tensor too large"))?;
-            let (blk, bsz) = ttype.block();
+            let (blk, bsz) = ttype.block().ok_or_else(|| Error::new("unsupported_dtype", format!("ggml: tensor {name}: unsupported type {}", ttype.name())))?;
             if ne[0] % blk != 0 {
                 bail!("format", "ggml: tensor {name}: ne[0]={} not a multiple of block size {blk}", ne[0]);
             }
@@ -218,101 +178,5 @@ impl GgmlModel {
             out.push(GgmlTensor { name, ne, ttype, data });
         }
         Ok(out)
-    }
-}
-
-fn f16_at(b: &[u8], o: usize) -> f32 {
-    f16::from_le_bytes([b[o], b[o + 1]]).to_f32()
-}
-
-/// Dequantize `n` elements of ggml data to f32.
-pub(crate) fn dequantize(t: GgmlType, data: &[u8], n: usize) -> Result<Vec<f32>> {
-    let (blk, bsz) = t.block();
-    if !n.is_multiple_of(blk) || data.len() != n / blk * bsz {
-        bail!("format", "ggml {t:?}: {} bytes do not hold {n} elements", data.len());
-    }
-    let mut out = Vec::with_capacity(n);
-    match t {
-        GgmlType::F32 => out.extend(data.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))),
-        GgmlType::F16 => out.extend(data.as_chunks::<2>().0.iter().map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())),
-        GgmlType::BF16 => out.extend(data.as_chunks::<2>().0.iter().map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())),
-        GgmlType::Q8_0 => {
-            for b in data.chunks_exact(bsz) {
-                let d = f16_at(b, 0);
-                out.extend(b[2..34].iter().map(|&q| (q as i8) as f32 * d));
-            }
-        }
-        GgmlType::Q4_0 | GgmlType::Q4_1 => {
-            let has_min = t == GgmlType::Q4_1;
-            let qo = if has_min { 4 } else { 2 };
-            for b in data.chunks_exact(bsz) {
-                let d = f16_at(b, 0);
-                let (m, off) = if has_min { (f16_at(b, 2), 0) } else { (0.0, 8) };
-                let qs = &b[qo..qo + 16];
-                let mut blkv = [0f32; 32];
-                for j in 0..16 {
-                    blkv[j] = ((qs[j] & 0x0F) as i32 - off) as f32 * d + m;
-                    blkv[j + 16] = ((qs[j] >> 4) as i32 - off) as f32 * d + m;
-                }
-                out.extend_from_slice(&blkv);
-            }
-        }
-        GgmlType::Q5_0 | GgmlType::Q5_1 => {
-            let has_min = t == GgmlType::Q5_1;
-            let ho = if has_min { 4 } else { 2 };
-            for b in data.chunks_exact(bsz) {
-                let d = f16_at(b, 0);
-                let (m, off) = if has_min { (f16_at(b, 2), 0) } else { (0.0, 16) };
-                let qh = u32::from_le_bytes([b[ho], b[ho + 1], b[ho + 2], b[ho + 3]]);
-                let qs = &b[ho + 4..ho + 20];
-                let mut blkv = [0f32; 32];
-                for j in 0..16 {
-                    let xh0 = (((qh >> j) << 4) & 0x10) as i32;
-                    let xh1 = ((qh >> (j + 12)) & 0x10) as i32;
-                    blkv[j] = (((qs[j] & 0x0F) as i32 | xh0) - off) as f32 * d + m;
-                    blkv[j + 16] = (((qs[j] >> 4) as i32 | xh1) - off) as f32 * d + m;
-                }
-                out.extend_from_slice(&blkv);
-            }
-        }
-    }
-    Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dequant_q8_0_and_q4_0() {
-        let mut b = f16::from_f32(0.5).to_le_bytes().to_vec();
-        b.extend((0..32).map(|i| (i as i8 - 16) as u8));
-        let x = dequantize(GgmlType::Q8_0, &b, 32).expect("q8");
-        assert_eq!(x[0], -8.0);
-        assert_eq!(x[31], 7.5);
-        let mut b = f16::from_f32(2.0).to_le_bytes().to_vec();
-        b.extend([0xF0u8; 16]);
-        let x = dequantize(GgmlType::Q4_0, &b, 32).expect("q4");
-        assert_eq!((x[0], x[16]), (-16.0, 14.0));
-    }
-
-    #[test]
-    fn dequant_q5_0_high_bits() {
-        // qh bit j set -> element j gets +16; with all nibbles 0 and off 16: (16-16)*d = 0.
-        let mut b = f16::from_f32(1.0).to_le_bytes().to_vec();
-        b.extend(0x0000_ffffu32.to_le_bytes());
-        b.extend([0u8; 16]);
-        let x = dequantize(GgmlType::Q5_0, &b, 32).expect("q5");
-        assert!(x[..16].iter().all(|&v| v == 0.0));
-        assert!(x[16..].iter().all(|&v| v == -16.0));
-    }
-
-    #[test]
-    fn dequant_q4_1_min() {
-        let mut b = f16::from_f32(1.0).to_le_bytes().to_vec();
-        b.extend(f16::from_f32(-3.0).to_le_bytes());
-        b.extend([0x21u8; 16]);
-        let x = dequantize(GgmlType::Q4_1, &b, 32).expect("q4_1");
-        assert_eq!((x[0], x[16]), (-2.0, -1.0));
     }
 }

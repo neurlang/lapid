@@ -2,7 +2,7 @@
 //! by [`super::convert`] from the checkpoint's `config.json`, `generation_config.json` and
 //! `processor_config.json`).
 
-use lapid::{Error, Result};
+use lapid::{Error, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -29,7 +29,7 @@ pub struct FlowConfig {
     pub frequency_embedding_size: usize,
     pub norm_eps: f32,
     pub time_norm_eps: f32,
-    /// `"lsd"` (two time conditions) — the only flow type released checkpoints use.
+    /// `"lsd"` (two time conditions): the only flow type released checkpoints use.
     pub flow_type: String,
 }
 
@@ -130,6 +130,120 @@ pub struct PhononConfig {
     pub generation: GenerationConfig,
     pub tokens: TokenIds,
     pub assets: Assets,
+}
+
+fn f(v: &Value, path: &str) -> Result<f64> {
+    v.pointer(path)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| Error::new("missing_metadata", format!("config: missing number {path}")))
+}
+
+fn u(v: &Value, path: &str) -> Result<usize> {
+    v.pointer(path)
+        .and_then(Value::as_u64)
+        .map(|x| x as usize)
+        .ok_or_else(|| Error::new("missing_metadata", format!("config: missing integer {path}")))
+}
+
+fn opt_f(v: Option<&Value>, key: &str, default: f64) -> f64 {
+    v.and_then(|v| v.get(key)).and_then(Value::as_f64).unwrap_or(default)
+}
+
+fn opt_u(v: Option<&Value>, key: &str, default: usize) -> usize {
+    v.and_then(|v| v.get(key)).and_then(Value::as_u64).map_or(default, |x| x as usize)
+}
+
+/// `PhononConfig` from the package's JSON files (`config.json`, `generation_config.json`,
+/// `processor_config.json`).
+pub fn from_hf(cfg: &Value, generation: Option<&Value>, processor: Option<&Value>) -> Result<PhononConfig> {
+    let ratios: Vec<usize> = cfg
+        .pointer("/mimi/ratios")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_u64).map(|x| x as usize).collect())
+        .ok_or_else(|| Error::new("missing_metadata", "config: missing mimi.ratios"))?;
+    let sample_rate = u(cfg, "/mimi/sample_rate")?;
+    let frame_rate = f(cfg, "/mimi/frame_rate")?;
+    let hop: usize = ratios.iter().product();
+    let samples_per_frame = (sample_rate as f64 / frame_rate).round() as usize;
+    if hop == 0 || !samples_per_frame.is_multiple_of(hop) {
+        bail!("unsupported_model", "mimi: frame size {samples_per_frame} is not a multiple of the hop {hop}");
+    }
+    let fh = cfg.get("flow_head_config");
+    Ok(PhononConfig {
+        lm: LmConfig {
+            d_model: u(cfg, "/hidden_size")?,
+            n_heads: u(cfg, "/num_attention_heads")?,
+            n_layers: u(cfg, "/num_hidden_layers")?,
+            ffn_dim: u(cfg, "/intermediate_size")?,
+            rope_theta: cfg.pointer("/rope_parameters/rope_theta").and_then(Value::as_f64).unwrap_or(10000.0) as f32,
+            norm_eps: opt_f(Some(cfg), "layer_norm_eps", 1e-5) as f32,
+            latent_dim: u(cfg, "/latent_dim")?,
+            vocab_size: u(cfg, "/vocab_size")?,
+            audio_prompt_dim: opt_u(Some(cfg), "audio_prompt_dim", 512),
+        },
+        flow: FlowConfig {
+            dim: opt_u(fh, "hidden_size", u(cfg, "/flow_lm/flow_dim")?),
+            depth: opt_u(fh, "num_hidden_layers", u(cfg, "/flow_lm/flow_depth")?),
+            frequency_embedding_size: opt_u(fh, "frequency_embedding_size", 256),
+            norm_eps: opt_f(fh, "layer_norm_eps", 1e-6) as f32,
+            time_norm_eps: opt_f(fh, "rms_norm_eps", 1e-5) as f32,
+            flow_type: fh.and_then(|h| h.get("flow_type")).and_then(Value::as_str).unwrap_or("lsd").to_string(),
+        },
+        conditions: ConditionConfig {
+            num_speakers: opt_u(Some(cfg), "num_speakers", 1),
+            duration_delta: opt_f(Some(cfg), "duration_delta", 0.0) as f32,
+            duration_delta_dim: opt_u(Some(cfg), "duration_delta_embedding_dim", 128),
+            duration_delta_scale: opt_f(Some(cfg), "duration_delta_scale", 1000.0) as f32,
+            duration_delta_max_period: opt_f(Some(cfg), "duration_delta_max_period", 10000.0) as f32,
+        },
+        mimi: MimiConfig {
+            sample_rate: sample_rate as u32,
+            frame_rate: frame_rate as f32,
+            dimension: u(cfg, "/mimi/dimension")?,
+            latent_dim: u(cfg, "/mimi/quantizer_dimension")?,
+            n_filters: u(cfg, "/mimi/n_filters")?,
+            n_residual_layers: u(cfg, "/mimi/n_residual_layers")?,
+            ratios,
+            kernel_size: u(cfg, "/mimi/kernel_size")?,
+            last_kernel_size: u(cfg, "/mimi/last_kernel_size")?,
+            residual_kernel_size: u(cfg, "/mimi/residual_kernel_size")?,
+            dilation_base: u(cfg, "/mimi/dilation_base")?,
+            compress: u(cfg, "/mimi/compress")?,
+            upsample_stride: samples_per_frame / hop,
+            channels: u(cfg, "/mimi/channels")?,
+            transformer: MimiTransformerConfig {
+                d_model: u(cfg, "/mimi/transformer_d_model")?,
+                n_heads: u(cfg, "/mimi/transformer_num_heads")?,
+                n_layers: u(cfg, "/mimi/transformer_num_layers")?,
+                ffn_dim: u(cfg, "/mimi/transformer_dim_feedforward")?,
+                rope_theta: f(cfg, "/mimi/transformer_max_period")? as f32,
+                window: u(cfg, "/mimi/transformer_context")? + 1,
+                norm_eps: 1e-5,
+            },
+        },
+        generation: GenerationConfig {
+            temperature: opt_f(generation, "temperature", 0.3) as f32,
+            eos_threshold: opt_f(generation, "eos_threshold", opt_f(Some(cfg), "eos_threshold", 4.0)) as f32,
+            num_flow_steps: opt_u(generation, "num_flow_steps", 1).max(1),
+            min_frames_before_eos: opt_u(generation, "min_frames_before_eos", 0),
+            frames_after_eos: opt_u(processor, "frames_after_eos", 2),
+            frames_after_eos_short_text: opt_u(processor, "frames_after_eos_short_text", 4),
+            short_text_max_words: opt_u(processor, "short_text_max_words", 4),
+            fade_in_duration: opt_f(processor, "fade_in_duration", 0.005) as f32,
+        },
+        tokens: TokenIds {
+            pad: opt_u(Some(cfg), "pad_token_id", 3) as u32,
+            audio_bos: opt_u(Some(cfg), "audio_bos_token_id", 4) as u32,
+            audio_prompt: opt_u(Some(cfg), "audio_prompt_token_id", 5) as u32,
+            audio_latent: opt_u(Some(cfg), "audio_latent_token_id", 6) as u32,
+        },
+        assets: Assets {
+            tokenizer: "tokenizer/tokenizer.json".to_string(),
+            tokenizer_model: None,
+            voice_prefix: "voices.".to_string(),
+            default_voice: "default".to_string(),
+        },
+    })
 }
 
 impl PhononConfig {

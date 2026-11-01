@@ -31,17 +31,19 @@ tower with clipped linears + standardize, 6-layer text decoder with PLE, kv shar
 attention (llama.cpp treats Gemma 4 models with per-layer embeddings as causal, so the GGUF +
 mmproj pair of this variant is checked: `data/reference/gemma4vl/tiny_causal`).
 
-Writes:
+Writes (the shared vision-LM reference layout of `lapid_hub::runtime::vlm_verify`, one case
+named `image`):
   <out>/image.png
   <out>/activations.safetensors
-      pixel_values [N, 3*p*p] (real patches only, rescaled to [0,1]), positions [N, 2] (x, y; f32)
-      vision.embed [N, Dv] (patch embedder), vision.layers.{i} [N, Dv], vision.pooled [M, Dv]
-      (pooler + standardize), vision.projected [M, D] (embed_vision)
-      mm.embed [S, D] (merged input embeddings), mm.layers.{i}.attn / mm.layers.{i} [S, D],
-      mm.norm [S, D], mm.logits.last [1, V], mm.gen.logits [K, V]
+      image.pixel_values [N, 3*p*p] (real patches only, rescaled to [0,1]), image.positions [N, 2]
+      (x, y; f32), image.vision.embed [N, Dv] (patch embedder), image.vision.layers.{i} [N, Dv],
+      image.vision.pooled [M, Dv] (pooler + standardize), image.vision.projected [M, D]
+      (embed_vision), image.embed [S, D] (merged input embeddings), image.layers.{i}.attn /
+      image.layers.{i} [S, D], image.logits.last [1, V], image.gen.logits [K, V]
   <out>/result.json
-      prompt_text (template output), prompt_tokens (expanded ids), n_soft, grid [ph, pw],
-      generated_tokens, generated_text, image_token_id, boi/eoi ids, versions
+      max_soft_tokens, token ids, versions; cases.image: messages_json, prompt_text (template
+      output), prompt_tokens (expanded ids), image, enable_thinking, n_soft, grid [ph, pw],
+      generated_tokens, generated_text
 """
 
 from __future__ import annotations
@@ -230,6 +232,8 @@ def main() -> int:
     tensors["mm.gen.logits"] = f32(torch.stack([l[0] for l in gout.logits])[: args.gen_logit_steps])
     print(f"{ids.shape[1]} prompt tokens ({n_soft} soft, grid {ph}x{pw}) -> {tok.decode(gen)!r}", file=sys.stderr)
 
+    tensors.pop("mm.norm", None)
+    tensors = {"image." + (k[3:] if k.startswith("mm.") else k): v for k, v in tensors.items()}
     save_file(tensors, str(args.out / "activations.safetensors"))
     import transformers
 
@@ -238,16 +242,19 @@ def main() -> int:
         "model": args.model if not args.tiny else "tiny-random-gemma4-vision",
         "dtype": "fp32",
         "device": "cpu",
-        "image": "image.png",
-        "messages_json": json.dumps(messages),
-        "prompt": PROMPT,
-        "prompt_text": text,
-        "prompt_tokens": ids[0].tolist(),
-        "n_soft": n_soft,
         "max_soft_tokens": proc.image_processor.max_soft_tokens,
-        "grid": [ph, pw],
-        "generated_tokens": gen,
-        "generated_text": tok.decode(gen, skip_special_tokens=False),
+        "cases": {"image": {
+            "messages_json": json.dumps(messages),
+            "prompt": PROMPT,
+            "prompt_text": text,
+            "prompt_tokens": ids[0].tolist(),
+            "image": "image.png",
+            "enable_thinking": False,
+            "n_soft": n_soft,
+            "grid": [ph, pw],
+            "generated_tokens": gen,
+            "generated_text": tok.decode(gen, skip_special_tokens=False),
+        }},
         "image_token_id": cfg.image_token_id,
         "boi_token_id": cfg.boi_token_id,
         "eoi_token_id": cfg.eoi_token_id,

@@ -18,7 +18,7 @@ use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Pr
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::served::Capability;
+use lapid_hub::runtime::serve::Capability;
 use crate::worker::Worker;
 
 /// Shared server state.

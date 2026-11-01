@@ -68,11 +68,12 @@ impl ModelEntry {
 }
 
 /// Migrated models.
-pub static MODELS: &[&ModelEntry] = &[&crate::lfm3::ENTRY];
+pub static MODELS: &[&ModelEntry] = &[&crate::lfm3::ENTRY, &crate::deepseek4::ENTRY, &crate::embeddinggemma::ENTRY, &crate::phonon::ENTRY, &crate::llama::ENTRY, &crate::qwen35::ENTRY, &crate::qwen4exp::ENTRY, &crate::whisper::ENTRY, &crate::parakeet::ENTRY, &crate::zipformer::ENTRY, &crate::vad::ENTRY, &crate::gemma4::ENTRY, &crate::gemma4::MOE_ENTRY, &crate::gemma4::VL_ENTRY, &crate::qwen3vl::ENTRY];
 
-/// Entry by verify/bench name or `.lapid` architecture.
+/// Entry by verify/bench name or `.lapid` architecture (a spec's GGUF architectures name
+/// the variants it writes too, e.g. `qwen3` / `qwen3moe` files of `llama`).
 pub fn find(name: &str) -> Option<&'static ModelEntry> {
-    MODELS.iter().copied().find(|e| e.name == name || e.convert.architecture == name)
+    MODELS.iter().copied().find(|e| e.name == name || e.convert.architecture == name || e.convert.gguf_architectures.contains(&name))
 }
 
 /// Entry converting HF `config.json` `model_type`.

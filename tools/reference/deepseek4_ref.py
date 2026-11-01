@@ -45,7 +45,7 @@ Writes:
       short.gen.logits [K,V] (raw logits of greedy steps), long.layers.{i}.tail [T,4D],
       long.logits.last [1,V], long.gen.logits [K,V]
   <out>/result.json
-      cases.{short,long}: messages_json, thinking, prompt_text, prompt_tokens, generated_tokens,
+      cases.{short,long}: messages_json, thinking (also as enable_thinking, the shared key), prompt_text, prompt_tokens, generated_tokens,
       generated_text; template_cases (DeepSeek V4 `encoding_dsv4.encode_messages`); tokenizer_cases
 """
 
@@ -495,6 +495,7 @@ def main() -> int:
         cases[cname] = {
             "messages_json": json.dumps(messages, ensure_ascii=False),
             "thinking": thinking,
+            "enable_thinking": thinking,
             "prompt_text": prompt,
             "prompt_tokens": ids[0].tolist(),
             "generated_tokens": gen,
@@ -508,6 +509,7 @@ def main() -> int:
         {
             "messages_json": json.dumps(c["messages"], ensure_ascii=False),
             "thinking": c["thinking"],
+            "enable_thinking": c["thinking"],
             "text": enc.encode_messages(c["messages"], thinking_mode="thinking" if c["thinking"] else "chat"),
         }
         for c in TEMPLATE_CASES

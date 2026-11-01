@@ -1,24 +1,21 @@
 //! lapid-server: an OpenAI-compatible HTTP server with an embedded web UI for lapid hub
 //! models (`lapid serve`), and the interactive terminal runner (`lapid run`).
 //!
-//! Each loaded model lives on its own worker thread ([`worker::Worker`]) behind a
-//! [`served::Served`] adapter; requests to one model run one at a time in arrival order.
+//! Each loaded model lives on its own worker thread ([`worker::Worker`]) as a
+//! `lapid_hub::AnyModel` (see `lapid_hub::load`); requests to one model run one at a time in
+//! arrival order.
 //!
 //! Endpoints: `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/completions`,
 //! `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`,
 //! `POST /v1/audio/speech`, `GET /health`, `GET /api/info`, and the web UI on every other path.
 
-pub use lapid_hub::runtime::serve::adapters;
 pub mod api;
 mod assets;
 pub mod cli;
 pub mod format;
 pub mod hf;
-pub use lapid_hub::runtime::serve::llm;
 pub mod load;
 pub mod run;
-pub mod served;
-pub use lapid_hub::runtime::serve::text;
 pub mod worker;
 
 use std::sync::Arc;
@@ -68,8 +65,8 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     let mut resolved = Vec::new();
     for arg in &opts.models {
         let spec = ModelSpec::parse(arg);
-        let (path, default_id) = load::resolve(&spec.source, opts.load.dtype.as_deref())?;
-        resolved.push((path, spec.id.unwrap_or(default_id)));
+        let r = lapid_hub::runtime::resolve::resolve(&spec.source, opts.load.dtype.as_deref())?;
+        resolved.push((r.path, spec.id.unwrap_or(r.id)));
     }
     let mut ids: Vec<&str> = resolved.iter().map(|(_, id)| id.as_str()).collect();
     ids.sort_unstable();

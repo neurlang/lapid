@@ -42,7 +42,8 @@ pub fn gather_rows<T: Copy>(data: &[T], order: &[usize]) -> Result<Vec<T>> {
 }
 
 /// Fold an inference BatchNorm that follows a convolution / linear layer into its weight
-/// `w` (`[out, ...]`) and bias: `w' = w * g / sqrt(var + eps)`, `b' = (b - mean) * g / sqrt(var + eps) + beta`.
+/// `w` (`[out, ...]`) and bias: `w' = w * g / sqrt(var + eps)`, `b' = (b - mean) * g / sqrt(var + eps) + beta`
+/// (computed in f64).
 pub fn fold_batchnorm(
     w: &[f32],
     b: Option<&[f32]>,
@@ -50,7 +51,7 @@ pub fn fold_batchnorm(
     beta: &[f32],
     mean: &[f32],
     var: &[f32],
-    eps: f32,
+    eps: f64,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     let c = gamma.len();
     if c == 0 || beta.len() != c || mean.len() != c || var.len() != c || !w.len().is_multiple_of(c) || b.is_some_and(|b| b.len() != c) {
@@ -60,9 +61,9 @@ pub fn fold_batchnorm(
     let mut w2 = Vec::with_capacity(w.len());
     let mut b2 = Vec::with_capacity(c);
     for o in 0..c {
-        let s = gamma[o] / (var[o] + eps).sqrt();
-        w2.extend(w[o * per..(o + 1) * per].iter().map(|x| x * s));
-        b2.push((b.map_or(0.0, |b| b[o]) - mean[o]) * s + beta[o]);
+        let s = f64::from(gamma[o]) / (f64::from(var[o]) + eps).sqrt();
+        w2.extend(w[o * per..(o + 1) * per].iter().map(|&x| (f64::from(x) * s) as f32));
+        b2.push(((b.map_or(0.0, |b| f64::from(b[o])) - f64::from(mean[o])) * s + f64::from(beta[o])) as f32);
     }
     Ok((w2, b2))
 }

@@ -50,7 +50,10 @@ pub type Lfm3 = Llm<Lfm3Model>;
 `taps.tap("layers.{i}", &x)` for every intermediate the reference names, and return the logits
 of `rows`. `Llm<M>` then gives `from_hub`, `load`, `load_bytes`, chunked prefill, decode,
 sessions with prefix reuse, chat templates (Jinja), sampling, stop tokens and strings,
-streaming, cancellation and timing.
+streaming, cancellation and timing. Templates that read globals beyond messages / tools / thinking
+(Llama 3.x `date_string`) get them from `CausalLm::template_globals` (model defaults) or
+`ChatOptions::template_vars` (per call); `lapid verify` passes a reference's
+`template_globals` / `date_string`.
 
 Building blocks live in `lapid-nn` (`Attention`, `KvCache`, `Rope`, `ZeroTailRope`,
 `GatedMlp`, `Conv1d`, norms, `Loader::linear_checked` ...). If a model needs a piece that is
@@ -99,6 +102,28 @@ Add `&crate::<model>::ENTRY` to `runtime::registry::MODELS`. That one line gives
 `lapid convert`, `lapid verify <model>` (template, tokenizer, layer by layer taps, cached
 decode, greedy tokens, fake-quant kernel check for quantized files), `lapid bench <model>`,
 calibrated int4, `lapid run` and `lapid serve`.
+
+Other pipelines follow the same pattern with their own definition trait and entry:
+
+| Kind | Definition | Entry | Model-specific verify part |
+|---|---|---|---|
+| Text embeddings | `embedding::EmbedderDef` (`DESCRIPTOR`, `CONVERT`, `from_file`) | `ModelEntry::embedder::<M>()` | none: taps from `encode` / `project`, cosine of `embed` vs the reference, Matryoshka sizes |
+| Speech synthesis | `tts::SpeechDef` (adds `request_options`, `tokens`) | `ModelEntry::speech::<M>()` | `reference_stages` (teacher-forced stages) and `reference_speech` (free run on the reference noise) |
+| Speech recognition, other audio | `audio::AudioDef` (adds `stages`, `end_to_end`, `bench_run`); recognizers also `audio::AsrModel` | `audio::asr_entry::<M>()`, `audio::audio_entry::<M>()` | `stages` (rows on the reference inputs: front end, encoder taps, step logits), `end_to_end` (tokens / text checks), `bench_run` (stage times) |
+| Image + text LM | `vlm::VisionLm` on top of `CausalLm` (`prepare_image`, `encode_image`, `forward_media`, `image_tokens`) | `ModelEntry::causal_lm::<M>()` with `verify` / `bench` set to `vlm_verify::{verify, bench}` | `reference_image` (the reference's prepared pixels), `media_taps` (encoder outputs the decoder check can take from the reference) |
+
+The generic harnesses are `runtime::embedding_harness`, `runtime::tts_harness` and
+`runtime::audio_verify` / `audio_bench` (EmbeddingGemma, Phonon, and Whisper (seq2seq),
+Parakeet (offline TDT) and Zipformer (streaming RNN-T) are the worked examples). Checkpoints with more than
+`config.json` + weights (sentence-transformers modules, voice files, model cards) use
+`ConvertHooks::hf_extras` to add weight files, blobs and metadata.
+
+Vision-language models (Gemma 4 is the worked example) get chat with image parts
+(`vision::Message`), placeholder expansion, image encoding and image-aware session reuse
+from `Llm::mm_prompt` / `mm_generate` / `mm_chat_stream`. A GGUF model whose vision tower
+ships as a separate llama.cpp `mmproj` converts as one file through
+`ConvertHooks::gguf_companion` (usually `engine::sibling_mmproj`), `companion_names` and
+`companion_config`.
 
 ## 4. Check
 

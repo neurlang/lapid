@@ -53,8 +53,6 @@ pub mod convert;
 pub mod deepseek4;
 pub mod embeddinggemma;
 pub mod gemma4;
-pub mod gemma4moe;
-pub mod gemma4vl;
 pub mod lfm3;
 pub mod llama;
 pub mod model;
