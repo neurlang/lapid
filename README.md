@@ -18,11 +18,14 @@
 
 ## Why
 
-- **ONNX Runtime** is fast on NVIDIA, slow on other GPUs, and big and hard to change.
-- **llama.cpp** is fast, but you need a different build for each GPU.
-- **Other Rust libraries** each miss something: candle supports few GPUs, burn is made for training, tract runs only on CPU.
-
-**lapid** is one small Rust library that runs fast on every GPU, and you can read and change all of it.
+| | The problem |
+|---|---|
+| **ONNX Runtime** | Fast on NVIDIA, slow on other GPUs, big and hard to change |
+| **llama.cpp** | Fast, but you need a different build for each GPU |
+| **candle** | Supports few GPUs |
+| **burn** | Made for training |
+| **tract** | Runs only on CPU |
+| **lapid** | One small Rust library, fast on every GPU, and you can read and change all of it |
 
 ## Quick start
 

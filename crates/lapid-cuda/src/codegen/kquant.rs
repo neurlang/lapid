@@ -336,7 +336,7 @@ pub(crate) fn mma_b_parts(d: DType, lds: usize) -> (String, String, String) {
     let six = d == DType::Q6K;
     let mut regs = String::from("    .reg .pred %bv;\n");
     if six {
-        regs.push_str("    .reg .b32 %kq<8>;\n    .reg .b32 %kh<8>;\n    .reg .s32 %ks;\n    .reg .b16 %kd;\n");
+        regs.push_str("    .reg .b32 %kq<4>;\n    .reg .b32 %kh<4>;\n    .reg .s32 %ks;\n    .reg .b16 %kd;\n");
     } else {
         regs.push_str("    .reg .b32 %kw<4>;\n    .reg .b32 %kq<4>;\n");
         if d == DType::Q5K {
@@ -376,17 +376,28 @@ pub(crate) fn mma_b_parts(d: DType, lds: usize) -> (String, String, String) {
         g.op(format!("mad.lo.u32 {o}, {half}, 16, {o}"));
         g.op(format!("cvt.u64.u32 {a}, {o}"));
         g.op(format!("add.s64 {a}, {a}, {base}"));
-        for i in 0..8 {
-            g.op(format!("ld.global.nc.u16 %kq{i}, [{a}+{}]", 2 * i));
-        }
+        // blocks are 210 bytes (2-byte aligned): 16 bytes = 5 aligned words + funnel shifts
+        let load16 = |g: &mut Gen, a: &str, dst: &str| {
+            let (al, lo32, sh) = (g.reg("b64"), g.reg("u32"), g.reg("u32"));
+            let x: Vec<String> = (0..5).map(|_| g.reg("b32")).collect();
+            g.op(format!("and.b64 {al}, {a}, -4"));
+            g.op(format!("cvt.u32.u64 {lo32}, {a}"));
+            g.op(format!("and.b32 {sh}, {lo32}, 3"));
+            g.op(format!("shl.b32 {sh}, {sh}, 3"));
+            for (i, xi) in x.iter().enumerate() {
+                g.op(format!("ld.global.nc.u32 {xi}, [{al}+{}]", 4 * i));
+            }
+            for i in 0..4 {
+                g.op(format!("shf.r.clamp.b32 %{dst}{i}, {}, {}, {sh}", x[i], x[i + 1]));
+            }
+        };
+        load16(&mut g, &a, "kq");
         // qh bytes 128 + 32n + 16*half .. +16
         g.op(format!("mad.lo.u32 {o}, {n}, 32, 128"));
         g.op(format!("mad.lo.u32 {o}, {half}, 16, {o}"));
         g.op(format!("cvt.u64.u32 {a}, {o}"));
         g.op(format!("add.s64 {a}, {a}, {base}"));
-        for i in 0..8 {
-            g.op(format!("ld.global.nc.u16 %kh{i}, [{a}+{}]", 2 * i));
-        }
+        load16(&mut g, &a, "kh");
         // scale 192 + 8n + half + 2qq
         g.op(format!("mad.lo.u32 {o}, {n}, 8, {half}"));
         g.op(format!("mad.lo.u32 {o}, {qq}, 2, {o}"));
@@ -442,20 +453,23 @@ pub(crate) fn mma_b_parts(d: DType, lds: usize) -> (String, String, String) {
         g.op(format!("shr.u32 {sh}, {qq}, 1"));
         g.op(format!("shl.b32 {sh}, {sh}, 2"));
         g.op(format!("shl.b32 {hs}, {qq}, 1"));
-        let pos = g.reg("u32");
-        for t in 0..16 {
-            let byte = 8 * (t % 2);
-            g.op(format!("add.u32 {pos}, {sh}, {byte}"));
-            g.op(format!("bfe.u32 {q}, %kq{}, {pos}, 4", t / 2));
-            g.op(format!("add.u32 {pos}, {hs}, {byte}"));
-            g.op(format!("bfe.u32 {h}, %kh{}, {pos}, 2", t / 2));
+        // 4 values per word: (ql >> sh) & 0xF | ((qh >> hs) & 3) << 4, minus 32
+        let (b, m32) = (g.reg("u32"), g.reg("f32"));
+        g.op(format!("mul.f32 {m32}, {ds}, 0fC2000000"));
+        for w in 0..4 {
+            g.op(format!("shr.b32 {q}, %kq{w}, {sh}"));
+            g.op(format!("and.b32 {q}, {q}, 0x0F0F0F0F"));
+            g.op(format!("shr.b32 {h}, %kh{w}, {hs}"));
+            g.op(format!("and.b32 {h}, {h}, 0x03030303"));
             g.op(format!("shl.b32 {h}, {h}, 4"));
             g.op(format!("or.b32 {q}, {q}, {h}"));
-            g.op(format!("sub.s32 {q}, {q}, 32"));
-            g.op(format!("cvt.rn.f32.s32 {f}, {q}"));
-            let v = g.reg("f32");
-            g.op(format!("mul.f32 {v}, {ds}, {f}"));
-            vals.push(v);
+            for j in 0..4 {
+                g.op(format!("bfe.u32 {b}, {q}, {}, 8", 8 * j));
+                g.op(format!("cvt.rn.f32.u32 {f}, {b}"));
+                let v = g.reg("f32");
+                g.op(format!("fma.rn.f32 {v}, {ds}, {f}, {m32}"));
+                vals.push(v);
+            }
         }
     } else {
         let (dd, dm) = d_dmin(&mut g, "%kw0");
