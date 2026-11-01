@@ -25,6 +25,16 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: crates/lapid-server/ui/pnpm-lock.yaml
+      - name: Build web UI
+        run: pnpm -C crates/lapid-server/ui install --frozen-lockfile && pnpm -C crates/lapid-server/ui build
       - name: Build
         run: cargo build --workspace --locked
       # GPU tests skip themselves when no Vulkan adapter / Metal device is present
@@ -36,8 +46,7 @@ jobs:
       - name: Pure-Rust dependency check
         if: runner.os == 'Linux'
         run: tools/check_pure.sh
+      # lapid-c's build.rs regenerates include/lapid.h; the committed copy must match.
       - name: C header is up to date
         if: runner.os == 'Linux'
-        run: |
-          cargo install cbindgen --locked --version 0.29.2
-          tools/check_c_header.sh
+        run: git diff --exit-code crates/lapid-c/include/lapid.h

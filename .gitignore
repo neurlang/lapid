@@ -4,3 +4,5 @@
 __pycache__/
 .venv/
 /plans
+/crates/lapid-server/ui/dist
+/crates/lapid-server/ui/node_modules

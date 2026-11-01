@@ -1,0 +1,29 @@
+[package]
+name = "lapid-c"
+description = "C API for lapid (lapid.h): devices, model files, lazy tensors and ops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# `liblapid.a` / `liblapid.so` / `liblapid.dylib`, `lapid.lib` + `lapid.dll` on Windows.
+name = "lapid"
+crate-type = ["staticlib", "cdylib"]
+# The C examples are compiled by tests/c_examples.rs.
+doctest = false
+# Its rustdoc would collide with the engine crate, also named `lapid`; see include/lapid.h.
+doc = false
+
+[dependencies]
+# Renamed: this crate's own library is called `lapid`.
+engine = { package = "lapid", path = "../lapid" }
+serde_json.workspace = true
+
+[build-dependencies]
+cbindgen = { version = "0.29", default-features = false }
+
+[dev-dependencies]
+lapid-format.workspace = true
+lapid-tensor.workspace = true
+serde_json.workspace = true

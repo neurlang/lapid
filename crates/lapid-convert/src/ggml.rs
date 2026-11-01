@@ -123,6 +123,12 @@ impl GgmlType {
             GgmlType::Q5K => (QK_K, 176),
             GgmlType::Q6K => (QK_K, 210),
             GgmlType::Q8K => (QK_K, 292),
+            // Plain integer / f64 tensors and MXFP4 ({e8m0 scale, 16 bytes of e2m1 pairs}).
+            GgmlType::Other(24) => (1, 1),
+            GgmlType::Other(25) => (1, 2),
+            GgmlType::Other(26) => (1, 4),
+            GgmlType::Other(27 | 28) => (1, 8),
+            GgmlType::Other(MXFP4) => (32, 17),
             GgmlType::Other(_) => return None,
         })
     }
@@ -201,9 +207,29 @@ pub fn dequantize(t: GgmlType, data: &[u8], n: usize) -> Result<Vec<f32>> {
                 out.extend(b[4..4 + QK_K].iter().map(|&q| d * (q as i8) as f32));
             }
         }
+        GgmlType::Other(24) => out.extend(data.iter().map(|&b| f32::from(b as i8))),
+        GgmlType::Other(25) => out.extend(data.chunks_exact(2).map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])))),
+        GgmlType::Other(26) => out.extend(data.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)),
+        GgmlType::Other(27) => out.extend(data.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap_or([0; 8])) as f32)),
+        GgmlType::Other(28) => out.extend(data.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap_or([0; 8])) as f32)),
+        GgmlType::Other(MXFP4) => blocks.for_each(|b| mxfp4(b, &mut out)),
         GgmlType::Other(_) => return Err(unsupported(t)),
     }
     Ok(out)
+}
+
+/// ggml type id of MXFP4.
+const MXFP4: u32 = 39;
+
+/// block_mxfp4 {e (e8m0), qs[16]}: x[j] = kv[qs[j] & 15] * d, x[j + 16] = kv[qs[j] >> 4] * d with
+/// kv = 2 * e2m1 and d = 2^(e - 128) (ggml's `GGML_E8M0_TO_FP32_HALF`).
+fn mxfp4(b: &[u8], out: &mut Vec<f32>) {
+    const KV: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+    let bits: u32 = if b[0] < 2 { 0x0020_0000 << b[0] } else { u32::from(b[0] - 1) << 23 };
+    let d = f32::from_bits(bits);
+    let qs = &b[1..17];
+    out.extend(qs.iter().map(|&q| f32::from(KV[usize::from(q & 15)]) * d));
+    out.extend(qs.iter().map(|&q| f32::from(KV[usize::from(q >> 4)]) * d));
 }
 
 /// block_q4_0 {d, qs[16]} / block_q4_1 {d, m, qs[16]}.

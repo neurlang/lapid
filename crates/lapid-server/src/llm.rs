@@ -1,0 +1,230 @@
+//! Chat / completion adapter for the hub's text-generation models (LFM3, Qwen3.5, Gemma 4).
+//! They share one generation surface (`TokenStream`, `GenerateOptions`); [`Llm`] names it
+//! once so a single [`LlmServed`] serves all of them with a small pool of sessions: a
+//! request reuses the session whose consumed tokens are a prefix of its prompt (the earlier
+//! turns of a conversation), so only the new tokens are prefilled.
+
+use lapid::{Error, Result};
+use lapid_hub::lfm3::{FinishReason, GenerateOptions, TokenStream};
+use lapid_hub::{Gemma4, Lfm3, ModelInfo, Qwen35};
+use lapid_nn::SamplingParams;
+
+use crate::served::{Capability, ChatParams, Delta, GenParams, GenSummary, ModelMeta, Served};
+use crate::text::{OutputFilter, ThinkSplitter};
+
+/// The generation surface the adapter needs from a hub LLM.
+pub trait Llm {
+    type Session;
+    fn new_session(&self) -> Self::Session;
+    fn session_tokens(s: &Self::Session) -> &[u32];
+    fn render(&self, messages: &str, tools: Option<&str>, enable_thinking: Option<bool>) -> Result<String>;
+    fn encode(&self, text: &str) -> Result<Vec<u32>>;
+    fn generate<'a>(&'a self, s: &'a mut Self::Session, prompt: &[u32], opts: GenerateOptions) -> Result<TokenStream<'a>>;
+    fn recommended(&self) -> SamplingParams;
+    fn info(&self) -> ModelInfo;
+    /// Reasoning block markers (open, close).
+    fn think_markers(&self) -> (&'static str, &'static str) {
+        ("<think>", "</think>")
+    }
+}
+
+macro_rules! impl_llm {
+    ($ty:ty, $session:ty, $markers:expr) => {
+        impl Llm for $ty {
+            type Session = $session;
+            fn new_session(&self) -> $session {
+                <$ty>::new_session(self)
+            }
+            fn session_tokens(s: &$session) -> &[u32] {
+                s.tokens()
+            }
+            fn render(&self, messages: &str, tools: Option<&str>, enable_thinking: Option<bool>) -> Result<String> {
+                self.render_chat_json(messages, tools, true, enable_thinking)
+            }
+            fn encode(&self, text: &str) -> Result<Vec<u32>> {
+                <$ty>::encode(self, text)
+            }
+            fn generate<'a>(&'a self, s: &'a mut $session, prompt: &[u32], opts: GenerateOptions) -> Result<TokenStream<'a>> {
+                <$ty>::generate(self, s, prompt, opts)
+            }
+            fn recommended(&self) -> SamplingParams {
+                self.recommended_sampling()
+            }
+            fn info(&self) -> ModelInfo {
+                lapid_hub::Model::info(self)
+            }
+            fn think_markers(&self) -> (&'static str, &'static str) {
+                $markers
+            }
+        }
+    };
+}
+
+impl_llm!(Lfm3, lapid_hub::lfm3::Session, ("<think>", "</think>"));
+impl_llm!(Qwen35, lapid_hub::qwen35::Session, ("<think>", "</think>"));
+impl_llm!(Gemma4, lapid_hub::gemma4::Session, ("<|channel>thought\n", "<channel|>"));
+
+struct Slot<S> {
+    session: S,
+    last_used: u64,
+}
+
+/// A hub LLM with a session pool.
+pub struct LlmServed<M: Llm> {
+    model: M,
+    meta: ModelMeta,
+    slots: Vec<Slot<M::Session>>,
+    max_slots: usize,
+    clock: u64,
+    defaults: GenParams,
+}
+
+impl<M: Llm> LlmServed<M> {
+    pub fn new(model: M, meta: ModelMeta, opts: &crate::load::LoadOptions) -> LlmServed<M> {
+        let mut meta = meta;
+        meta.capabilities = vec![Capability::Chat, Capability::Completion];
+        let max_slots = opts.sessions.max(1);
+        LlmServed { model, meta, slots: Vec::new(), max_slots, clock: 0, defaults: opts.defaults.clone() }
+    }
+
+    /// The session to run `prompt` on: the longest cached prefix, else a new or the least
+    /// recently used one (its state is reset by the generation).
+    fn pick_slot(&mut self, prompt: &[u32]) -> usize {
+        self.clock += 1;
+        let best = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                let t = M::session_tokens(&s.session);
+                !t.is_empty() && t.len() < prompt.len() && prompt[..t.len()] == *t
+            })
+            .max_by_key(|(_, s)| M::session_tokens(&s.session).len())
+            .map(|(i, _)| i);
+        let i = match best {
+            Some(i) => i,
+            None if self.slots.len() < self.max_slots => {
+                self.slots.push(Slot { session: self.model.new_session(), last_used: 0 });
+                self.slots.len() - 1
+            }
+            None => self.slots.iter().enumerate().min_by_key(|(_, s)| s.last_used).map_or(0, |(i, _)| i),
+        };
+        self.slots[i].last_used = self.clock;
+        i
+    }
+
+    fn sampling(&self, g: &GenParams) -> SamplingParams {
+        let d = &self.defaults;
+        let g = &GenParams {
+            max_tokens: g.max_tokens.or(d.max_tokens),
+            temperature: g.temperature.or(d.temperature),
+            top_p: g.top_p.or(d.top_p),
+            top_k: g.top_k.or(d.top_k),
+            repetition_penalty: g.repetition_penalty.or(d.repetition_penalty),
+            seed: g.seed.or(d.seed),
+            stop: Vec::new(),
+        };
+        let mut s = self.model.recommended();
+        if let Some(t) = g.temperature {
+            s.temperature = t.max(0.0);
+        }
+        if let Some(p) = g.top_p {
+            s.top_p = p.clamp(0.0, 1.0);
+        }
+        if let Some(k) = g.top_k {
+            s.top_k = k;
+        }
+        if let Some(r) = g.repetition_penalty {
+            s.repetition_penalty = r;
+        }
+        s.seed = g.seed.unwrap_or_else(|| {
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
+        });
+        s
+    }
+
+    fn run(&mut self, prompt_text: &str, g: &GenParams, think: ThinkSplitter, out: &mut dyn FnMut(Delta) -> bool) -> Result<GenSummary> {
+        let ids = self.model.encode(prompt_text)?;
+        if ids.is_empty() {
+            return Err(Error::new("invalid_argument", "the prompt is empty"));
+        }
+        let opts = GenerateOptions {
+            max_new_tokens: g.max_tokens.or(self.defaults.max_tokens).unwrap_or(2048).max(1),
+            sampling: self.sampling(g),
+            stop_tokens: None,
+            cancel: None,
+        };
+        let slot = self.pick_slot(&ids);
+        let mut filter = OutputFilter::new(think, &g.stop);
+        let model = &self.model;
+        let session = &mut self.slots[slot].session;
+        let mut stream = model.generate(session, &ids, opts)?;
+        let mut cancelled = false;
+        'decode: for tok in stream.by_ref() {
+            let tok = tok?;
+            for d in filter.push(&tok.text) {
+                if !out(d) {
+                    cancelled = true;
+                    break 'decode;
+                }
+            }
+            if filter.stopped() {
+                break;
+            }
+        }
+        if !cancelled {
+            for d in filter.finish() {
+                if !out(d) {
+                    cancelled = true;
+                    break;
+                }
+            }
+        }
+        let stats = stream.stats();
+        let finish = if cancelled {
+            "cancelled"
+        } else if filter.stopped() {
+            "stop"
+        } else {
+            match stream.finish_reason() {
+                Some(FinishReason::Length) => "length",
+                Some(FinishReason::Cancelled) => "cancelled",
+                _ => "stop",
+            }
+        };
+        let generated = stream.generated().len();
+        let stop_tok = matches!(stream.finish_reason(), Some(FinishReason::Stop));
+        Ok(GenSummary {
+            finish_reason: finish.to_string(),
+            prompt_tokens: stats.prompt_tokens + stats.cached_tokens,
+            cached_tokens: stats.cached_tokens,
+            completion_tokens: if stop_tok { generated.saturating_sub(1) } else { generated },
+            ttft_ms: stats.time_to_first_token_ms,
+            decode_ms: stats.decode_ms,
+        })
+    }
+}
+
+impl<M: Llm> Served for LlmServed<M> {
+    fn meta(&self) -> &ModelMeta {
+        &self.meta
+    }
+
+    fn meta_mut(&mut self) -> &mut ModelMeta {
+        &mut self.meta
+    }
+
+    fn chat(&mut self, req: &ChatParams, out: &mut dyn FnMut(Delta) -> bool) -> Result<GenSummary> {
+        let messages = serde_json::to_string(&req.messages)?;
+        let tools = req.tools.as_ref().map(serde_json::to_string).transpose()?;
+        let text = self.model.render(&messages, tools.as_deref(), req.enable_thinking)?;
+        let (open, close) = self.model.think_markers();
+        let prompt_open = text.trim_end().ends_with(open.trim_end());
+        let think = ThinkSplitter::new(open, close, prompt_open);
+        self.run(&text, &req.sampling, think, out)
+    }
+
+    fn complete(&mut self, prompt: &str, sampling: &GenParams, out: &mut dyn FnMut(Delta) -> bool) -> Result<GenSummary> {
+        self.run(prompt, sampling, ThinkSplitter::passthrough(), out)
+    }
+}

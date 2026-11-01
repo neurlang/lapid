@@ -1,0 +1,175 @@
+# Prebuilt C libraries (crates/lapid-c): pushing a tag `c-v<version>` builds static and
+# shared libraries for each platform and attaches them, with SHA-256 checksums, to the
+# GitHub Release `c-v<version>`. `<version>` must equal the lapid-c crate version.
+# Manual runs (workflow_dispatch) build and upload the archives as workflow artifacts only.
+name: Release C library
+
+on:
+  push:
+    tags:
+      - "c-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Smaller archives: no debug info in the release libraries.
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-14 }
+          - { target: x86_64-apple-darwin, os: macos-14 }
+          - { target: x86_64-pc-windows-msvc, os: windows-2022 }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1
+        with:
+          toolchain: 1.98.1
+          targets: ${{ matrix.target }}
+
+      - name: Version
+        id: version
+        run: |
+          # pkgid ends in "#lapid-c@<version>" (or "#<version>").
+          crate=$(cargo pkgid -p lapid-c | sed 's/.*[#@]//')
+          if [[ "$GITHUB_REF" == refs/tags/c-v* ]]; then
+            tag="${GITHUB_REF_NAME#c-v}"
+            if [[ "$tag" != "$crate" ]]; then
+              echo "tag c-v$tag does not match lapid-c version $crate" >&2
+              exit 1
+            fi
+          fi
+          echo "version=$crate" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          # Give the Linux shared library a soname so it can be installed system-wide.
+          # On macOS, an @rpath install name instead of the absolute build path.
+          if [[ "$TARGET" == *-linux-* ]]; then
+            export RUSTFLAGS="-C link-arg=-Wl,-soname,liblapid.so"
+          elif [[ "$TARGET" == *-apple-* ]]; then
+            export RUSTFLAGS="-C link-arg=-Wl,-install_name,@rpath/liblapid.dylib"
+          fi
+          # One build produces both crate types; the note lists the system libraries a
+          # static link needs, which ships in the archive.
+          cargo rustc -p lapid-c --lib --release --locked --target "$TARGET" \
+            -- --print native-static-libs 2>&1 | tee build.log
+          grep -m1 'native-static-libs:' build.log | sed 's/.*native-static-libs: *//' > native-static-libs.txt
+          cat native-static-libs.txt
+
+      - name: Package
+        id: package
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          name="lapid-c-$VERSION-$TARGET"
+          out="target/$TARGET/release"
+          mkdir -p "$name/include" "$name/lib"
+          cp crates/lapid-c/include/lapid.h "$name/include/"
+          cp LICENSE "$name/"
+          cp crates/lapid-c/README.md "$name/README.md"
+          cp native-static-libs.txt "$name/lib/"
+          case "$TARGET" in
+            *-windows-*)
+              # lapid.lib is the static library; lapid.dll.lib the import library of lapid.dll.
+              cp "$out/lapid.lib" "$out/lapid.dll" "$out/lapid.dll.lib" "$name/lib/"
+              7z a -tzip "$name.zip" "$name" > /dev/null
+              archive="$name.zip"
+              ;;
+            *-apple-*)
+              cp "$out/liblapid.a" "$out/liblapid.dylib" "$name/lib/"
+              tar czf "$name.tar.gz" "$name"
+              archive="$name.tar.gz"
+              ;;
+            *)
+              cp "$out/liblapid.a" "$out/liblapid.so" "$name/lib/"
+              tar czf "$name.tar.gz" "$name"
+              archive="$name.tar.gz"
+              ;;
+          esac
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          cat "$archive.sha256"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      # Links on every Unix target; runs where the target is the runner's own architecture.
+      - name: Smoke test (C example against the static library)
+        if: runner.os != 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dir="lapid-c-$VERSION-$TARGET"
+          arch=()
+          cross=0
+          if [[ "$TARGET" == x86_64-apple-darwin ]]; then
+            arch=(-arch x86_64)
+            cross=1
+          fi
+          # shellcheck disable=SC2046 # the library list is meant to be split into words
+          cc "${arch[@]}" -std=c99 crates/lapid-c/examples/c/matmul.c -I "$dir/include" \
+            "$dir/lib/liblapid.a" $(cat "$dir/lib/native-static-libs.txt") -o matmul
+          if [[ $cross == 0 ]]; then ./matmul cpu; fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/c-v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          cat *.sha256 | sort -k2 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: lapid C library ${{ github.ref_name }}
+          body: |
+            Prebuilt `lapid` C libraries (static and shared) with `include/lapid.h`.
+            See crates/lapid-c/README.md for usage. Verify downloads with `SHA256SUMS`.
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+            dist/SHA256SUMS
+          fail_on_unmatched_files: false

@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use lapid_compiler::{AttentionDims, AttentionSpec};
-use lapid_tensor::{Error, Result};
+use lapid_tensor::{DType, Error, Result};
 
 use super::common;
 use super::{Key, Params, Plan, bad, check_plain, grid, grid_threads, template};
@@ -21,6 +21,12 @@ use crate::Caps;
 const TILE_Q: usize = 64;
 /// Head dims above 256 run DC = ceil(D / 256) passes per thread in the split kernel.
 const ROW_MAX_D: usize = 1024;
+
+/// `LAPID_VULKAN_FAST_ATTENTION=1`: f16 cooperative-matrix attention for f32 inputs too.
+fn fast_attention() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LAPID_VULKAN_FAST_ATTENTION").is_ok_and(|v| v.trim() == "1"))
+}
 
 pub(super) fn plan(spec: &Arc<AttentionSpec>, d: &AttentionDims, caps: &Caps) -> Result<Plan> {
     check_plain(spec.dtype, "attention q/k/v")?;
@@ -43,14 +49,17 @@ pub(super) fn plan(spec: &Arc<AttentionSpec>, d: &AttentionDims, caps: &Caps) ->
     if let Some(m) = &d.mask {
         p.view(m, 4)?;
     }
-    if caps.coopmat && caps.f16 && d.sq > 8 && matches!(d.d, 256 | 512) {
+    // Cooperative-matrix kernels round Q/K/V/P to f16: f32 inputs keep f32 math (tile / split
+    // kernels) unless `LAPID_VULKAN_FAST_ATTENTION=1`.
+    let coop = caps.coopmat && caps.f16 && (spec.dtype != DType::F32 || fast_attention());
+    if coop && d.sq > 8 && matches!(d.d, 256 | 512) {
         // wide heads (Gemma 4): 16-query blocks on cooperative matrices
         let nqb = d.sq.div_ceil(16);
         p.0[6] = u32::try_from(nqb).map_err(|_| bad("attention: too many queries"))?;
         let items = (d.batch * d.heads * nqb) as u64;
         return Ok(Plan { scratch: 0, next: None, key: Key::AttnCoopWide(spec.clone(), d.d as u32), params: p.0, groups: grid(items, caps) });
     }
-    if tile && caps.coopmat && d.d == 64 {
+    if tile && coop && d.d == 64 {
         let items = (d.batch * d.heads * q_blocks) as u64;
         return Ok(Plan { scratch: 0, next: None, key: Key::AttnCoop(spec.clone()), params: p.0, groups: grid(items, caps) });
     }

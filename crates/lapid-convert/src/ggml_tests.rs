@@ -264,3 +264,22 @@ fn matches_ggml_c_reference() {
     }
     assert!(n > 0);
 }
+
+#[test]
+fn mxfp4_and_integer_types() {
+    // e = 129 → d = 2^(129 - 128) = 2; nibbles j and j + 16 per byte.
+    let mut b = vec![129u8];
+    b.extend((0..16u8).map(|j| (15 - j) << 4 | j));
+    let t = GgmlType::from_id(39);
+    assert_eq!(t.nbytes(64).expect("mxfp4 size"), 34);
+    let got = dequantize(t, &b, 32).expect("mxfp4");
+    let kv = [0f32, 1., 2., 3., 4., 6., 8., 12., 0., -1., -2., -3., -4., -6., -8., -12.];
+    for j in 0..16 {
+        assert_eq!(got[j], kv[j] * 2.0);
+        assert_eq!(got[j + 16], kv[15 - j] * 2.0);
+    }
+    let i32s: Vec<u8> = [7i32, -3].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let t = GgmlType::from_id(26);
+    assert_eq!(t.nbytes(2).expect("i32 size"), 8);
+    assert_eq!(dequantize(t, &i32s, 2).expect("i32"), vec![7.0, -3.0]);
+}
