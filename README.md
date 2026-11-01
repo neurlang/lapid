@@ -27,8 +27,6 @@
 | Tract | ❌ | ✅ | ✅ | ✅ |
 | **Lapid** | ✅ | ✅ | ✅ | ✅ |
 
-⚠️ partly
-
 ## Quick start
 
 ```sh
