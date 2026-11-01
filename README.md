@@ -11,15 +11,14 @@ CUDA · Vulkan · Metal · WebGPU · CPU — one build, nothing to install.
 
 </div>
 
-## ✨ Why lapid
+## Why lapid
 
-- 📦 **No SDKs** — no CUDA toolkit, Vulkan SDK or C++ compiler. Drivers load at runtime.
-- ⚡ **Fast by design** — merges many small operations into a few GPU kernels, so models run faster.
-- 🗜️ **Small models** — runs quantized weights (`fp16`, `int8`, `int4`, GGUF) to use less memory.
-- 📄 **One file per model** — weights + tokenizer in a single `.lapid`. Imports safetensors and GGUF.
-- ✅ **Verified** — every model is checked layer by layer against PyTorch.
+- **No SDKs** — no CUDA toolkit, Vulkan SDK or C++ compiler. Drivers load at runtime.
+- **Small models** — runs quantized weights (`fp16`, `int8`, `int4`, GGUF) to use less memory.
+- **One file per model** — weights + tokenizer in a single `.lapid`. Imports safetensors and GGUF.
+- **Verified** — every model is checked layer by layer against PyTorch.
 
-## 🚀 Quick start
+## Quick start
 
 ```sh
 cargo add lapid
@@ -35,6 +34,6 @@ println!("{:?}", Device::best().to_vec_f32(&y)?);  // compiles, fuses, runs
 
 <div align="center">
 
-📚 [Examples](crates/lapid-hub/examples/) · 📖 [Docs](docs/) · MIT / Apache-2.0
+[Examples](crates/lapid-hub/examples/) · [Docs](docs/) · MIT / Apache-2.0
 
 </div>
