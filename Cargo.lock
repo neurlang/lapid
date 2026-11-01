@@ -1459,6 +1459,7 @@ dependencies = [
 name = "lapid-nn"
 version = "0.1.0"
 dependencies = [
+ "image",
  "lapid",
  "rustfft",
  "serde_json",
