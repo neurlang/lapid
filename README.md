@@ -18,9 +18,11 @@
 
 ## Why
 
-ONNX Runtime is slow outside CUDA and is a heavy C++ dependency that's hard to change. llama.cpp is fast, but every GPU needs its own build and SDK, and every op is a hand-written kernel per backend. Rust options trade one thing for another: candle has limited GPU support, burn is built for training, tract is CPU only.
+- **ONNX Runtime** flies on CUDA, crawls elsewhere, and ships as a heavy C++ black box.
+- **llama.cpp** is fast, but needs one build per GPU and a hand-written kernel for every op.
+- **Rust frameworks** each pick a corner: candle (few GPUs), burn (training), tract (CPU only).
 
-lapid gives you one small Rust build that runs on every GPU, a compiler that generates and fuses the kernels, and models you can read and change.
+**lapid** is one small Rust build for every GPU, with kernels written by a compiler and models you can actually read.
 
 ## Quick start
 
