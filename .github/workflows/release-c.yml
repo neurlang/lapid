@@ -164,6 +164,8 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: lapid C library ${{ github.ref_name }}
+          # The CLI release (v* tags) stays "Latest": the badge and installers point there.
+          make_latest: false
           body: |
             Prebuilt `lapid` C libraries (static and shared) with `include/lapid.h`.
             See crates/lapid-c/README.md for usage. Verify downloads with `SHA256SUMS`.
