@@ -3,6 +3,7 @@
 mod audio;
 mod chat;
 mod misc;
+mod openapi;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -137,6 +138,8 @@ pub fn router(state: Shared) -> Router {
     let compress = CompressionLayer::new().compress_when(DefaultPredicate::new().and(NotForContentType::const_new("audio/")));
     Router::new()
         .route("/health", get(misc::health))
+        .route("/openapi.json", get(openapi::spec))
+        .route("/docs", get(openapi::docs))
         .route("/api/info", get(misc::info))
         .route("/v1/models", get(misc::models))
         .route("/v1/models/{id}", get(misc::model))
