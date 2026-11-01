@@ -99,13 +99,9 @@ impl Whisper {
                 // OpenAI `detect_language`: logits after <|startoftranscript|>, language tokens only
                 Some(memory) => {
                     let logits = seq2seq::next_logits(self, &memory, &[cfg.special.sot])?;
-                    let best = cfg.languages.iter().filter_map(|&(_, id)| logits.get(id as usize).map(|&l| (id, l))).fold(
-                        None::<(u32, f32)>,
-                        |acc, (id, l)| match acc {
-                            Some((_, bl)) if bl >= l => acc,
-                            _ => Some((id, l)),
-                        },
-                    );
+                    let scored = cfg.languages.iter().filter_map(|&(_, id)| logits.get(id as usize).map(|&l| (id, l)));
+                    // the first of equal maxima wins
+                    let best = scored.reduce(|best, x| if best.1 >= x.1 { best } else { x });
                     Ok((best.map(|(id, _)| id), Some(memory)))
                 }
                 None => Ok((None, None)),

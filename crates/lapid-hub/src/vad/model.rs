@@ -18,22 +18,13 @@
 //!   with silence), so stream and batch are bit-identical on every backend.
 
 use lapid::{Device, Error, Result, Tensor};
+use lapid_nn::speech::lstm::{HostLstmCell, host_sigmoid};
 use lapid_nn::{Conv1d, Linear, Loader};
 
 use super::config::VadConfig;
 
 /// Realized recurrent state (h, c), each `hidden_size` floats.
-#[derive(Clone, Debug, PartialEq)]
-pub struct LstmState {
-    pub h: Vec<f32>,
-    pub c: Vec<f32>,
-}
-
-impl LstmState {
-    pub fn zeros(hidden: usize) -> LstmState {
-        LstmState { h: vec![0.0; hidden], c: vec![0.0; hidden] }
-    }
-}
+pub use lapid_nn::speech::HostLstmState as LstmState;
 
 /// Host results of the batched front-end over `n` windows.
 pub(crate) struct Front {
@@ -51,8 +42,8 @@ pub(crate) struct Net {
     basis: Tensor,
     encoder: Vec<Conv1d>,
     input_proj: Linear,
-    /// Host copies: recurrent weight [4H, H] and the head.
-    w_hh: Vec<f32>,
+    /// Host copies: the recurrence (`W_hh` [4H, H]) and the head.
+    cell: HostLstmCell,
     head_w: Vec<f32>,
     head_b: f32,
 }
@@ -88,7 +79,7 @@ impl Net {
             basis,
             encoder,
             input_proj: Linear::new(w_ih, Some(bias)),
-            w_hh: host(l, "decoder.rnn.weight_hh", &[4 * h, h])?,
+            cell: HostLstmCell { w_hh: host(l, "decoder.rnn.weight_hh", &[4 * h, h])?, hidden: h },
             head_w: host(l, "decoder.decoder.2.weight", &[1, h])?,
             head_b: head_b.first().copied().unwrap_or(0.0),
         })
@@ -157,59 +148,10 @@ impl Net {
     }
 
     /// One recurrent step on input gates `gx` [4H]: updates `state`, returns the speech
-    /// probability. PyTorch `LSTMCell` gate order (i, f, g, o).
+    /// probability (`sigmoid(head(relu(h)))`).
     pub fn step(&self, state: &mut LstmState, gx: &[f32]) -> f32 {
-        let h = self.cfg.hidden_size;
-        let mut gates = vec![0f32; 4 * h];
-        for (r, g) in gates.iter_mut().enumerate() {
-            let row = &self.w_hh[r * h..(r + 1) * h];
-            *g = gx[r] + dot(row, &state.h);
-        }
-        for j in 0..h {
-            let i = sigmoid(gates[j]);
-            let f = sigmoid(gates[h + j]);
-            let g = gates[2 * h + j].tanh();
-            let o = sigmoid(gates[3 * h + j]);
-            let c = f * state.c[j] + i * g;
-            state.c[j] = c;
-            state.h[j] = o * c.tanh();
-        }
+        self.cell.step(state, gx);
         let logit = self.head_b + self.head_w.iter().zip(&state.h).map(|(w, x)| w * x.max(0.0)).sum::<f32>();
-        sigmoid(logit)
-    }
-}
-
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-/// Dot product with 8 independent accumulators (vectorizes; order fixed, so results are
-/// deterministic across runs and callers).
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    let mut acc = [0f32; 8];
-    let (ac, ar) = a.as_chunks::<8>();
-    let (bc, br) = b.as_chunks::<8>();
-    for (x, y) in ac.iter().zip(bc) {
-        for k in 0..8 {
-            acc[k] += x[k] * y[k];
-        }
-    }
-    let mut s = ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
-    for (x, y) in ar.iter().zip(br) {
-        s += x * y;
-    }
-    s
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dot_matches_naive() {
-        let a: Vec<f32> = (0..131).map(|i| (i as f32 * 0.37).sin()).collect();
-        let b: Vec<f32> = (0..131).map(|i| (i as f32 * 0.11).cos()).collect();
-        let naive: f64 = a.iter().zip(&b).map(|(x, y)| *x as f64 * *y as f64).sum();
-        assert!((dot(&a, &b) as f64 - naive).abs() < 1e-4);
+        host_sigmoid(logit)
     }
 }

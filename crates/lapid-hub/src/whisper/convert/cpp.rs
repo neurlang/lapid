@@ -1,4 +1,5 @@
-//! whisper.cpp `ggml-*.bin` → `.lapid` (HF tensor naming, same metadata as the HF path).
+//! whisper.cpp `ggml-*.bin` → `.lapid` (HF tensor naming, same metadata as the HF path). The
+//! legacy ggml container itself is `lapid_convert::ggml_legacy`; the header layout is Whisper's.
 //!
 //! q8_0 → int8 and q4_0 → int4 are copied block-for-block when the policy target
 //! matches; every other combination is dequantized to f32 and re-encoded by the policy.
@@ -9,13 +10,15 @@ use std::path::Path;
 use lapid::quant::Format;
 use lapid::{Error, Result, bail};
 use lapid_convert::OutDType;
+use lapid_convert::ggml::{GgmlType, dequantize};
+use lapid_convert::ggml_legacy::{GgmlFile, GgmlTensor};
 use lapid_convert::policy::Target;
 use lapid_convert::writer::{ModelWriter, check_complete, file_hash};
-use serde_json::{Map, Value, json};
+use lapid_nn::tokenizer::bytes_to_unicode;
+use serde_json::{Value, json};
 
-use super::ggml::{self, GgmlModel, GgmlTensor, GgmlType, Hparams};
-use super::tokens::{Specials, byte_to_char_table, bytes_to_bpe_string};
-use super::{CONVERT, EMBED_TOKENS, TOKENS_BLOB, expected_tensors, metadata};
+use super::tokens::Specials;
+use super::{CONVERT, EMBED_TOKENS, TOKENS_BLOB, cfg_usize, expected_tensors, metadata, whisper_meta};
 
 /// Maps a whisper.cpp (OpenAI checkpoint) tensor name to the HF name.
 pub(crate) fn map_name(n: &str) -> Option<String> {
@@ -72,62 +75,78 @@ fn hf_shape(hf_name: &str, t: &GgmlTensor<'_>) -> Vec<usize> {
     if hf_name.ends_with(".bias") { vec![t.numel()] } else { t.shape() }
 }
 
-fn tokens(h: &Hparams, vocab: &[Vec<u8>], sp: &Specials) -> Result<Vec<String>> {
-    let n = h.n_vocab;
-    let table = byte_to_char_table();
+/// whisper.cpp hyper-parameters in file order, under their HF `config.json` names
+/// (`n_text_state` has none: it must equal `d_model`, the audio state).
+const HPARAMS: [&str; 10] = [
+    "vocab_size",
+    "max_source_positions",
+    "d_model",
+    "encoder_attention_heads",
+    "encoder_layers",
+    "max_target_positions",
+    "n_text_state",
+    "decoder_attention_heads",
+    "decoder_layers",
+    "num_mel_bins",
+];
+
+/// whisper.cpp model header: `i32 x 11` hparams ([`HPARAMS`] then ftype), `i32 n_mel, i32
+/// n_fft, f32[n_mel*n_fft]` mel filters, `i32 n_tokens, n_tokens x (u32 len, len bytes)`
+/// vocabulary (raw token bytes). Returns the hparams as an HF config, ftype, the vocabulary
+/// and the offset of the first tensor record.
+fn read_header(file: &GgmlFile) -> Result<(Value, i32, Vec<Vec<u8>>, usize)> {
+    let mut c = file.header();
+    const MAX: usize = 1 << 20;
+    let mut cfg = json!({});
+    for name in HPARAMS {
+        let v = c.count(name, MAX)?;
+        if v == 0 {
+            bail!("format", "ggml: hparam {name} is 0");
+        }
+        cfg[name] = json!(v);
+    }
+    let ftype = c.i32()?;
+    // Mel filters (unused: the hub computes its own filterbank).
+    let n_mel = c.count("filters.n_mel", 4096)?;
+    let n_fft = c.count("filters.n_fft", 1 << 16)?;
+    c.take(n_mel * n_fft * 4)?;
+    let n_tokens = c.count("vocab size", MAX)?;
+    let mut vocab = Vec::with_capacity(n_tokens);
+    for _ in 0..n_tokens {
+        let len = c.count("token length", 1 << 16)?;
+        vocab.push(c.take(len)?.to_vec());
+    }
+    Ok((cfg, ftype, vocab, c.pos()))
+}
+
+/// Id-ordered token strings: the file's raw token bytes in byte-level BPE form (HF
+/// `vocab.json`), the special tokens of the canonical layout on top.
+fn tokens(n: usize, vocab: &[Vec<u8>]) -> Vec<String> {
+    let table = bytes_to_unicode();
     let mut out: Vec<Option<String>> = vec![None; n];
     for (i, b) in vocab.iter().enumerate().take(n) {
-        out[i] = Some(bytes_to_bpe_string(&table, b));
+        out[i] = Some(b.iter().map(|&b| table[b as usize]).collect());
     }
-    for (id, s) in sp.token_strings(n as u32) {
+    for (id, s) in Specials::from_n_vocab(n as u32).token_strings(n as u32) {
         if let Some(slot) = out.get_mut(id as usize) {
             *slot = Some(s);
         }
     }
-    Ok(out.into_iter().enumerate().map(|(i, t)| t.unwrap_or_else(|| format!("<|unused_{i}|>"))).collect())
+    out.into_iter().enumerate().map(|(i, t)| t.unwrap_or_else(|| format!("<|unused_{i}|>"))).collect()
 }
 
-fn whisper_meta(h: &Hparams) -> Result<Value> {
-    if h.n_audio_state != h.n_text_state {
-        bail!("unsupported_model", "ggml: n_audio_state {} != n_text_state {}", h.n_audio_state, h.n_text_state);
+/// The `"whisper"` metadata object: the HF path's [`whisper_meta`] on the header config
+/// (special tokens resolved from the token strings, default suppress lists), plus OpenAI's
+/// `max_initial_timestamp_index`.
+fn ggml_whisper_meta(cfg: &Value, tokens: &[String]) -> Result<Value> {
+    let (d_model, n_text_state, n_vocab) = (&cfg["d_model"], &cfg["n_text_state"], tokens.len());
+    if d_model != n_text_state {
+        bail!("unsupported_model", "ggml: n_audio_state {d_model} != n_text_state {n_text_state}");
     }
-    let sp = Specials::from_n_vocab(h.n_vocab as u32);
-    if (sp.timestamp_begin as usize) > h.n_vocab {
-        bail!("unsupported_model", "ggml: n_vocab {} too small for a Whisper vocabulary", h.n_vocab);
+    if (Specials::from_n_vocab(n_vocab as u32).timestamp_begin as usize) > n_vocab {
+        bail!("unsupported_model", "ggml: n_vocab {n_vocab} too small for a Whisper vocabulary");
     }
-    let mut languages = Map::new();
-    if sp.is_multilingual() {
-        for (code, id) in sp.languages() {
-            languages.insert(code.to_string(), json!(id));
-        }
-    }
-    let mut special = json!({
-        "sot": sp.sot, "eot": sp.eot, "transcribe": sp.transcribe, "translate": sp.translate,
-        "no_timestamps": sp.no_timestamps, "timestamp_begin": sp.timestamp_begin,
-        "no_speech": sp.no_speech, "prev": sp.prev,
-    });
-    special["sot_lm"] = json!(sp.sot_lm);
-    Ok(json!({
-        "n_mels": h.n_mels,
-        "n_audio_ctx": h.n_audio_ctx,
-        "n_audio_state": h.n_audio_state,
-        "n_audio_head": h.n_audio_head,
-        "n_audio_layer": h.n_audio_layer,
-        "n_audio_ffn": 4 * h.n_audio_state,
-        "n_text_ctx": h.n_text_ctx,
-        "n_text_state": h.n_text_state,
-        "n_text_head": h.n_text_head,
-        "n_text_layer": h.n_text_layer,
-        "n_text_ffn": 4 * h.n_text_state,
-        "n_vocab": h.n_vocab,
-        "multilingual": sp.is_multilingual(),
-        "activation": "gelu",
-        "special": special,
-        "languages": languages,
-        "suppress_tokens": sp.suppress_tokens(),
-        "begin_suppress_tokens": sp.begin_suppress_tokens(),
-        "max_initial_timestamp_index": 50,
-    }))
+    whisper_meta(cfg, Some(&json!({"max_initial_timestamp_index": 50})), tokens)
 }
 
 /// Model name from the file name: `ggml-small.en-q8_0.bin` → `whisper-small.en`.
@@ -156,18 +175,19 @@ fn convert_tensor(w: &mut ModelWriter, hf_name: &str, t: &GgmlTensor<'_>) -> Res
         let bytes = lapid::quant::from_ggml_blocks(f, t.data, rows, cols);
         return w.add_raw(hf_name, target.dtype(), &shape, &bytes);
     }
-    let data = ggml::dequantize(t.ttype, t.data, t.numel())?;
+    let data = dequantize(t.ttype, t.data, t.numel())?;
     w.add_f32(hf_name, &shape, &data)
 }
 
 pub(crate) fn convert(path: &Path, dtype: OutDType, out: &Path) -> Result<()> {
-    let model = GgmlModel::open(path)?;
-    let h = model.hparams.clone();
-    let whisper = whisper_meta(&h)?;
-    let token_list = tokens(&h, &model.vocab, &Specials::from_n_vocab(h.n_vocab as u32))?;
-    let tensors = model.tensors()?;
+    let file = GgmlFile::open(path)?;
+    let (cfg, ftype, vocab, tensors_start) = read_header(&file)?;
+    let (n_vocab, d_model) = (cfg_usize(&cfg, "vocab_size")?, cfg_usize(&cfg, "d_model")?);
+    let token_list = tokens(n_vocab, &vocab);
+    let whisper = ggml_whisper_meta(&cfg, &token_list)?;
+    let tensors = file.tensors(tensors_start)?;
     let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
-    let source = json!({ "repo": "ggerganov/whisper.cpp", "file": file_name, "file_hash": file_hash(path)?, "ggml_ftype": h.ftype % 1000 });
+    let source = json!({ "repo": "ggerganov/whisper.cpp", "file": file_name, "file_hash": file_hash(path)?, "ggml_ftype": ftype % 1000 });
     let meta = metadata(&model_name(path), dtype, "mit", source, whisper);
 
     // Map + validate names before writing anything.
@@ -181,12 +201,12 @@ pub(crate) fn convert(path: &Path, dtype: OutDType, out: &Path) -> Result<()> {
         }
         mapped.push((hf, t));
     }
-    let expected = expected_tensors(h.n_audio_layer, h.n_text_layer);
+    let expected = expected_tensors(cfg_usize(&cfg, "encoder_layers")?, cfg_usize(&cfg, "decoder_layers")?);
     check_complete(&seen, &expected)?;
     if let Some((_, t)) = mapped.iter().find(|(n, _)| n == EMBED_TOKENS) {
         let shape = t.shape();
-        if shape != [h.n_vocab, h.n_text_state] {
-            bail!("shape_mismatch", "ggml: token embedding has shape {shape:?}, expected [{}, {}]", h.n_vocab, h.n_text_state);
+        if shape != [n_vocab, d_model] {
+            bail!("shape_mismatch", "ggml: token embedding has shape {shape:?}, expected [{n_vocab}, {d_model}]");
         }
     }
 
@@ -268,13 +288,11 @@ mod tests {
 
     #[test]
     fn token_table() {
-        let h = Hparams {
-            n_vocab: 51865, n_audio_ctx: 1500, n_audio_state: 768, n_audio_head: 12, n_audio_layer: 12,
-            n_text_ctx: 448, n_text_state: 768, n_text_head: 12, n_text_layer: 12, n_mels: 80, ftype: 1,
-        };
+        let values = [51865, 1500, 768, 12, 12, 448, 768, 12, 12, 80];
+        let cfg = Value::Object(HPARAMS.iter().zip(values).map(|(k, v)| (k.to_string(), json!(v))).collect());
         let vocab: Vec<Vec<u8>> = (0..50257u32).map(|i| if i == 0 { b" the".to_vec() } else { vec![b'a'] }).collect();
-        let m = whisper_meta(&h).expect("meta");
-        let t = tokens(&h, &vocab, &Specials::from_n_vocab(51865)).expect("tokens");
+        let t = tokens(51865, &vocab);
+        let m = ggml_whisper_meta(&cfg, &t).expect("meta");
         assert_eq!(t.len(), 51865);
         assert_eq!(t[0], "Ġthe");
         assert_eq!(t[50257], "<|endoftext|>");
@@ -282,5 +300,6 @@ mod tests {
         assert_eq!(t[50363], "<|notimestamps|>");
         assert_eq!(m["special"]["timestamp_begin"], 50364);
         assert_eq!(m["languages"]["en"], 50259);
+        assert_eq!((m["special"]["sot_lm"].clone(), m["max_initial_timestamp_index"].clone()), (json!(50360), json!(50)));
     }
 }

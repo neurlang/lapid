@@ -32,6 +32,12 @@ pub fn relu(x: &Tensor) -> Result<Tensor> {
     x.binary_scalar(BinaryOp::Max, 0.0)
 }
 
+/// ELU (alpha 1): max(x, 0) + exp(min(x, 0)) - 1.
+pub fn elu(x: &Tensor) -> Result<Tensor> {
+    let neg = x.binary_scalar(BinaryOp::Min, 0.0)?.exp()?.add_scalar(-1.0)?;
+    relu(x)?.add(&neg)
+}
+
 /// Gated linear unit along `axis`: the first half times sigmoid of the second half.
 pub fn glu(x: &Tensor, axis: isize) -> Result<Tensor> {
     let ax = x.axis(axis)?;
@@ -63,6 +69,13 @@ mod tests {
         assert_close(&eval(&silu(&x).unwrap()), &si, 1e-6);
         let re: Vec<f32> = v.iter().map(|&a| a.max(0.0)).collect();
         assert_close(&eval(&relu(&x).unwrap()), &re, 0.0);
+    }
+
+    #[test]
+    fn elu_matches_formula() {
+        let (x, v) = input();
+        let want: Vec<f32> = v.iter().map(|&a| if a > 0.0 { a } else { a.exp() - 1.0 }).collect();
+        assert_close(&eval(&elu(&x).unwrap()), &want, 1e-6);
     }
 
     #[test]

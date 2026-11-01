@@ -7,7 +7,7 @@
 //! m = mlp_hc.mix(x);   x = combine(x, moe(m.input),   m.weights)
 //! ```
 //! `mixer` is Qwen3.5's Gated DeltaNet (sigmoid output gate) or its gated attention with the
-//! QSA indexer; `moe` is Qwen3.5's. The final mixer (`hyper_connection_mixer`) collapses the
+//! QSA indexer; `moe` is Qwen3.5's; the hyper-connections are `lapid_nn::llm::hyper::LowRankHc`. The final mixer (`hyper_connection_mixer`) collapses the
 //! streams and replaces the output norm; logits through `lm_head`. File conventions as Qwen3.5
 //! (effective-scale norms, grouped `[hc, D]` norms, `A = -exp(A_log)`, tiled v heads).
 //!
@@ -15,16 +15,19 @@
 //! slots: conv `i`, delta-rule `L + i`, PLE conv `2L`) plus the last n-gram tokens (host).
 
 use lapid::{DType, Result, Tensor, bail};
+use lapid_nn::llm::delta_net::DeltaNet;
+use lapid_nn::llm::head::LmHead;
+use lapid_nn::llm::hyper::LowRankHc;
+use lapid_nn::llm::moe::SparseMoe;
 use lapid_nn::{Conv1d, KvCache, Loader, Rope};
 use serde_json::Value;
 
 use super::attn::{Indexer, QsaAttention};
 use super::config::{GateAct, Qwen4ExpConfig};
-use super::hc::{HyperConnection, combine};
 use super::ple::{NgramTable, Ple};
-use crate::llama::model::LmHead;
+use crate::llama::model::{lm_head, logits};
 use crate::qwen35::config::LayerType;
-use crate::qwen35::model::{DeltaNet, GatedAttention, Moe, deltanet_step};
+use crate::qwen35::model::{delta_net, deltanet_step, gated_attention, moe};
 use crate::runtime::{CausalLm, LmCache, LmDims, LmState, Rows, Taps};
 
 pub const MIXER: &str = "model.hyper_connection_mixer";
@@ -36,9 +39,9 @@ enum Mixer {
 
 struct Layer {
     mixer: Mixer,
-    attn_hc: HyperConnection,
-    mlp_hc: HyperConnection,
-    moe: Moe,
+    attn_hc: LowRankHc,
+    mlp_hc: LowRankHc,
+    moe: SparseMoe,
     ple: Option<Box<Ple>>,
 }
 
@@ -83,23 +86,15 @@ pub struct Qwen4ExpModel {
     pub cfg: Qwen4ExpConfig,
     head: LmHead,
     layers: Vec<Layer>,
-    final_hc: HyperConnection,
+    final_hc: LowRankHc,
 }
 
 fn f32_param(l: &Loader<'_>, name: &str, shape: &[usize]) -> Result<Tensor> {
     l.tensor_checked(name, shape)?.cast(DType::F32)
 }
 
-fn hyper(l: &Loader<'_>, cfg: &Qwen4ExpConfig, p: &str, inject: bool) -> Result<HyperConnection> {
-    let (hc, d, lr) = (cfg.hc, cfg.hidden_size(), cfg.hc_lowrank);
-    Ok(HyperConnection {
-        norm: f32_param(l, &format!("{p}.hc_norm.weight"), &[hc, d])?,
-        down: l.linear_checked(&format!("{p}.input_mix_weight_down"), lr, hc * d, false)?,
-        up: l.linear_checked(&format!("{p}.input_mix_weight_up"), hc * d, lr, false)?,
-        inject: inject.then(|| l.linear_checked(&format!("{p}.block_inject_weight"), hc, hc * d, false)).transpose()?,
-        hc,
-        eps: cfg.base.norm_eps,
-    })
+fn hyper(l: &Loader<'_>, cfg: &Qwen4ExpConfig, p: &str, inject: bool) -> Result<LowRankHc> {
+    LowRankHc::load(l, p, [cfg.hc, cfg.hidden_size(), cfg.hc_lowrank], inject, cfg.base.norm_eps)
 }
 
 fn attention(l: &Loader<'_>, cfg: &Qwen4ExpConfig, p: &str) -> Result<QsaAttention> {
@@ -122,7 +117,7 @@ fn attention(l: &Loader<'_>, cfg: &Qwen4ExpConfig, p: &str) -> Result<QsaAttenti
         }
         None => None,
     };
-    Ok(QsaAttention { attn: GatedAttention::load(l, b, p)?, indexer })
+    Ok(QsaAttention { attn: gated_attention(l, b, p)?, indexer })
 }
 
 fn ple(l: &Loader<'_>, cfg: &Qwen4ExpConfig, p: &str) -> Result<Ple> {
@@ -161,16 +156,16 @@ impl CausalLm for Qwen4ExpModel {
             layers.push(Layer {
                 mixer: match kind {
                     LayerType::FullAttention => Mixer::Attention(Box::new(attention(l, &cfg, &p)?)),
-                    LayerType::LinearAttention => Mixer::Linear(Box::new(DeltaNet::load(l, &cfg.base, &p, cfg.output_gate == GateAct::Sigmoid)?)),
+                    LayerType::LinearAttention => Mixer::Linear(Box::new(delta_net(l, &cfg.base, &p, cfg.output_gate == GateAct::Sigmoid)?)),
                 },
                 attn_hc: hyper(l, &cfg, &format!("{p}.attn_hyper_connection"), true)?,
                 mlp_hc: hyper(l, &cfg, &format!("{p}.mlp_hyper_connection"), true)?,
-                moe: Moe::load(l, &cfg.base, &p)?,
+                moe: moe(l, &cfg.base, &p)?,
                 ple: if cfg.ple.as_ref().is_some_and(|q| q.layer == i) { Some(Box::new(ple(l, &cfg, &p)?)) } else { None },
             });
         }
         Ok(Qwen4ExpModel {
-            head: LmHead::load(l, cfg.vocab_size(), cfg.hidden_size(), true)?,
+            head: lm_head(l, cfg.vocab_size(), cfg.hidden_size(), true)?,
             final_hc: hyper(l, &cfg, MIXER, false)?,
             layers,
             cfg,
@@ -205,18 +200,15 @@ impl CausalLm for Qwen4ExpModel {
                 taps.tap(format_args!("layers.{i}.ple"), &inj);
                 x = x.add(&inj)?;
             }
-            let m = layer.attn_hc.mix(&x)?;
-            let y = match &layer.mixer {
-                Mixer::Attention(a) => a.forward(&m.input, &mut st.cache.kv, i, nl + i, offset)?,
-                Mixer::Linear(dn) => deltanet_step(dn, &m.input, &mut st.cache, i, nl + i)?,
-            };
-            taps.tap(format_args!("layers.{i}.op"), &y);
-            let Some(w) = m.weights else { bail!("internal", "qwen4exp: layer mixer without inject") };
-            x = combine(&x, &y, &w)?;
-            let m = layer.mlp_hc.mix(&x)?;
-            let f = layer.moe.forward(&m.input)?;
-            let Some(w) = m.weights else { bail!("internal", "qwen4exp: layer mixer without inject") };
-            x = combine(&x, &f, &w)?;
+            x = layer.attn_hc.around(&x, |h| {
+                let y = match &layer.mixer {
+                    Mixer::Attention(a) => a.forward(h, &mut st.cache.kv, i, nl + i, offset)?,
+                    Mixer::Linear(dn) => deltanet_step(dn, h, &mut st.cache, i, nl + i)?,
+                };
+                taps.tap(format_args!("layers.{i}.op"), &y);
+                Ok(y)
+            })?;
+            x = layer.mlp_hc.around(&x, |h| layer.moe.forward(h))?;
             taps.tap(format_args!("layers.{i}"), &x);
         }
         if let Some(p) = &self.cfg.ple {
@@ -224,6 +216,6 @@ impl CausalLm for Qwen4ExpModel {
             h.drain(..h.len().saturating_sub(p.ngram - 1));
             st.staged_hist = Some(h);
         }
-        self.head.logits(&x, rows, taps, |x| Ok(self.final_hc.mix(x)?.input))
+        logits(&self.head, &x, rows, taps, |x| Ok(self.final_hc.mix(x)?.input))
     }
 }

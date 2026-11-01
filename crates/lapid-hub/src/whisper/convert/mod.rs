@@ -1,6 +1,6 @@
 //! Whisper checkpoints -> `.lapid`: Hugging Face (`WhisperForConditionalGeneration`) through
 //! the generic engine ([`CONVERT`]), and whisper.cpp `ggml-*.bin` ([`convert_ggml`], the
-//! legacy ggml container only whisper.cpp uses).
+//! legacy ggml container, read by `lapid_convert::ggml_legacy`).
 //!
 //! Both emit HF tensor names and the same `"whisper"` metadata object (hyper-parameters,
 //! special tokens, languages, suppress lists) plus the id-ordered token strings as the blob
@@ -9,7 +9,6 @@
 //! at most int8; conv weights and positional embeddings f16; norms and biases f32.
 
 mod cpp;
-mod ggml;
 mod tokens;
 
 use std::collections::BTreeMap;
@@ -24,7 +23,7 @@ use lapid_convert::policy::Role;
 use lapid_convert::writer::read_json;
 use serde_json::{Map, Value, json};
 
-pub(crate) use ggml::is_ggml_file;
+pub(crate) use lapid_convert::ggml_legacy::is_legacy_ggml as is_ggml_file;
 use tokens::Specials;
 
 /// Token embedding; also the (tied) output projection.
@@ -85,9 +84,8 @@ pub fn convert_ggml(ggml_bin: &Path, dtype: OutDType, out: &Path) -> Result<()> 
 }
 
 /// Required `.lapid` metadata with the `"whisper"` object (ggml path).
-fn metadata(name: &str, dtype: OutDType, license: &str, source: Value, mut whisper: Value) -> Value {
+fn metadata(name: &str, dtype: OutDType, license: &str, source: Value, whisper: Value) -> Value {
     let mut m = lapid_convert::writer::metadata(name, "whisper", dtype, license, source);
-    whisper["tokens_blob"] = json!(TOKENS_BLOB);
     m["whisper"] = whisper;
     m["components"] = components(license);
     m

@@ -13,19 +13,8 @@
 //! parser reads both.
 
 use lapid::{Error, Result, bail};
+pub use lapid_nn::llm::rope::RopeScaling;
 use serde_json::{Value, json};
-
-/// Position scaling of the rotary embedding.
-#[derive(Clone, Debug, PartialEq)]
-pub enum RopeScaling {
-    None,
-    /// HF "linear": positions divided by `factor` (= inverse frequencies divided by it).
-    Linear { factor: f32 },
-    /// HF "llama3": low frequencies divided by `factor`, a smooth ramp in between.
-    Llama3 { factor: f32, low_freq_factor: f32, high_freq_factor: f32, original_max_positions: usize },
-    /// Per-frequency divisors (llama.cpp `rope_freqs.weight`, how GGUF stores llama3 scaling).
-    FreqFactors(Vec<f32>),
-}
 
 /// Sparse MoE FFN (`qwen3_moe`): softmax router → top-k (renormalized when `norm_topk_prob`),
 /// SwiGLU experts, no shared expert.
@@ -228,31 +217,7 @@ impl LlamaConfig {
 
     /// Inverse frequencies of the rotary embedding (f32, computed like HF).
     pub fn inv_freq(&self) -> Vec<f32> {
-        let d = self.head_dim;
-        let base: Vec<f32> = (0..d / 2).map(|i| 1.0f32 / self.rope_theta.powf((2 * i) as f32 / d as f32)).collect();
-        match &self.rope_scaling {
-            RopeScaling::None => base,
-            RopeScaling::Linear { factor } => base.iter().map(|f| f / factor).collect(),
-            RopeScaling::FreqFactors(ff) => base.iter().zip(ff).map(|(f, s)| f / s).collect(),
-            RopeScaling::Llama3 { factor, low_freq_factor, high_freq_factor, original_max_positions } => {
-                let old = *original_max_positions as f32;
-                let low_wavelen = old / low_freq_factor;
-                let high_wavelen = old / high_freq_factor;
-                base.iter()
-                    .map(|&f| {
-                        let wavelen = 2.0 * std::f32::consts::PI / f;
-                        let scaled = if wavelen > low_wavelen { f / factor } else { f };
-                        let medium = wavelen >= high_wavelen && wavelen <= low_wavelen;
-                        if medium {
-                            let smooth = (old / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor);
-                            (1.0 - smooth) * scaled / factor + smooth * scaled
-                        } else {
-                            scaled
-                        }
-                    })
-                    .collect()
-            }
-        }
+        lapid_nn::llm::rope::scaled_inv_freq(self.head_dim, self.rope_theta, &self.rope_scaling)
     }
 
     /// HF-style JSON (stored in the `.lapid` metadata).
@@ -320,12 +285,7 @@ mod tests {
         assert!(!c.qkv_bias && !c.qk_norm && c.tie_embeddings);
         assert_eq!(c.eos, vec![128001, 128008, 128009]);
         assert!(matches!(c.rope_scaling, RopeScaling::Llama3 { .. }));
-        let f = c.inv_freq();
-        assert_eq!(f.len(), 32);
-        assert_eq!(f[0], 1.0);
-        // lowest frequency is divided by the factor
-        let plain = 1.0f32 / 500000f32.powf(62.0 / 64.0);
-        assert!((f[31] - plain / 32.0).abs() < 1e-12);
+        assert_eq!(c.inv_freq().len(), 32);
         assert_eq!(LlamaConfig::from_json(&c.to_json()).expect("again"), c);
     }
 

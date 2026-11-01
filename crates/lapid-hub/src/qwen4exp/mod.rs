@@ -18,7 +18,6 @@
 mod attn;
 pub mod config;
 pub mod convert;
-mod hc;
 pub mod model;
 mod ple;
 

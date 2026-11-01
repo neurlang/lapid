@@ -5,11 +5,12 @@
 //! derived limits (`sr * ms / 1000`, ...) are floats (f64), and option values are taken at their
 //! shortest decimal spelling so `0.6f32` behaves like Python's `0.6`.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Options of [`super::Vad::process`] / [`super::VadStream`] (silero `get_speech_timestamps` /
 /// `VADIterator` arguments; the defaults are silero's).
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VadOptions {
     /// Probabilities at or above this are speech.
     pub threshold: f32,

@@ -10,9 +10,10 @@
 //! * flatten (channel-major like PyTorch's `(c, f)`) → Linear → BiasNorm.
 
 use lapid::{Result, Tensor, bail};
+use lapid_nn::speech::{DepthwiseConv, taps_2d};
 use lapid_nn::{Linear, Loader};
 
-use super::{BiasNorm, kernel_taps, linear, param, strided, swoosh_l, swoosh_r, weighted_sum};
+use super::{BiasNorm, linear, param, swoosh_l, swoosh_r};
 use crate::zipformer::config::{EMBED_CHANNELS, EMBED_LAYER1, EMBED_LAYER2, ZipformerConfig};
 
 /// ConvNeXt kernel (7×7) and its time cache (3 frames).
@@ -28,13 +29,7 @@ fn im2col3(x: &Tensor, t_stride: usize, f_stride: usize, f_pad: usize) -> Result
     let to = (t - 3) / t_stride + 1;
     let fo = (f + 2 * f_pad - 3) / f_stride + 1;
     let xp = if f_pad > 0 { x.pad(1, f_pad, f_pad, 0.0)? } else { x.clone() };
-    let mut taps = Vec::with_capacity(9);
-    for kt in 0..3 {
-        let rows = strided(&xp, 0, kt, to, t_stride)?;
-        for kf in 0..3 {
-            taps.push(strided(&rows, 1, kf, fo, f_stride)?);
-        }
-    }
+    let taps = taps_2d(&xp, 0, (3, 3), (t_stride, f_stride), (to, fo))?;
     let refs: Vec<&Tensor> = taps.iter().collect();
     Tensor::cat(&refs, 2)
 }
@@ -43,8 +38,8 @@ pub(crate) struct Embed {
     conv0: Linear,
     conv1: Linear,
     conv2: Linear,
-    dw: Vec<Tensor>,
-    dw_bias: Tensor,
+    /// ConvNeXt depthwise 7×7 (weight [128, 49]).
+    dw: DepthwiseConv,
     pw1: Linear,
     pw2: Linear,
     out: Linear,
@@ -64,8 +59,7 @@ impl Embed {
             conv0: linear(l, &format!("{p}.conv.0"), EMBED_LAYER1, 9)?,
             conv1: linear(l, &format!("{p}.conv.4"), EMBED_LAYER2, 9 * EMBED_LAYER1)?,
             conv2: linear(l, &format!("{p}.conv.7"), c, 9 * EMBED_LAYER2)?,
-            dw: kernel_taps(&dw)?,
-            dw_bias: param(l, &format!("{p}.convnext.depthwise_conv.bias"), c)?,
+            dw: DepthwiseConv::new(&dw, Some(param(l, &format!("{p}.convnext.depthwise_conv.bias"), c)?))?,
             pw1: linear(l, &format!("{p}.convnext.pointwise_conv1"), 3 * c, c)?,
             pw2: linear(l, &format!("{p}.convnext.pointwise_conv2"), c, 3 * c)?,
             out: linear(l, &format!("{p}.out"), cfg.encoder_dim[0], c * width)?,
@@ -98,14 +92,7 @@ impl Embed {
         let new_cache = xc.slice(0, t_out, t_out + CONVNEXT_CACHE)?.contiguous()?;
         let pad = CONVNEXT_K / 2;
         let xp = xc.pad(1, pad, pad, 0.0)?;
-        let mut taps = Vec::with_capacity(CONVNEXT_K * CONVNEXT_K);
-        for kt in 0..CONVNEXT_K {
-            let rows = xp.slice(0, kt, kt + t_out)?;
-            for kf in 0..CONVNEXT_K {
-                taps.push(rows.slice(1, kf, kf + self.width)?);
-            }
-        }
-        let y = weighted_sum(&taps, &self.dw, Some(&self.dw_bias))?;
+        let y = self.dw.apply(&taps_2d(&xp, 0, (CONVNEXT_K, CONVNEXT_K), (1, 1), (t_out, self.width))?)?;
         let y = self.pw2.forward(&swoosh_l(&self.pw1.forward(&y)?)?)?;
         let x = bypass.add(&y)?; // [T_out, W, 128]
         let flat = x.permute(&[0, 2, 1])?.contiguous()?.reshape(&[t_out, EMBED_CHANNELS * self.width])?;

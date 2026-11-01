@@ -82,45 +82,6 @@ pub(crate) fn bypass(orig: &Tensor, x: &Tensor, scale: &Tensor) -> Result<Tensor
     orig.add(&x.sub(orig)?.mul(scale)?)
 }
 
-/// Per-channel weights of a depthwise kernel `w` [C, K] (realized f32) -> K tensors [C].
-pub(crate) fn kernel_taps(w: &Tensor) -> Result<Vec<Tensor>> {
-    let k = w.shape().get(1).copied().unwrap_or(0);
-    (0..k).map(|t| w.slice(1, t, t + 1)?.squeeze(1)).collect()
-}
-
-/// Σ taps[t] * weights[t] (+ bias): one elementwise chain the compiler fuses.
-pub(crate) fn weighted_sum(taps: &[Tensor], weights: &[Tensor], bias: Option<&Tensor>) -> Result<Tensor> {
-    let mut acc: Option<Tensor> = None;
-    for (x, w) in taps.iter().zip(weights) {
-        let term = x.mul(w)?;
-        acc = Some(match acc {
-            Some(a) => a.add(&term)?,
-            None => term,
-        });
-    }
-    let acc = acc.ok_or_else(|| Error::new("internal", "weighted sum of zero taps"))?;
-    match bias {
-        Some(b) => acc.add(b),
-        None => Ok(acc),
-    }
-}
-
-/// `x[.., start + i*stride, ..]` for `i in 0..n` along `axis` (zero-padding the tail when the
-/// last window would run past the end; the padding is never selected).
-pub(crate) fn strided(x: &Tensor, axis: usize, start: usize, n: usize, stride: usize) -> Result<Tensor> {
-    if stride == 1 {
-        return x.slice(axis as isize, start, start + n);
-    }
-    let len = x.shape()[axis];
-    let need = start + n * stride;
-    let x = if need > len { x.pad(axis as isize, 0, need - len, 0.0)? } else { x.clone() };
-    let w = x.slice(axis as isize, start, need)?;
-    let mut shape = w.shape().to_vec();
-    shape[axis] = n;
-    shape.insert(axis + 1, stride);
-    w.contiguous()?.reshape(&shape)?.slice(axis as isize + 1, 0, 1)?.squeeze(axis as isize + 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,12 +106,5 @@ mod tests {
             assert!((l[i] as f64 - wl).abs() < 1e-4 * wl.abs().max(1.0), "swoosh_l({a}) {} vs {wl}", l[i]);
             assert!((r[i] as f64 - wr).abs() < 1e-4 * wr.abs().max(1.0), "swoosh_r({a}) {} vs {wr}", r[i]);
         }
-    }
-
-    #[test]
-    fn strided_picks_every_other() {
-        let x = Tensor::from_f32(&(0..7).map(|i| i as f32).collect::<Vec<_>>(), &[7, 1]).expect("x");
-        assert_eq!(eval(&strided(&x, 0, 2, 3, 2).expect("s")), vec![2.0, 4.0, 6.0]);
-        assert_eq!(eval(&strided(&x, 0, 0, 4, 2).expect("s")), vec![0.0, 2.0, 4.0, 6.0]);
     }
 }

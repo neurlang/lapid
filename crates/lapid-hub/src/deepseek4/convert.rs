@@ -23,6 +23,7 @@ use serde_json::{Map, Value, json};
 
 use super::config::Deepseek4Config;
 use super::model::{EMBED, HEAD};
+use crate::llama::convert::expert_stacks;
 
 macro_rules! blk {
     ($g:literal, $h:literal) => {
@@ -101,14 +102,6 @@ fn layer_of(name: &str) -> Option<usize> {
     name.strip_prefix("layers.")?.split('.').next()?.parse().ok()
 }
 
-/// `(layers.{i}.ffn.experts.{w}, e)` of a per-expert upstream tensor.
-fn per_expert(name: &str) -> Option<(String, usize)> {
-    let (prefix, rest) = name.split_once(".ffn.experts.")?;
-    let (e, part) = rest.split_once('.')?;
-    let w = part.strip_suffix(".weight").filter(|w| matches!(*w, "w1" | "w2" | "w3"))?;
-    Some((format!("{prefix}.ffn.experts.{w}"), e.parse().ok()?))
-}
-
 impl ConvertHooks for Hooks {
     fn hf_config(&self, c: &Value) -> Result<Value> {
         cfg_of(c).map(|_| c.clone())
@@ -180,22 +173,7 @@ impl ConvertHooks for Hooks {
         if name.ends_with(".scale") {
             bail!("unsupported_dtype", "{name}: FP8 / FP4 quantized upstream checkpoints are not supported; convert a GGUF instead");
         }
-        let Some((stack, e)) = per_expert(name) else { return Ok(Emit::Keep) };
-        if e != 0 {
-            return Ok(Emit::Drop);
-        }
-        let inner = src.shape(name).unwrap_or_default();
-        let mut data = Vec::new();
-        for x in 0..cfg.n_experts {
-            let n = name.replacen(".experts.0.", &format!(".experts.{x}."), 1);
-            if src.shape(&n).as_ref() != Some(&inner) {
-                bail!("missing_tensor", "{stack}: expert {x} missing or of another shape");
-            }
-            data.extend(src.f32(&n)?);
-        }
-        let mut shape = vec![cfg.n_experts];
-        shape.extend(inner);
-        Ok(Emit::Replace(vec![(stack, shape, data)]))
+        expert_stacks(name, src, cfg.n_experts)
     }
 }
 
@@ -315,8 +293,6 @@ mod tests {
         assert_eq!(g("output_hc_fn.weight"), Renamed::To("hc_head_fn".into()));
         assert_eq!(g("blk.0.exp_probs_b_vl.bias"), Renamed::Drop);
         assert_eq!(g("blk.0.mystery.weight"), Renamed::NoMatch);
-        assert_eq!(per_expert("layers.2.ffn.experts.7.w3.weight"), Some(("layers.2.ffn.experts.w3".into(), 7)));
-        assert_eq!(per_expert("layers.2.ffn.shared_experts.w3.weight"), None);
         assert_eq!(CONVERT.role(EMBED, &[129280, 4096]), Role::LinearInt8);
         assert_eq!(CONVERT.role("layers.0.hc_attn_fn", &[24, 16384]), Role::Param);
         assert_eq!(CONVERT.role("layers.1.attn.compressor.wkv.weight", &[1024, 4096]), Role::Param);

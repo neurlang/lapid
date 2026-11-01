@@ -2,7 +2,10 @@
 //! (`metadata["zipformer"]`, written by [`super::convert`] from the exported `config.json`).
 
 use lapid::{Error, Result};
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 
 /// Blob holding sherpa-onnx style `tokens.txt` (`<piece> <id>` per line).
 pub(crate) const TOKENS_BLOB: &str = "tokenizer/tokens.txt";
@@ -18,9 +21,13 @@ pub const TAIL_FRAMES: usize = 30;
 /// `log(1e-10)`: the fbank value of padding frames.
 pub const LOG_EPS: f32 = -23.025_850_929_940_457;
 
-#[derive(Clone, Debug, PartialEq)]
+/// Lists may be given as "2,2,3" strings and integers as strings (icefall's command-line
+/// form in exported `config.json` files); one-element lists apply to every stack.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ZipformerConfig {
+    #[serde(default = "default_sample_rate")]
     pub sample_rate: u32,
+    #[serde(default = "default_feature_dim")]
     pub feature_dim: usize,
     /// Per encoder stack (all of the same length).
     pub num_encoder_layers: Vec<usize>,
@@ -75,29 +82,11 @@ impl ZipformerConfig {
         3 * self.encoder_dim[i] / 4
     }
 
+    /// The metadata object (`metadata["zipformer"]`): the fields plus the tokens blob name.
     pub fn to_json(&self) -> Value {
-        json!({
-            "sample_rate": self.sample_rate,
-            "feature_dim": self.feature_dim,
-            "num_encoder_layers": self.num_encoder_layers,
-            "downsampling_factor": self.downsampling_factor,
-            "feedforward_dim": self.feedforward_dim,
-            "num_heads": self.num_heads,
-            "encoder_dim": self.encoder_dim,
-            "cnn_module_kernel": self.cnn_module_kernel,
-            "query_head_dim": self.query_head_dim,
-            "value_head_dim": self.value_head_dim,
-            "pos_head_dim": self.pos_head_dim,
-            "pos_dim": self.pos_dim,
-            "decoder_dim": self.decoder_dim,
-            "joiner_dim": self.joiner_dim,
-            "context_size": self.context_size,
-            "vocab_size": self.vocab_size,
-            "blank_id": self.blank_id,
-            "chunk_size": self.chunk_size,
-            "left_context_frames": self.left_context_frames,
-            "tokens_blob": TOKENS_BLOB,
-        })
+        let mut v = serde_json::to_value(self).unwrap_or_default();
+        v["tokens_blob"] = Value::from(TOKENS_BLOB);
+        v
     }
 
     pub fn from_metadata(metadata: &Value) -> Result<ZipformerConfig> {
@@ -107,38 +96,9 @@ impl ZipformerConfig {
         ZipformerConfig::from_json(z)
     }
 
-    /// From the metadata object or an exported `config.json` (lists may be "2,2,3" strings).
+    /// From the metadata object or an exported `config.json`.
     pub fn from_json(z: &Value) -> Result<ZipformerConfig> {
-        let u = |k: &str| -> Result<usize> {
-            match z.get(k) {
-                Some(Value::Number(n)) => n.as_u64().map(|v| v as usize),
-                Some(Value::String(s)) => s.trim().parse().ok(),
-                _ => None,
-            }
-            .ok_or_else(|| meta_err(format!("zipformer config: missing or invalid integer '{k}'")))
-        };
-        let cfg = ZipformerConfig {
-            sample_rate: z.get("sample_rate").and_then(Value::as_u64).unwrap_or(16_000) as u32,
-            feature_dim: z.get("feature_dim").and_then(Value::as_u64).unwrap_or(80) as usize,
-            num_encoder_layers: list(z, "num_encoder_layers")?,
-            downsampling_factor: list(z, "downsampling_factor")?,
-            feedforward_dim: list(z, "feedforward_dim")?,
-            num_heads: list(z, "num_heads")?,
-            encoder_dim: list(z, "encoder_dim")?,
-            cnn_module_kernel: list(z, "cnn_module_kernel")?,
-            query_head_dim: list(z, "query_head_dim")?,
-            value_head_dim: list(z, "value_head_dim")?,
-            pos_head_dim: list(z, "pos_head_dim")?,
-            pos_dim: u("pos_dim")?,
-            decoder_dim: u("decoder_dim")?,
-            joiner_dim: u("joiner_dim")?,
-            context_size: u("context_size")?,
-            vocab_size: u("vocab_size")?,
-            blank_id: u("blank_id")? as u32,
-            chunk_size: u("chunk_size")?,
-            left_context_frames: u("left_context_frames")?,
-        };
-        cfg.normalized()
+        ZipformerConfig::deserialize(numeric(z)).map_err(|e| meta_err(format!("zipformer config: {e}")))?.normalized()
     }
 
     /// Broadcast one-element lists to every stack (icefall `_to_tuple`) and validate.
@@ -219,14 +179,37 @@ impl ZipformerConfig {
     }
 }
 
-fn list(z: &Value, k: &str) -> Result<Vec<usize>> {
-    let bad = || meta_err(format!("zipformer config: missing or invalid list '{k}'"));
-    match z.get(k) {
-        Some(Value::String(s)) => s.split(',').map(|x| x.trim().parse::<usize>().map_err(|_| bad())).collect(),
-        Some(Value::Array(a)) => a.iter().map(|x| x.as_u64().map(|v| v as usize).ok_or_else(bad)).collect(),
-        Some(Value::Number(n)) => n.as_u64().map(|v| vec![v as usize]).ok_or_else(bad),
-        _ => Err(bad()),
+fn default_sample_rate() -> u32 {
+    16_000
+}
+
+fn default_feature_dim() -> usize {
+    80
+}
+
+/// Per-stack list fields.
+const LISTS: [&str; 9] = [
+    "num_encoder_layers", "downsampling_factor", "feedforward_dim", "num_heads", "encoder_dim",
+    "cnn_module_kernel", "query_head_dim", "value_head_dim", "pos_head_dim",
+];
+
+/// icefall's command-line forms as JSON: "2,2,3" strings (and single integers) as lists for
+/// the per-stack fields, integer strings as integers.
+fn numeric(z: &Value) -> Value {
+    let mut z = z.clone();
+    for (k, v) in z.as_object_mut().into_iter().flatten() {
+        let list = LISTS.contains(&k.as_str());
+        match v {
+            Value::String(s) => {
+                if let Some(n) = s.split(',').map(|x| x.trim().parse::<u64>().ok()).collect::<Option<Vec<u64>>>() {
+                    *v = if list || n.len() != 1 { Value::from(n) } else { Value::from(n[0]) };
+                }
+            }
+            Value::Number(_) if list => *v = Value::Array(vec![v.clone()]),
+            _ => {}
+        }
     }
+    z
 }
 
 fn meta_err(msg: impl Into<String>) -> Error {

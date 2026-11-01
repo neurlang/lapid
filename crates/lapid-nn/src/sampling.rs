@@ -89,6 +89,23 @@ impl Rng {
     pub fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
     }
+
+    /// `n` samples of N(0, std^2) (Box-Muller: each pair of uniforms gives a cos and a sin
+    /// sample; for odd `n` the last sin sample is dropped).
+    pub fn normal(&mut self, n: usize, std: f32) -> Vec<f32> {
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            let u1 = self.next_f64().max(f64::MIN_POSITIVE);
+            let u2 = self.next_f64();
+            let r = (-2.0 * u1.ln()).sqrt();
+            let a = std::f64::consts::TAU * u2;
+            out.push((r * a.cos()) as f32 * std);
+            if out.len() < n {
+                out.push((r * a.sin()) as f32 * std);
+            }
+        }
+        out
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -182,6 +199,19 @@ impl Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_moments_and_pairs() {
+        let v = Rng::new(1).normal(20_000, 2.0);
+        let mean = v.iter().sum::<f32>() / v.len() as f32;
+        let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / v.len() as f32;
+        assert!(mean.abs() < 0.05 && (var - 4.0).abs() < 0.15, "mean {mean} var {var}");
+        // an odd count drops the last pair's sin sample: the next draw starts a new pair
+        let mut a = Rng::new(3);
+        let (x, y) = (a.normal(3, 1.0), a.normal(1, 1.0));
+        let z = Rng::new(3).normal(6, 1.0);
+        assert_eq!((&x[..], y[0]), (&z[..3], z[4]));
+    }
 
     #[test]
     fn argmax_first_max_and_nan() {

@@ -5,16 +5,8 @@
 //! upstream-style copy), so one parser reads all of them.
 
 use lapid::{Error, Result, bail};
+pub use lapid_nn::llm::rope::Yarn;
 use serde_json::Value;
-
-/// YaRN frequency interpolation of the compressed-attention RoPE (sliding layers use plain RoPE).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Yarn {
-    pub factor: f32,
-    pub original_max_positions: usize,
-    pub beta_fast: f32,
-    pub beta_slow: f32,
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Deepseek4Config {

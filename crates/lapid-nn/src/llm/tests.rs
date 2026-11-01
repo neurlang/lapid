@@ -1,7 +1,8 @@
-//! Real-shape kernel coverage for DeepSeek V4 (random data, every available device vs the
-//! CPU / host): the lightning-indexer top-k (k = 512 over a long compressed history), the
-//! head-dim-512 MQA logits + per-head sink softmax (64 heads), the grouped output projection
-//! as MatMulId (8 groups of [1024, 4096], f16) and the hyper-connection Sinkhorn at hc = 4.
+//! Real-shape kernel coverage of the LLM blocks at DeepSeek V4 sizes (random data, every
+//! available device vs the CPU / host): top-k (k = 512 over a long compressed history, the
+//! lightning indexer), head-dim-512 MQA logits + per-head sink softmax (64 heads), MatMulId
+//! with 8 f16 "experts" of [1024, 4096] (grouped output projection) and the Sinkhorn
+//! hyper-connection mixing at hc = 4.
 
 use lapid::{DType, Device, Result, Tensor};
 

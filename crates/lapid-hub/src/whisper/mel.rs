@@ -58,9 +58,6 @@ pub(crate) struct LongMel {
     /// [n_mels, total_frames]
     data: Vec<f32>,
     total_frames: usize,
-    /// Frames that cover real audio (`content_frames` in transcribe.py).
-    #[allow(dead_code)] // the seek loop uses `content_frames(len)`; kept for tests / debugging
-    pub content_frames: usize,
 }
 
 impl LongMel {
@@ -74,7 +71,6 @@ impl LongMel {
             n_mels: mel.n_mels(),
             data: finalize(&mel.compute(&signal, total_frames)),
             total_frames,
-            content_frames: total_frames.saturating_sub(N_FRAMES),
         }
     }
 
@@ -94,7 +90,7 @@ impl LongMel {
     }
 }
 
-/// Number of mel frames covering `n_samples` of real audio.
+/// Number of mel frames covering `n_samples` of real audio (`content_frames` in transcribe.py).
 pub(crate) fn content_frames(n_samples: usize) -> usize {
     n_samples / HOP_LENGTH
 }
@@ -121,7 +117,7 @@ mod tests {
         let mel = whisper_mel(80).unwrap();
         let samples = vec![0.1f32; 16000 * 40];
         let long = LongMel::new(&samples, &mel);
-        assert_eq!(long.content_frames, 4000);
+        assert_eq!(content_frames(samples.len()), 4000);
         let w = long.window(3000, 1000);
         assert_eq!(w.len(), 80 * N_FRAMES);
         assert_eq!(w[1500], 0.0); // padded tail

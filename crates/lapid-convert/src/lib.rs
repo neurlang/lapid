@@ -1,11 +1,11 @@
 //! lapid-convert: generic building blocks for converting models to `.lapid`.
 //!
 //! Hugging Face Hub downloads (cached), a safetensors reader, a GGUF reader with ggml
-//! dequantizers, the output dtype policy and quantized encoding, and a streaming,
-//! policy-applying writer, and the declarative converter engine (`engine`, `mapping`,
-//! `transforms`, `assets`): a model describes its tensor names and roles as tables plus
-//! small hooks, and the engine does the rest. Model-specific tables and hooks live with
-//! their model in `lapid-hub`.
+//! dequantizers, the legacy ggml container (`ggml_legacy`), the output dtype policy and
+//! quantized encoding, and a streaming, policy-applying writer, and the declarative
+//! converter engine (`engine`, `mapping`, `transforms`, `assets`): a model describes its
+//! tensor names and roles as tables plus small hooks, and the engine does the rest.
+//! Model-specific tables and hooks live with their model in `lapid-hub`.
 
 use std::path::PathBuf;
 
@@ -15,6 +15,7 @@ pub mod assets;
 pub mod calibrate;
 pub mod engine;
 pub mod ggml;
+pub mod ggml_legacy;
 mod gptq;
 pub mod gguf;
 mod hf;

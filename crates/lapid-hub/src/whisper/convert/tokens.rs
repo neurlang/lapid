@@ -1,5 +1,5 @@
-//! Whisper tokenizer tables shared by the converters: GPT-2 byte-level encoding, the
-//! language list (token order), and the default suppress lists.
+//! Whisper tokenizer tables shared by the converters: the language list (token order), the
+//! canonical special-token layout and the default suppress lists.
 
 /// Whisper language codes in token order (`<|en|>` = sot + 1, ...). `yue` exists only in
 /// 100-language models (large-v3).
@@ -30,28 +30,6 @@ const SUPPRESS_ENGLISH: [u32; 84] = [
     15306, 16410, 16791, 17992, 19203, 19510, 20724, 22305, 22935, 27007, 30109, 30420, 33409, 34949, 40283, 40493,
     40549, 47282, 49146,
 ];
-
-/// GPT-2 `bytes_to_unicode`: byte → char used in byte-level BPE token strings.
-pub(crate) fn byte_to_char_table() -> [char; 256] {
-    let printable = |b: u32| (0x21..=0x7e).contains(&b) || (0xa1..=0xac).contains(&b) || (0xae..=0xff).contains(&b);
-    let mut table = ['\0'; 256];
-    let mut n = 0u32;
-    for b in 0..256u32 {
-        let cp = if printable(b) {
-            b
-        } else {
-            n += 1;
-            255 + n
-        };
-        table[b as usize] = char::from_u32(cp).unwrap_or('\u{fffd}');
-    }
-    table
-}
-
-/// Raw token bytes → byte-level BPE string (HF `vocab.json` form).
-pub(crate) fn bytes_to_bpe_string(table: &[char; 256], bytes: &[u8]) -> String {
-    bytes.iter().map(|&b| table[b as usize]).collect()
-}
 
 /// Special-token ids of a Whisper vocabulary.
 #[derive(Clone, Debug, PartialEq)]
@@ -122,14 +100,6 @@ impl Specials {
         v.extend([self.sot, self.translate, self.transcribe, self.sot_lm, self.prev, self.no_speech]);
         v
     }
-
-    pub(crate) fn begin_suppress_tokens(&self) -> Vec<u32> {
-        vec![220, self.eot]
-    }
-
-    pub(crate) fn languages(&self) -> Vec<(&'static str, u32)> {
-        LANGUAGES.iter().take(self.n_languages as usize).enumerate().map(|(i, c)| (*c, self.sot + 1 + i as u32)).collect()
-    }
 }
 
 #[cfg(test)]
@@ -137,24 +107,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn byte_level_table() {
-        let t = byte_to_char_table();
-        assert_eq!(t[b'a' as usize], 'a');
-        assert_eq!(t[b' ' as usize], 'Ġ');
-        assert_eq!(t[b'\n' as usize], 'Ċ');
-        assert_eq!(t[0], 'Ā');
-        assert_eq!(t[0xad], 'Ń');
-        assert_eq!(bytes_to_bpe_string(&t, b" the"), "Ġthe");
-    }
-
-    #[test]
     fn whisper_small_specials() {
         let s = Specials::from_n_vocab(51865);
         assert_eq!((s.eot, s.sot, s.translate, s.transcribe), (50257, 50258, 50358, 50359));
         assert_eq!((s.sot_lm, s.prev, s.no_speech, s.no_timestamps, s.timestamp_begin), (50360, 50361, 50362, 50363, 50364));
-        assert_eq!(s.languages()[0], ("en", 50259));
-        assert_eq!(s.languages().last().copied(), Some(("su", 50357)));
         let strs = s.token_strings(51865);
+        assert!(strs.contains(&(50259, "<|en|>".to_string())) && strs.contains(&(50357, "<|su|>".to_string())));
         assert_eq!(strs.last().map(|t| t.1.as_str()), Some("<|30.00|>"));
         assert!(strs.contains(&(50364, "<|0.00|>".to_string())));
         assert!(strs.contains(&(50365, "<|0.02|>".to_string())));
@@ -168,6 +126,6 @@ mod tests {
         assert_eq!((en.eot, en.sot, en.translate, en.no_timestamps, en.timestamp_begin), (50256, 50257, 50357, 50362, 50363));
         let v3 = Specials::from_n_vocab(51866);
         assert_eq!((v3.translate, v3.transcribe, v3.no_timestamps), (50359, 50360, 50364));
-        assert_eq!(v3.languages().last().copied(), Some(("yue", 50358)));
+        assert!(v3.token_strings(51866).contains(&(50358, "<|yue|>".to_string())));
     }
 }

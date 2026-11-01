@@ -36,10 +36,11 @@ pub use lapid_nn::Precision;
 pub use crate::runtime::transducer::Step;
 use crate::model::{Bytes, Model, ModelInfo, hub_model_path};
 use crate::runtime::audio::{Argmax, AsrModel, AudioDef, BenchRun, Check, EndToEnd, Row, Sample, Stages, asr_entry};
-use crate::runtime::serve::{AsrParams, AsrSegment, AsrWord, TranscriptOut};
+use crate::runtime::serve::{AsrParams, TranscriptOut};
 use crate::runtime::transducer::{GreedyOptions, Transducer, context_windows, forced_decode, greedy_decode};
 use mel::{Features, Mel};
-use model::decoder::{Joint, LstmState, Prediction};
+use lapid_nn::speech::LstmState;
+use model::decoder::{Joint, Prediction};
 use model::encoder::Encoder;
 
 #[derive(Clone, Debug)]
@@ -65,20 +66,8 @@ pub struct Token {
     pub end: f32,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct Word {
-    pub word: String,
-    pub start: f32,
-    pub end: f32,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct Segment {
-    pub start: f32,
-    pub end: f32,
-    pub text: String,
-    pub tokens: Vec<u32>,
-}
+/// A word with its time span (seconds), and a sentence-level segment.
+pub use crate::runtime::serve::{AsrSegment as Segment, AsrWord as Word};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Transcript {
@@ -300,11 +289,11 @@ impl Transducer for Parakeet {
     }
 
     fn predictor_init(&self) -> Result<Vec<Tensor>> {
-        Ok(self.prediction.zero_state().tensors().into_iter().cloned().collect())
+        Ok(self.prediction.lstm.zero_state().tensors().into_iter().cloned().collect())
     }
 
     fn predict(&self, _history: &[u32], token: u32, state: &[Tensor]) -> Result<(Tensor, Vec<Tensor>)> {
-        let (out, next) = self.prediction.step(token, &LstmState::from_tensors(state.to_vec(), self.prediction.n_layers()))?;
+        let (out, next) = self.prediction.step(token, &LstmState::from_tensors(state.to_vec(), self.prediction.lstm.layers.len()))?;
         Ok((out, next.tensors().into_iter().cloned().collect()))
     }
 
@@ -316,12 +305,7 @@ impl Transducer for Parakeet {
 impl AsrModel for Parakeet {
     fn recognize(&self, samples: &[f32], _: &AsrParams) -> Result<TranscriptOut> {
         let t = self.transcribe(samples, &TranscribeOptions::default())?;
-        Ok(TranscriptOut {
-            text: t.text.trim().to_string(),
-            language: None,
-            segments: t.segments.into_iter().map(|s| AsrSegment { start: s.start, end: s.end, text: s.text, tokens: s.tokens }).collect(),
-            words: t.words.into_iter().map(|w| AsrWord { word: w.word, start: w.start, end: w.end }).collect(),
-        })
+        Ok(TranscriptOut { text: t.text.trim().to_string(), language: None, segments: t.segments, words: t.words })
     }
 }
 

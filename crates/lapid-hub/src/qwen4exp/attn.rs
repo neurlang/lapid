@@ -1,7 +1,7 @@
 //! Gated full attention with the QSA token indexer (HF `Qwen4ExpTextAttention` +
 //! `Qwen4ExpTextQSAIndexer`, llama.cpp qwen4exp `build_layer_attn` / `build_qsa_sel`).
 //!
-//! Attention itself is Qwen3.5's (`qwen35::model::GatedAttention`).
+//! Attention itself is Qwen3.5's (`lapid_nn::llm::gated_attention::GatedAttention`).
 //!
 //! QSA restricts each query to the top `budget / ratio` blocks of `ratio` consecutive keys plus
 //! its incomplete tail. A block is scored by one pooled key: the mean of the raw indexer keys
@@ -19,9 +19,8 @@
 
 use lapid::{BinaryOp, DType, Result, Tensor};
 use lapid_nn::attention::Mask;
+use lapid_nn::llm::gated_attention::GatedAttention;
 use lapid_nn::{KvCache, Linear, RmsNorm, Rope, ops};
-
-use crate::qwen35::model::GatedAttention;
 
 pub(crate) struct Indexer {
     pub q: Linear,

@@ -24,20 +24,7 @@ pub(crate) enum Noise {
 impl Noise {
     fn draw(&mut self, n: usize, std: f32) -> Vec<f32> {
         match self {
-            Noise::Seeded(rng) => {
-                let mut out = Vec::with_capacity(n);
-                while out.len() < n {
-                    let u1 = rng.next_f64().max(f64::MIN_POSITIVE);
-                    let u2 = rng.next_f64();
-                    let r = (-2.0 * u1.ln()).sqrt();
-                    let a = std::f64::consts::TAU * u2;
-                    out.push((r * a.cos()) as f32 * std);
-                    if out.len() < n {
-                        out.push((r * a.sin()) as f32 * std);
-                    }
-                }
-                out
-            }
+            Noise::Seeded(rng) => rng.normal(n, std),
             Noise::Fixed(v, pos) => {
                 let out = (0..n).map(|i| v.get(*pos + i).copied().unwrap_or(0.0)).collect();
                 *pos += n;

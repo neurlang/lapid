@@ -13,6 +13,7 @@
 
 use lapid::{DType, Result, Tensor, bail};
 use lapid_nn::attention::{merge_heads, scaled_dot_product_attention};
+use lapid_nn::vision::{aspect_preserving_size, axial_rope, block_mean_matrix, patchify_raster};
 use lapid_nn::{Embedding, Linear, Loader, Mask, RmsNorm, Rope, ops};
 
 use super::config::{ImageProcessorConfig, VisionConfig};
@@ -36,31 +37,11 @@ pub struct PreparedImage {
     pub n_soft: usize,
 }
 
-/// HF `get_aspect_ratio_preserving_size` (height, width).
-pub fn target_size(height: usize, width: usize, patch: usize, max_patches: usize, k: usize) -> Result<(usize, usize)> {
-    let target_px = (max_patches * patch * patch) as f64;
-    let factor = (target_px / (height * width) as f64).sqrt();
-    let side = k * patch;
-    let mut th = ((factor * height as f64) / side as f64).floor() as usize * side;
-    let mut tw = ((factor * width as f64) / side as f64).floor() as usize * side;
-    let max_side = (max_patches / (k * k)) * side;
-    match (th, tw) {
-        (0, 0) => bail!("invalid_argument", "gemma4 vision: image {height}x{width} resizes to 0x0"),
-        (0, _) => (th, tw) = (side, ((width as f64 / height as f64).floor() as usize * side).min(max_side)),
-        (_, 0) => (th, tw) = (((height as f64 / width as f64).floor() as usize * side).min(max_side), side),
-        _ => {}
-    }
-    if (th * tw) as f64 > target_px {
-        bail!("invalid_argument", "gemma4 vision: {height}x{width} -> {th}x{tw} exceeds {max_patches} patches");
-    }
-    Ok((th, tw))
-}
-
-/// Resize, rescale and patchify `img`.
+/// Resize (aspect kept, at most `max_soft_tokens * k^2` patches), rescale and patchify `img`.
 pub fn prepare(img: &Image, pc: &ImageProcessorConfig) -> Result<PreparedImage> {
     let (p, k) = (pc.patch_size, pc.pooling_kernel_size);
     let img = if pc.do_resize {
-        let (th, tw) = target_size(img.height, img.width, p, pc.max_soft_tokens * k * k, k)?;
+        let (th, tw) = aspect_preserving_size(img.height, img.width, p, pc.max_soft_tokens * k * k, k)?;
         img.resize(tw, th, pc.resample)?
     } else {
         img.clone()
@@ -69,20 +50,10 @@ pub fn prepare(img: &Image, pc: &ImageProcessorConfig) -> Result<PreparedImage> 
     if p == 0 || k == 0 || h % (p * k) != 0 || w % (p * k) != 0 {
         bail!("invalid_argument", "gemma4 vision: {h}x{w} is not a multiple of {}", p * k);
     }
-    let chw = img.to_chw(pc.rescale_factor, pc.mean, pc.std);
-    let (rows, cols, pp) = (h / p, w / p, 3 * p * p);
-    let mut patches = vec![0.0f32; rows * cols * pp];
-    let mut positions = Vec::with_capacity(rows * cols);
-    for r in 0..rows {
-        for c in 0..cols {
-            let base = (r * cols + c) * pp;
-            for (iy, ix, ch) in (0..p).flat_map(|y| (0..p).flat_map(move |x| (0..3).map(move |ch| (y, x, ch)))) {
-                patches[base + (iy * p + ix) * 3 + ch] = chw[ch * h * w + (r * p + iy) * w + c * p + ix];
-            }
-            positions.push([c, r]);
-        }
-    }
-    Ok(PreparedImage { patches, positions, grid: (rows, cols), n_soft: rows * cols / (k * k) })
+    let pt = patchify_raster(&img.to_chw(pc.rescale_factor, pc.mean, pc.std), h, w, p);
+    let (rows, cols) = (pt.grid_h, pt.grid_w);
+    let positions = (0..rows).flat_map(|r| (0..cols).map(move |c| [c, r])).collect();
+    Ok(PreparedImage { patches: pt.data, positions, grid: (rows, cols), n_soft: rows * cols / (k * k) })
 }
 
 /// Gemma4ClippableLinear: clamp(lin(clamp(x, input)), output).
@@ -172,20 +143,13 @@ impl VisionTower {
         })
     }
 
-    /// Axial RoPE on t [1, H, N, hd]: first half by x (column), second half by y (row).
-    fn rope2d(&self, t: &Tensor, xs: &[usize], ys: &[usize]) -> Result<Tensor> {
-        let hd = self.cfg.head_dim;
-        let a = self.rope.apply_positions(&t.slice(3, 0, hd / 2)?, xs)?;
-        Tensor::cat(&[&a, &self.rope.apply_positions(&t.slice(3, hd / 2, hd)?, ys)?], 3)
-    }
-
     fn layer(&self, ly: &Layer, x: &Tensor, xs: &[usize], ys: &[usize]) -> Result<Tensor> {
         let (n, hd, c) = (x.shape()[1], self.cfg.head_dim, &self.cfg);
         let [q, k, v, o, gate, up, down] = &ly.lin;
         let h = ly.norms[0].forward(x)?;
         let heads = |t: Tensor, nh: usize| t.reshape(&[1, n, nh, hd]);
-        let q = self.rope2d(&ly.q_norm.forward(&heads(q.forward(&h)?, c.n_head)?)?.permute(&[0, 2, 1, 3])?, xs, ys)?;
-        let k = self.rope2d(&ly.k_norm.forward(&heads(k.forward(&h)?, c.n_kv_head)?)?.permute(&[0, 2, 1, 3])?, xs, ys)?;
+        let q = axial_rope(&self.rope, &ly.q_norm.forward(&heads(q.forward(&h)?, c.n_head)?)?.permute(&[0, 2, 1, 3])?, xs, ys)?;
+        let k = axial_rope(&self.rope, &ly.k_norm.forward(&heads(k.forward(&h)?, c.n_kv_head)?)?.permute(&[0, 2, 1, 3])?, xs, ys)?;
         let v = rms_plain(&heads(v.forward(&h)?, c.n_kv_head)?, c.eps)?.permute(&[0, 2, 1, 3])?;
         let a = o.forward(&merge_heads(&scaled_dot_product_attention(&q, &k, &v, 1.0, &Mask::None)?)?)?;
         let x = x.add(&ly.norms[1].forward(&a)?)?;
@@ -216,18 +180,10 @@ impl VisionTower {
             x = self.layer(ly, &x, &xs, &ys)?;
             taps.tap(format_args!("vision.layers.{i}"), &x);
         }
-        // Block-average pooling as a [M, N] matmul (blocks row-major, weights 1/k^2).
-        let (m, bw) = (img.n_soft, img.grid.1 / k);
-        let mut w = vec![0.0f32; m * n];
-        for (j, p) in img.positions.iter().enumerate() {
-            let block = p[0] / k + bw * (p[1] / k);
-            if block >= m {
-                bail!("shape_mismatch", "gemma4 vision: patch {j} pools to block {block} of {m}");
-            }
-            w[block * n + j] = 1.0 / (k * k) as f32;
-        }
+        // Block-average pooling as a [M, N] matmul.
+        let pool = block_mean_matrix(&img.positions, k, img.grid.1 / k, img.n_soft)?;
         let h = x.reshape(&[n, c.hidden_size])?;
-        let mut pooled = Tensor::from_f32(&w, &[m, n])?.matmul(&h)?.mul_scalar((c.hidden_size as f64).sqrt())?;
+        let mut pooled = pool.matmul(&h)?.mul_scalar((c.hidden_size as f64).sqrt())?;
         if let Some((b, s)) = &self.std {
             pooled = pooled.sub(b)?.mul(s)?;
         }
@@ -244,9 +200,6 @@ mod tests {
 
     #[test]
     fn sizes_and_patches() {
-        // 640x488 (w x h) at 280 soft tokens -> 672 x 912 (HF).
-        assert_eq!(target_size(488, 640, 16, 2520, 3).expect("size"), (672, 912));
-        assert_eq!(target_size(110, 150, 16, 630, 3).expect("size"), (336, 432));
         let rgb: Vec<u8> = (0..96 * 48 * 3).map(|i| (i % 251) as u8).collect();
         let pc = ImageProcessorConfig { do_resize: false, ..ImageProcessorConfig::from_json(None) };
         let p = prepare(&Image::new(96, 48, rgb.clone()).expect("img"), &pc).expect("prep");

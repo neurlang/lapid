@@ -15,6 +15,7 @@ use lapid::{Device, Result};
 use lapid_convert::engine::ConvertSpec;
 use lapid_nn::Precision;
 use lapid_verify::{Descriptor, diff};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::model::LstmState;
@@ -31,19 +32,9 @@ const STREAM_CHUNK: usize = 1000;
 /// Seconds of audio benchmarked (the input is tiled to this length).
 const BENCH_SECONDS: usize = 60;
 
-/// silero option names (as in `result.json`) -> [`VadOptions`].
+/// silero option names (as in `result.json`) -> [`VadOptions`] (missing ones: defaults).
 pub fn options_from_json(v: &Value) -> VadOptions {
-    let d = VadOptions::default();
-    let f = |k: &str| v.get(k).and_then(Value::as_f64);
-    let u = |k: &str, x: u32| v.get(k).and_then(Value::as_u64).map_or(x, |n| n as u32);
-    VadOptions {
-        threshold: f("threshold").map_or(d.threshold, |x| x as f32),
-        neg_threshold: f("neg_threshold").map(|x| x as f32),
-        min_speech_duration_ms: u("min_speech_duration_ms", d.min_speech_duration_ms),
-        min_silence_duration_ms: u("min_silence_duration_ms", d.min_silence_duration_ms),
-        speech_pad_ms: u("speech_pad_ms", d.speech_pad_ms),
-        max_speech_duration_s: f("max_speech_duration_s").map_or(d.max_speech_duration_s, |x| x as f32),
-    }
+    VadOptions::deserialize(v).unwrap_or_default()
 }
 
 /// Stream `samples` in `chunk`-sized pieces, then zeros up to a whole window (what the

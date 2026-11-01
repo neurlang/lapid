@@ -1,98 +1,63 @@
-//! FastConformer encoder: conv subsampling, then blocks of
-//! `x + ½ FF1(LN x)` → `x + RelPosMHA(LN x)` → `x + Conv(LN x)` → `x + ½ FF2(LN x)` → LN.
-//! The convolution module is point-wise conv (2d) → GLU → depthwise conv (k, BatchNorm
-//! folded at conversion) → SiLU → point-wise conv, run channels-last [1, T, C].
-//! The encoder projection to the joint dimension (`encoder_projector`) is applied here too.
+//! FastConformer encoder: conv subsampling, conformer blocks (`lapid_nn::speech`) over
+//! sinusoidal relative positions, and the projection to the joint dimension
+//! (`encoder_projector`).
 
 use lapid::{Result, Tensor};
-use lapid_nn::{Activation, LayerNorm, Linear, Loader, Mlp};
+use lapid_nn::speech::{ConformerBlock, ConvModule, DepthwiseConv, RelPosAttention, sinusoidal_rel_positions};
+use lapid_nn::{Activation, Linear, Loader, Mlp};
 
-use super::attention::{RelPosAttention, rel_pos_embedding};
 use super::subsampling::Subsampling;
-use super::{LN_EPS, kernel_taps, linear_checked, weighted_sum};
+use super::{LN_EPS, linear_checked};
 use crate::parakeet::config::ParakeetConfig;
 
-struct ConvModule {
-    pw1: Linear,
-    /// Depthwise per-tap weights [C] (f32), bias [C].
-    dw: Vec<Tensor>,
-    dw_bias: Tensor,
-    pw2: Linear,
-}
-
-impl ConvModule {
-    fn load(l: &Loader<'_>, p: &str, d: usize, k: usize) -> Result<ConvModule> {
-        let w = l.tensor_f32(&format!("{p}.depthwise_conv.weight"))?;
-        l.expect_shape(&w, &format!("{p}.depthwise_conv.weight"), &[d, k])?;
-        Ok(ConvModule {
-            pw1: linear_checked(l, &format!("{p}.pointwise_conv1"), 2 * d, d)?,
-            dw: kernel_taps(&w)?,
-            dw_bias: l.tensor_f32(&format!("{p}.depthwise_conv.bias"))?,
-            pw2: linear_checked(l, &format!("{p}.pointwise_conv2"), d, d)?,
-        })
-    }
-
-    /// x [1, T, C] -> [1, T, C].
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = lapid_nn::ops::glu(&self.pw1.forward(x)?, -1)?;
-        let k = self.dw.len();
-        let t = h.shape()[1];
-        let pad = (k - 1) / 2;
-        let hp = h.pad(1, pad, pad, 0.0)?;
-        let taps: Vec<Tensor> = (0..k).map(|i| hp.slice(1, i, i + t)).collect::<Result<_>>()?;
-        let y = weighted_sum(&taps, &self.dw, Some(&self.dw_bias))?;
-        self.pw2.forward(&lapid_nn::ops::silu(&y)?)
-    }
-}
-
-struct Block {
-    norm_ff1: LayerNorm,
-    ff1: Mlp,
-    norm_att: LayerNorm,
-    attn: RelPosAttention,
-    norm_conv: LayerNorm,
-    conv: ConvModule,
-    norm_ff2: LayerNorm,
-    ff2: Mlp,
-    norm_out: LayerNorm,
-}
-
-impl Block {
-    fn load(l: &Loader<'_>, p: &str, cfg: &ParakeetConfig) -> Result<Block> {
-        let d = cfg.d_model;
-        let ln = |n: &str| l.layer_norm(&format!("{p}.{n}"), LN_EPS);
-        let ff = |n: &str| -> Result<Mlp> {
-            Ok(Mlp::new(
-                linear_checked(l, &format!("{p}.{n}.linear1"), cfg.ff_dim, d)?,
-                linear_checked(l, &format!("{p}.{n}.linear2"), d, cfg.ff_dim)?,
-                Activation::Silu,
-            ))
-        };
-        Ok(Block {
-            norm_ff1: ln("norm_feed_forward1")?,
-            ff1: ff("feed_forward1")?,
-            norm_att: ln("norm_self_att")?,
-            attn: RelPosAttention::load(l, &format!("{p}.self_attn"), d, cfg.n_heads)?,
-            norm_conv: ln("norm_conv")?,
-            conv: ConvModule::load(l, &format!("{p}.conv"), d, cfg.conv_kernel)?,
-            norm_ff2: ln("norm_feed_forward2")?,
-            ff2: ff("feed_forward2")?,
-            norm_out: ln("norm_out")?,
-        })
-    }
-
-    fn forward(&self, x: &Tensor, pos: &Tensor) -> Result<Tensor> {
-        let x = x.add(&self.ff1.forward(&self.norm_ff1.forward(x)?)?.mul_scalar(0.5)?)?;
-        let x = x.add(&self.attn.forward(&self.norm_att.forward(&x)?, pos)?)?;
-        let x = x.add(&self.conv.forward(&self.norm_conv.forward(&x)?)?)?;
-        let x = x.add(&self.ff2.forward(&self.norm_ff2.forward(&x)?)?.mul_scalar(0.5)?)?;
-        self.norm_out.forward(&x)
-    }
+/// Block `p` (HF names) of a `cfg`-shaped encoder.
+fn load_block(l: &Loader<'_>, p: &str, cfg: &ParakeetConfig) -> Result<ConformerBlock> {
+    let d = cfg.d_model;
+    let ln = |n: &str| l.layer_norm(&format!("{p}.{n}"), LN_EPS);
+    let lin = |n: &str, out: usize, inp: usize| linear_checked(l, &format!("{p}.{n}"), out, inp);
+    let ff = |n: &str| -> Result<Mlp> {
+        Ok(Mlp::new(lin(&format!("{n}.linear1"), cfg.ff_dim, d)?, lin(&format!("{n}.linear2"), d, cfg.ff_dim)?, Activation::Silu))
+    };
+    let attn_bias = |n: &str| -> Result<Tensor> {
+        let name = format!("{p}.self_attn.{n}");
+        let t = l.tensor_f32(&name)?;
+        l.expect_shape(&t, &name, &[cfg.n_heads, d / cfg.n_heads])?;
+        Ok(t)
+    };
+    let attn = RelPosAttention::new(
+        lin("self_attn.q_proj", d, d)?,
+        lin("self_attn.k_proj", d, d)?,
+        lin("self_attn.v_proj", d, d)?,
+        lin("self_attn.o_proj", d, d)?,
+        lin("self_attn.relative_k_proj", d, d)?,
+        &attn_bias("bias_u")?,
+        &attn_bias("bias_v")?,
+        cfg.n_heads,
+    )?;
+    let dw_name = format!("{p}.conv.depthwise_conv.weight");
+    let dw = l.tensor_f32(&dw_name)?;
+    l.expect_shape(&dw, &dw_name, &[d, cfg.conv_kernel])?;
+    let conv = ConvModule {
+        pw1: lin("conv.pointwise_conv1", 2 * d, d)?,
+        dw: DepthwiseConv::new(&dw, Some(l.tensor_f32(&format!("{p}.conv.depthwise_conv.bias"))?))?,
+        pw2: lin("conv.pointwise_conv2", d, d)?,
+    };
+    Ok(ConformerBlock {
+        norm_ff1: ln("norm_feed_forward1")?,
+        ff1: ff("feed_forward1")?,
+        norm_att: ln("norm_self_att")?,
+        attn,
+        norm_conv: ln("norm_conv")?,
+        conv,
+        norm_ff2: ln("norm_feed_forward2")?,
+        ff2: ff("feed_forward2")?,
+        norm_out: ln("norm_out")?,
+    })
 }
 
 pub(crate) struct Encoder {
     subsampling: Subsampling,
-    blocks: Vec<Block>,
+    blocks: Vec<ConformerBlock>,
     projector: Linear,
     d_model: usize,
 }
@@ -108,7 +73,7 @@ pub(crate) struct EncoderGraph {
 impl Encoder {
     pub fn load(l: &Loader<'_>, cfg: &ParakeetConfig) -> Result<Encoder> {
         let blocks = (0..cfg.n_layers)
-            .map(|i| Block::load(l, &format!("encoder.layers.{i}"), cfg))
+            .map(|i| load_block(l, &format!("encoder.layers.{i}"), cfg))
             .collect::<Result<_>>()?;
         Ok(Encoder {
             subsampling: Subsampling::load(l, cfg)?,
@@ -125,7 +90,7 @@ impl Encoder {
         if trace {
             traced.push(x.clone());
         }
-        let pos = rel_pos_embedding(x.shape()[1], self.d_model)?;
+        let pos = sinusoidal_rel_positions(x.shape()[1], self.d_model)?;
         for (i, b) in self.blocks.iter().enumerate() {
             x = b.forward(&x, &pos)?;
             if trace {

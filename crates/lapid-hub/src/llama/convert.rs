@@ -31,32 +31,35 @@ pub static CONVERT: ConvertSpec = ConvertSpec {
     hf_model_types: MODEL_TYPES,
     gguf_architectures: &["llama", "qwen2", "qwen3", "qwen3moe", "mistral"],
     hf_names: &[Rule::drop("*rotary_emb.inv_freq"), Rule::drop("mtp.*")],
-    gguf_names: &[
-        Rule::new("token_embd.weight", EMBED),
-        Rule::new("output_norm.weight", "model.norm.weight"),
-        Rule::new("output.weight", LM_HEAD),
-        Rule::drop("rope_freqs.weight"),
-        Rule::drop("blk.{i}.attn_rot_embd*"),
-        blk!("attn_norm", "input_layernorm"),
-        blk!("ffn_norm", "post_attention_layernorm"),
-        blk!("attn_q", "self_attn.q_proj"),
-        blk!("attn_k", "self_attn.k_proj"),
-        blk!("attn_v", "self_attn.v_proj"),
-        blk!("attn_output", "self_attn.o_proj"),
-        blk!("attn_q_norm", "self_attn.q_norm"),
-        blk!("attn_k_norm", "self_attn.k_norm"),
-        blk!("ffn_gate", "mlp.gate_proj"),
-        blk!("ffn_up", "mlp.up_proj"),
-        blk!("ffn_down", "mlp.down_proj"),
-        blk!("ffn_gate_inp", "mlp.gate"),
-        Rule::new("blk.{i}.ffn_gate_exps.weight", "model.layers.{i}.mlp.experts.gate_proj"),
-        Rule::new("blk.{i}.ffn_up_exps.weight", "model.layers.{i}.mlp.experts.up_proj"),
-        Rule::new("blk.{i}.ffn_down_exps.weight", "model.layers.{i}.mlp.experts.down_proj"),
-    ],
+    gguf_names: GGUF_NAMES,
     roles: ROLES,
     text_assets: true,
     hooks: &Hooks,
 };
+
+/// llama.cpp names of the plain decoder (also the Qwen3-VL text model).
+pub(crate) const GGUF_NAMES: &[Rule] = &[
+    Rule::new("token_embd.weight", EMBED),
+    Rule::new("output_norm.weight", "model.norm.weight"),
+    Rule::new("output.weight", LM_HEAD),
+    Rule::drop("rope_freqs.weight"),
+    Rule::drop("blk.{i}.attn_rot_embd*"),
+    blk!("attn_norm", "input_layernorm"),
+    blk!("ffn_norm", "post_attention_layernorm"),
+    blk!("attn_q", "self_attn.q_proj"),
+    blk!("attn_k", "self_attn.k_proj"),
+    blk!("attn_v", "self_attn.v_proj"),
+    blk!("attn_output", "self_attn.o_proj"),
+    blk!("attn_q_norm", "self_attn.q_norm"),
+    blk!("attn_k_norm", "self_attn.k_norm"),
+    blk!("ffn_gate", "mlp.gate_proj"),
+    blk!("ffn_up", "mlp.up_proj"),
+    blk!("ffn_down", "mlp.down_proj"),
+    blk!("ffn_gate_inp", "mlp.gate"),
+    Rule::new("blk.{i}.ffn_gate_exps.weight", "model.layers.{i}.mlp.experts.gate_proj"),
+    Rule::new("blk.{i}.ffn_up_exps.weight", "model.layers.{i}.mlp.experts.up_proj"),
+    Rule::new("blk.{i}.ffn_down_exps.weight", "model.layers.{i}.mlp.experts.down_proj"),
+];
 
 /// Embedding at most int8, router f32, expert stacks quantized like linears.
 pub(crate) const ROLES: &[RoleRule] =
@@ -64,25 +67,27 @@ pub(crate) const ROLES: &[RoleRule] =
 
 struct Hooks;
 
-/// `(stack name, expert, part)` of an HF per-expert tensor `{p}.mlp.experts.{e}.{part}.weight`.
+/// `(stack name, expert, part)` of a per-expert tensor `{p}.experts.{e}.{part}.weight` (HF
+/// `mlp.experts.{e}.gate_proj`, DeepSeek `ffn.experts.{e}.w1`).
 fn per_expert(name: &str) -> Option<(String, usize, &str)> {
-    let (prefix, rest) = name.split_once(".mlp.experts.")?;
+    let (prefix, rest) = name.split_once(".experts.")?;
     let (e, part) = rest.split_once('.')?;
-    let part = part.strip_suffix(".weight").filter(|p| matches!(*p, "gate_proj" | "up_proj" | "down_proj"))?;
-    Some((format!("{prefix}.mlp.experts.{part}"), e.parse().ok()?, part))
+    let part = part.strip_suffix(".weight").filter(|p| !p.contains('.'))?;
+    Some((format!("{prefix}.experts.{part}"), e.parse().ok()?, part))
 }
 
 /// HF expert layouts -> `[E, N, K]` stacks: per-expert tensors are stacked when expert 0 is
-/// written (the others dropped), fused `[E, 2I, D]` `gate_up_proj` stacks split.
+/// written (the others dropped), fused `[E, 2I, D]` `gate_up_proj` stacks split. Also used by
+/// DeepSeek V4 (`ffn.experts.{e}.w1` -> `ffn.experts.w1`).
 pub(crate) fn expert_stacks(name: &str, src: &dyn TensorSource, n_experts: usize) -> Result<Emit> {
     if let Some((stack, e, part)) = per_expert(name) {
         if e != 0 {
             return Ok(Emit::Drop);
         }
-        let prefix = &name[..name.find(".mlp.experts.").unwrap_or(0)];
+        let prefix = &name[..name.find(".experts.").unwrap_or(0)];
         let (mut data, mut inner) = (Vec::new(), Vec::new());
         for x in 0..n_experts {
-            let n = format!("{prefix}.mlp.experts.{x}.{part}.weight");
+            let n = format!("{prefix}.experts.{x}.{part}.weight");
             let shape = src.shape(&n).ok_or_else(|| Error::new("missing_tensor", format!("{stack}: expert {x} missing")))?;
             if x > 0 && shape != inner {
                 bail!("shape_mismatch", "{stack}: experts disagree in shape ({inner:?} vs {shape:?})");
@@ -128,36 +133,7 @@ impl ConvertHooks for Hooks {
     }
 
     fn expected(&self, c: &Value) -> Result<Vec<String>> {
-        let cfg = LlamaConfig::from_json(c)?;
-        let mut v = vec![EMBED.to_string(), "model.norm.weight".to_string()];
-        if !cfg.tie_embeddings {
-            v.push(LM_HEAD.to_string());
-        }
-        for i in 0..cfg.n_layers {
-            let p = format!("model.layers.{i}");
-            v.extend(["input_layernorm", "post_attention_layernorm"].map(|n| format!("{p}.{n}.weight")));
-            for n in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-                v.push(format!("{p}.self_attn.{n}.weight"));
-                if (n == "o_proj" && cfg.o_bias) || (n != "o_proj" && cfg.qkv_bias) {
-                    v.push(format!("{p}.self_attn.{n}.bias"));
-                }
-            }
-            if cfg.qk_norm {
-                v.extend(["q_norm", "k_norm"].map(|n| format!("{p}.self_attn.{n}.weight")));
-            }
-            if cfg.layer_is_moe(i) {
-                v.push(format!("{p}.mlp.gate.weight"));
-                v.extend(["gate_proj", "up_proj", "down_proj"].map(|n| format!("{p}.mlp.experts.{n}")));
-            } else {
-                for n in ["gate_proj", "up_proj", "down_proj"] {
-                    v.push(format!("{p}.mlp.{n}.weight"));
-                    if cfg.mlp_bias {
-                        v.push(format!("{p}.mlp.{n}.bias"));
-                    }
-                }
-            }
-        }
-        Ok(v)
+        Ok(expected(&LlamaConfig::from_json(c)?))
     }
 
     /// llama.cpp permutes `llama` q/k rows for its interleaved RoPE; restore HF order.
@@ -185,6 +161,39 @@ impl ConvertHooks for Hooks {
     }
 }
 
+/// Tensors of a decoder with config `cfg`.
+pub(crate) fn expected(cfg: &LlamaConfig) -> Vec<String> {
+    let mut v = vec![EMBED.to_string(), "model.norm.weight".to_string()];
+    if !cfg.tie_embeddings {
+        v.push(LM_HEAD.to_string());
+    }
+    for i in 0..cfg.n_layers {
+        let p = format!("model.layers.{i}");
+        v.extend(["input_layernorm", "post_attention_layernorm"].map(|n| format!("{p}.{n}.weight")));
+        for n in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            v.push(format!("{p}.self_attn.{n}.weight"));
+            if (n == "o_proj" && cfg.o_bias) || (n != "o_proj" && cfg.qkv_bias) {
+                v.push(format!("{p}.self_attn.{n}.bias"));
+            }
+        }
+        if cfg.qk_norm {
+            v.extend(["q_norm", "k_norm"].map(|n| format!("{p}.self_attn.{n}.weight")));
+        }
+        if cfg.layer_is_moe(i) {
+            v.push(format!("{p}.mlp.gate.weight"));
+            v.extend(["gate_proj", "up_proj", "down_proj"].map(|n| format!("{p}.mlp.experts.{n}")));
+        } else {
+            for n in ["gate_proj", "up_proj", "down_proj"] {
+                v.push(format!("{p}.mlp.{n}.weight"));
+                if cfg.mlp_bias {
+                    v.push(format!("{p}.mlp.{n}.bias"));
+                }
+            }
+        }
+    }
+    v
+}
+
 fn license_extras(license: Option<String>) -> HfExtras {
     let mut x = HfExtras::default();
     if let Some(l) = license.filter(|l| !l.is_empty()) {
@@ -194,7 +203,7 @@ fn license_extras(license: Option<String>) -> HfExtras {
 }
 
 /// HF-style config from `<arch>.*` GGUF keys.
-fn gguf_config(f: &GgufFile) -> Result<Value> {
+pub(crate) fn gguf_config(f: &GgufFile) -> Result<Value> {
     let arch = f.architecture().unwrap_or("llama").to_string();
     let get = |k: &str| f.get(&format!("{arch}.{k}"));
     let opt = |k: &str| get(k).and_then(GgufValue::as_u64).map(|v| v as usize);
@@ -254,6 +263,8 @@ mod tests {
         assert_eq!(g("blk.0.mystery.weight"), Renamed::NoMatch);
         assert_eq!(rename(CONVERT.hf_names, "model.layers.0.self_attn.rotary_emb.inv_freq"), Renamed::Drop);
         assert_eq!(per_expert("model.layers.2.mlp.experts.7.up_proj.weight"), Some(("model.layers.2.mlp.experts.up_proj".into(), 7, "up_proj")));
+        assert_eq!(per_expert("layers.2.ffn.experts.7.w3.weight"), Some(("layers.2.ffn.experts.w3".into(), 7, "w3")));
+        assert_eq!(per_expert("layers.2.ffn.shared_experts.w3.weight"), None);
         assert_eq!(CONVERT.role(EMBED, &[151936, 1024]), Role::LinearInt8);
         assert_eq!(CONVERT.role("model.layers.0.mlp.gate.weight", &[128, 2048]), Role::Param);
         assert_eq!(CONVERT.role("model.layers.0.mlp.experts.gate_proj", &[128, 768, 2048]), Role::Linear);
@@ -262,6 +273,6 @@ mod tests {
             "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2, "tie_word_embeddings": true}))
         .expect("cfg");
         // 2 globals + 2 * (2 norms + 4 attn + 3 bias + 3 mlp)
-        assert_eq!(Hooks.expected(&cfg.to_json()).expect("names").len(), 2 + 2 * 12);
+        assert_eq!(expected(&cfg).len(), 2 + 2 * 12);
     }
 }

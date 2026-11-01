@@ -18,7 +18,7 @@
 use lapid::{DType, Result, Tensor};
 use lapid_nn::{Linear, RmsNorm};
 
-use super::rope::TailRope;
+use lapid_nn::llm::rope::TailRope;
 
 /// Additive mask value for "not visible" (finite so masks can be summed and multiplied).
 pub(crate) const NEG: f32 = -1e30;

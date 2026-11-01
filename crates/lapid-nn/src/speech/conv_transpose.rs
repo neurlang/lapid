@@ -1,5 +1,5 @@
 //! Transposed 1-D convolution (PyTorch `ConvTranspose1d`, dense or depthwise), with the
-//! causal streaming state Mimi uses. Candidate for lapid-nn (Mimi only for now).
+//! causal streaming state of streaming codecs (Mimi, EnCodec-style SEANet decoders).
 //!
 //! y[co, t*S + k] += x[ci, t] * w[ci, co, k]. The kernel is zero-padded to `m * S` taps and
 //! viewed as `m` chunks of `S`: every input frame t contributes one [Cout, m, S] block (one
@@ -12,7 +12,7 @@
 
 use lapid::{DType, Device, Result, Tensor, bail};
 
-pub(crate) struct ConvTranspose1d {
+pub struct ConvTranspose1d {
     /// Dense: [Cin, Cout * m * S]; depthwise: [1, C, 1, m * S] (both f32, realized).
     weight: Tensor,
     bias: Option<Tensor>,
@@ -90,7 +90,6 @@ impl ConvTranspose1d {
     }
 
     /// Causal full-sequence transposed conv: [B, Cout, T * S] (right `K - S` trimmed).
-    #[allow(dead_code)]
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let t = x.shape()[2];
         self.add_bias(self.overlap_add(x)?.slice(2, 0, t * self.stride)?)
@@ -186,10 +185,14 @@ mod tests {
                 got[co].extend_from_slice(&v[co * n..(co + 1) * n]);
             }
         }
+        // and so does the one-call forward
+        let y = conv.forward(&Tensor::from_f32(&x, &[1, cin, t]).expect("x")).expect("forward");
+        let whole = dev.to_vec_f32(&dev.eval(&[&y]).expect("eval")[0]).expect("vec");
         for co in 0..cout {
             for i in 0..t * s {
                 let e = full[co * len + i];
                 assert!((got[co][i] - e).abs() < 1e-4, "co {co} i {i}: {} vs {e}", got[co][i]);
+                assert!((whole[co * t * s + i] - e).abs() < 1e-4, "forward co {co} i {i}");
             }
         }
     }

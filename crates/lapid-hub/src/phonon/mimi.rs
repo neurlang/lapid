@@ -8,20 +8,13 @@
 //! concatenation equals one full causal decode.
 
 use lapid::{Device, Result, Tensor};
-use lapid_nn::{Conv1d, Loader};
-
-use lapid_nn::KvCache;
+use lapid_nn::ops::elu;
+use lapid_nn::speech::conv_transpose::ConvTranspose1d;
+use lapid_nn::speech::streaming_transformer::StreamingTransformer;
+use lapid_nn::{Conv1d, KvCache, Loader};
 
 use super::config::MimiConfig;
-use super::convtr::ConvTranspose1d;
-use super::transformer::{Transformer, TransformerSpec};
-
-/// ELU (alpha 1): max(x, 0) + exp(min(x, 0)) - 1.
-fn elu(x: &Tensor) -> Result<Tensor> {
-    let pos = x.binary_scalar(lapid::BinaryOp::Max, 0.0)?;
-    let neg = x.binary_scalar(lapid::BinaryOp::Min, 0.0)?.exp()?.add_scalar(-1.0)?;
-    pos.add(&neg)
-}
+use super::transformer::{self, TransformerSpec};
 
 enum Layer {
     Elu,
@@ -70,7 +63,7 @@ pub(crate) struct MimiDecoder {
     latent_proj: Conv1d,
     upsample: ConvTranspose1d,
     up_slot: usize,
-    transformer: Transformer,
+    transformer: StreamingTransformer,
     layers: Vec<(usize, Layer)>,
     n_states: usize,
 }
@@ -87,7 +80,7 @@ impl MimiDecoder {
             window: Some(t.window),
             layer_scale: true,
         };
-        let transformer = Transformer::load(loader, "mimi.decoder_transformer.transformer", &spec)?;
+        let transformer = transformer::load(loader, "mimi.decoder_transformer.transformer", &spec)?;
         let up_w = loader.tensor("mimi.upsample.convtr.convtr.weight")?;
         let upsample = ConvTranspose1d::new(&up_w, None, cfg.upsample_stride, cfg.dimension, device)?;
 

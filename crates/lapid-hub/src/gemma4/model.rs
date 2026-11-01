@@ -15,6 +15,7 @@
 
 use lapid::{BinaryOp, DType, Error, HostData, Result, Tensor, UnaryOp, bail};
 use lapid_nn::attention::{merge_heads, repeat_kv, scaled_dot_product_attention};
+use lapid_nn::vision::image_block_mask;
 use lapid_nn::weights::fake_quant_act;
 use lapid_nn::{Embedding, GatedMlp, KvCache, Linear, Loader, Mask, Precision, RmsNorm, ZeroTailRope, ops};
 
@@ -33,24 +34,6 @@ const MAX_TABLE_BYTES: usize = 1 << 31;
 pub fn rms_plain(x: &Tensor, eps: f32) -> Result<Tensor> {
     let xf = x.cast(DType::F32)?;
     xf.mul(&xf.mul(&xf)?.mean(-1, true)?.add_scalar(f64::from(eps))?.unary(UnaryOp::Rsqrt)?)
-}
-
-/// Additive [n, sk] mask: key j visible to query i iff in the window and (`j <= i` or both
-/// rows are in the same image block, `blocks[i]` = block of chunk row i, -1 = text).
-fn mask(blocks: Option<&[i32]>, n: usize, sk: usize, window: Option<usize>) -> Result<Tensor> {
-    let off = sk - n;
-    let mut m = vec![0.0f32; n * sk];
-    for i in 0..n {
-        let qpos = i + off;
-        for j in 0..sk {
-            let same = blocks.is_some_and(|b| j >= off && b[i] >= 0 && b[j - off] == b[i]);
-            let in_window = window.is_none_or(|w| j > qpos || qpos - j < w);
-            if !((j <= qpos || same) && in_window) {
-                m[i * sk + j] = f32::NEG_INFINITY;
-            }
-        }
-    }
-    Tensor::from_f32(&m, &[n, sk])
 }
 
 struct Attn {
@@ -94,12 +77,12 @@ impl Attn {
             let rep = nh / nkv;
             let mut s = q.cast(DType::F32)?.matmul_t(&repeat_kv(&k, rep)?.cast(DType::F32)?)?;
             if n > 1 || blocks.is_some() {
-                s = s.add(&mask(blocks, n, sk, self.window)?)?;
+                s = s.add(&image_block_mask(blocks, n, sk, self.window)?)?;
             }
             s.softmax()?.matmul(&repeat_kv(&v, rep)?.cast(DType::F32)?)?.cast(q.dtype())?
         } else {
             let m = match (blocks, self.window) {
-                (Some(b), w) => Mask::Custom { additive: mask(Some(b), n, sk, w)?, causal: false },
+                (Some(b), w) => Mask::Custom { additive: image_block_mask(Some(b), n, sk, w)?, causal: false },
                 (None, Some(w)) => Mask::Sliding(w),
                 (None, None) => Mask::Causal,
             };
@@ -382,16 +365,4 @@ impl Decoder {
 pub fn clamp(x: &Tensor, (lo, hi): (f32, f32)) -> Result<Tensor> {
     let x = if lo.is_finite() { x.binary_scalar(BinaryOp::Max, f64::from(lo))? } else { x.clone() };
     if hi.is_finite() { x.binary_scalar(BinaryOp::Min, f64::from(hi)) } else { Ok(x) }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn image_block_mask() {
-        let dev = lapid::Device::cpu();
-        let m = super::mask(Some(&[-1, 0, 0]), 3, 4, Some(8)).expect("mask");
-        let v = dev.to_vec_f32(&dev.eval(&[&m]).expect("eval")[0]).expect("host");
-        // query row 1 (image) sees key 3 (its image, later); row 0 (text) does not.
-        assert_eq!((v[4 + 3], v[3]), (0.0, f32::NEG_INFINITY));
-    }
 }

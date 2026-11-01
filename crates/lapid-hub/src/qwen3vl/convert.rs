@@ -28,11 +28,6 @@ macro_rules! vis {
         Rule::new(concat!("model.visual.", $h, ".{w}"), concat!($g, ".{w}"))
     };
 }
-macro_rules! blk {
-    ($g:literal, $h:literal) => {
-        Rule::new(concat!("blk.{i}.", $g, ".{w}"), concat!("model.layers.{i}.", $h, ".{w}"))
-    };
-}
 const PATCH: &str = "v.patch_embd.weight";
 
 pub static CONVERT: ConvertSpec = ConvertSpec {
@@ -60,23 +55,7 @@ pub static CONVERT: ConvertSpec = ConvertSpec {
         vis!("deepstack_merger_list.{j}.linear_fc1", "v.deepstack_list.{j}.fc1"),
         vis!("deepstack_merger_list.{j}.linear_fc2", "v.deepstack_list.{j}.fc2"),
     ],
-    gguf_names: &[
-        Rule::new("token_embd.weight", EMBED),
-        Rule::new("output_norm.weight", "model.norm.weight"),
-        Rule::new("output.weight", LM_HEAD),
-        Rule::drop("rope_freqs.weight"),
-        blk!("attn_norm", "input_layernorm"),
-        blk!("ffn_norm", "post_attention_layernorm"),
-        blk!("attn_q", "self_attn.q_proj"),
-        blk!("attn_k", "self_attn.k_proj"),
-        blk!("attn_v", "self_attn.v_proj"),
-        blk!("attn_output", "self_attn.o_proj"),
-        blk!("attn_q_norm", "self_attn.q_norm"),
-        blk!("attn_k_norm", "self_attn.k_norm"),
-        blk!("ffn_gate", "mlp.gate_proj"),
-        blk!("ffn_up", "mlp.up_proj"),
-        blk!("ffn_down", "mlp.down_proj"),
-    ],
+    gguf_names: crate::llama::convert::GGUF_NAMES,
     roles: &[RoleRule::new("v.*", Role::Dense), RoleRule::new("mm.*", Role::Dense), RoleRule::new(EMBED, Role::LinearInt8)],
     text_assets: true,
     hooks: &Hooks,
@@ -107,24 +86,14 @@ impl ConvertHooks for Hooks {
 
     /// Text part (the vision part comes from the mmproj, see `companion_config`).
     fn gguf_config(&self, f: &GgufFile) -> Result<Value> {
-        let get = |k: &str| f.get(&format!("qwen3vl.{k}"));
-        let uint = |k: &str| get(k).and_then(GgufValue::as_u64).ok_or_else(|| Error::new("missing_metadata", format!("GGUF: missing qwen3vl.{k}")));
-        let (hidden, n_head) = (uint("embedding_length")?, uint("attention.head_count")?);
-        let sec: Vec<u64> = get("rope.dimension_sections").and_then(GgufValue::as_array).map(|a| a.iter().filter_map(GgufValue::as_u64).take(3).collect()).unwrap_or_else(|| vec![24, 20, 20]);
+        let mut text = crate::llama::convert::gguf_config(f)?;
+        let sec: Vec<u64> = f.get("qwen3vl.rope.dimension_sections").and_then(GgufValue::as_array).map(|a| a.iter().filter_map(GgufValue::as_u64).take(3).collect()).unwrap_or_else(|| vec![24, 20, 20]);
+        text["rope_parameters"] = json!({"rope_type": "default", "rope_theta": text["rope_theta"], "mrope_section": sec, "mrope_interleaved": true});
+        text["max_position_embeddings"] = json!(f.get("qwen3vl.context_length").and_then(GgufValue::as_u64).unwrap_or(262_144));
         let tokens = f.get("tokenizer.ggml.tokens").and_then(GgufValue::as_array);
         let id = |s: &str| tokens.and_then(|t| t.iter().position(|v| v.as_str() == Some(s))).ok_or_else(|| Error::new("missing_metadata", format!("GGUF vocabulary has no {s}")));
         Ok(json!({
-            "model_type": "qwen3_vl", "tie_word_embeddings": f.tensor("output.weight").is_none(),
-            "text_config": {
-                "vocab_size": f.tensor("token_embd.weight").map(|t| t.shape[0]).ok_or_else(|| Error::new("missing_tensor", "GGUF: no token_embd.weight"))?,
-                "hidden_size": hidden, "intermediate_size": uint("feed_forward_length")?, "num_hidden_layers": uint("block_count")?,
-                "num_attention_heads": n_head, "num_key_value_heads": uint("attention.head_count_kv")?,
-                "head_dim": get("attention.key_length").and_then(GgufValue::as_u64).unwrap_or(hidden / n_head.max(1)),
-                "rms_norm_eps": get("attention.layer_norm_rms_epsilon").and_then(GgufValue::as_f64).unwrap_or(1e-6),
-                "rope_parameters": {"rope_type": "default", "rope_theta": get("rope.freq_base").and_then(GgufValue::as_f64).unwrap_or(5e6), "mrope_section": sec, "mrope_interleaved": true},
-                "tie_word_embeddings": f.tensor("output.weight").is_none(),
-                "max_position_embeddings": get("context_length").and_then(GgufValue::as_u64).unwrap_or(262_144),
-            },
+            "model_type": "qwen3_vl", "tie_word_embeddings": text["tie_word_embeddings"], "text_config": text,
             "image_token_id": id("<|image_pad|>")?, "vision_start_token_id": id("<|vision_start|>")?, "vision_end_token_id": id("<|vision_end|>")?,
             "eos_token_id": f.get("tokenizer.ggml.eos_token_id").and_then(GgufValue::as_u64).into_iter().collect::<Vec<_>>(),
         }))
@@ -150,22 +119,7 @@ impl ConvertHooks for Hooks {
 
     fn expected(&self, c: &Value) -> Result<Vec<String>> {
         let cfg = Qwen3VlConfig::from_json(c, None)?;
-        let t = &cfg.text;
-        let mut v = vec![EMBED.to_string(), "model.norm.weight".to_string()];
-        if !t.tie_embeddings {
-            v.push(LM_HEAD.to_string());
-        }
-        for i in 0..t.n_layers {
-            let mut n = vec!["input_layernorm.weight", "post_attention_layernorm.weight", "self_attn.q_norm.weight", "self_attn.k_norm.weight"];
-            n.extend(["mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"]);
-            for w in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-                v.push(format!("model.layers.{i}.self_attn.{w}.weight"));
-                if t.attention_bias {
-                    v.push(format!("model.layers.{i}.self_attn.{w}.bias"));
-                }
-            }
-            v.extend(n.iter().map(|n| format!("model.layers.{i}.{n}")));
-        }
+        let mut v = crate::llama::convert::expected(&cfg.text.base);
         v.extend(cfg.vision.expected_tensors(false, false));
         Ok(v)
     }

@@ -5,9 +5,8 @@
 //!
 //! Only the model's math, config, conversion tables and verification stages live here; text
 //! chunking, end of speech, fade-in, streaming, verification, benchmarks and serving are the
-//! shared speech pipeline (`runtime::tts`). The unique math (flow LM, LSD flow head, Mimi
-//! codec with streaming convolutions and transposed convolutions, text preparation) is about
-//! 1.1k lines, so this model is over the 500-line target.
+//! shared speech pipeline (`runtime::tts`); the streaming transformer and transposed
+//! convolution are `lapid_nn::speech` layers.
 //!
 //! ```no_run
 //! let device = lapid::Device::best();
@@ -22,7 +21,6 @@
 
 pub mod config;
 pub mod convert;
-mod convtr;
 mod flow;
 mod lm;
 mod mimi;

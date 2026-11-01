@@ -1,14 +1,14 @@
-//! Shared pieces of the vision-language models: image decoding / resampling ([`image`]),
-//! chat messages with image parts ([`Message`]), and the generic ViT / SigLIP-style
-//! encoder behind GGUF `clip` / mmproj files.
+//! Shared pieces of the vision-language models: chat messages with image parts
+//! ([`Message`]), the generic ViT / SigLIP-style encoder behind GGUF `clip` / mmproj files and
+//! its preprocessing settings. Images, patching, 2-D RoPE and pooling are `lapid_nn::vision`.
 
 pub mod encoder;
-pub mod image;
 pub mod processor;
+
+pub use lapid_nn::vision::{Filter, Image};
 
 use crate::runtime::jinja;
 pub use encoder::{VisionConfig, VisionEncoder};
-pub use image::{Filter, Image};
 pub use processor::{ImageProcessor, Patches};
 
 /// One part of a message's content.

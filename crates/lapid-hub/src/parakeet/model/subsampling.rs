@@ -9,9 +9,10 @@
 //! (no padding frame) is equivalent: a masked frame is a zero, and so is the conv padding.
 
 use lapid::{Error, Result, Tensor};
+use lapid_nn::speech::{DepthwiseConv, taps_2d};
 use lapid_nn::{Linear, Loader};
 
-use super::{kernel_taps, linear_checked, strided, weighted_sum};
+use super::linear_checked;
 use crate::parakeet::config::ParakeetConfig;
 use crate::parakeet::convert::subsampling_layers;
 
@@ -37,20 +38,12 @@ fn taps3x3(x: &Tensor) -> Result<(Vec<Tensor>, usize, usize)> {
     // Each tap reads [k, k + 2*n) of the padded axis; pad the tail so the last window fits.
     let right = |len: usize, n: usize| (K - 1 + n * STRIDE).saturating_sub(len + PAD);
     let xp = x.pad(1, PAD, right(t, to), 0.0)?.pad(2, PAD, right(f, fo), 0.0)?;
-    let mut taps = Vec::with_capacity(K * K);
-    for kt in 0..K {
-        let rows = strided(&xp, 1, kt, to, STRIDE)?;
-        for kf in 0..K {
-            taps.push(strided(&rows, 2, kf, fo, STRIDE)?);
-        }
-    }
-    Ok((taps, to, fo))
+    Ok((taps_2d(&xp, 1, (K, K), (STRIDE, STRIDE), (to, fo))?, to, fo))
 }
 
 struct Stage {
-    /// Depthwise 3×3 per-tap weights [C] (f32) and bias [C].
-    dw: Vec<Tensor>,
-    dw_bias: Tensor,
+    /// Depthwise 3×3 (weight [C, 9] f32, bias [C]).
+    dw: DepthwiseConv,
     pw: Linear,
 }
 
@@ -69,19 +62,19 @@ impl Subsampling {
         let p = "encoder.subsampling.layers";
         let mut conv0 = None;
         let mut stages = Vec::new();
-        let mut pending_dw: Option<(Vec<Tensor>, Tensor)> = None;
+        let mut pending_dw: Option<DepthwiseConv> = None;
         for (i, depthwise) in subsampling_layers(cfg.subsampling_stages()) {
             if i == 0 {
                 conv0 = Some(linear_checked(l, &format!("{p}.0"), c, K * K)?);
             } else if depthwise {
                 let w = l.tensor_f32(&format!("{p}.{i}.weight"))?;
                 l.expect_shape(&w, &format!("{p}.{i}.weight"), &[c, K * K])?;
-                pending_dw = Some((kernel_taps(&w)?, l.tensor_f32(&format!("{p}.{i}.bias"))?));
+                pending_dw = Some(DepthwiseConv::new(&w, Some(l.tensor_f32(&format!("{p}.{i}.bias"))?))?);
             } else {
-                let (dw, dw_bias) = pending_dw
+                let dw = pending_dw
                     .take()
                     .ok_or_else(|| Error::new("internal", "subsampling: point-wise conv without depthwise"))?;
-                stages.push(Stage { dw, dw_bias, pw: linear_checked(l, &format!("{p}.{i}"), c, c)? });
+                stages.push(Stage { dw, pw: linear_checked(l, &format!("{p}.{i}"), c, c)? });
             }
         }
         let conv0 = conv0.ok_or_else(|| Error::new("internal", "subsampling: no first conv"))?;
@@ -104,7 +97,7 @@ impl Subsampling {
         let mut x = lapid_nn::ops::relu(&self.conv0.forward(&cols)?)?; // [1, To, Fo, C]
         for s in &self.stages {
             let (taps, _, _) = taps3x3(&x)?;
-            let y = weighted_sum(&taps, &s.dw, Some(&s.dw_bias))?;
+            let y = s.dw.apply(&taps)?;
             x = lapid_nn::ops::relu(&s.pw.forward(&y)?)?;
         }
         // [1, T', F', C] -> [1, T', C, F'] -> [1, T', C * F'] (HF flattens channel-major).

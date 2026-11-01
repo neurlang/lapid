@@ -18,9 +18,9 @@
 //! uploaded.
 
 use lapid::{DType, Error, Op, Result, Tensor, UnaryOp, bail};
+use lapid_nn::llm::hyper::grouped_rms_norm;
 use lapid_nn::{Conv1d, Linear, ops};
 
-use super::hc::grouped_rms_norm;
 use crate::qwen4exp::config::PleConfig;
 
 /// The host n-gram table: a `.lapid` host tensor [rows, row_dim] (float or quantized).
@@ -28,23 +28,6 @@ pub(crate) struct NgramTable {
     pub table: Tensor,
     pub rows: usize,
     pub cols: usize,
-}
-
-fn half_to_f32(h: u16) -> f32 {
-    let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
-    let exp = ((h >> 10) & 0x1f) as i32;
-    let frac = (h & 0x3ff) as f32;
-    match exp {
-        0 => sign * frac * 2f32.powi(-24),
-        31 => {
-            if frac == 0.0 {
-                sign * f32::INFINITY
-            } else {
-                f32::NAN
-            }
-        }
-        e => sign * (1.0 + frac / 1024.0) * 2f32.powi(e - 15),
-    }
 }
 
 impl NgramTable {
@@ -76,8 +59,8 @@ impl NgramTable {
         for (i, o) in out.iter_mut().enumerate() {
             *o = match dt {
                 DType::F32 => f32::from_le_bytes([row[4 * i], row[4 * i + 1], row[4 * i + 2], row[4 * i + 3]]),
-                DType::F16 => half_to_f32(u16::from_le_bytes([row[2 * i], row[2 * i + 1]])),
-                _ => f32::from_bits((u16::from_le_bytes([row[2 * i], row[2 * i + 1]]) as u32) << 16),
+                DType::F16 => half::f16::from_le_bytes([row[2 * i], row[2 * i + 1]]).to_f32(),
+                _ => half::bf16::from_le_bytes([row[2 * i], row[2 * i + 1]]).to_f32(),
             };
         }
         Ok(())
@@ -189,12 +172,5 @@ mod tests {
         assert_eq!(rows, want);
         // the history continues a sequence exactly like one call
         assert_eq!(ngram_rows(&c, &[4, 6], &[9, 2]), want[4..].to_vec());
-    }
-
-    #[test]
-    fn half() {
-        assert_eq!(half_to_f32(0x3c00), 1.0);
-        assert_eq!(half_to_f32(0xc000), -2.0);
-        assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
     }
 }

@@ -20,10 +20,12 @@
 
 use lapid::{DType, Error, Result, Tensor};
 use lapid_nn::attention::{Mask, merge_heads, scaled_dot_product_attention};
-use lapid_nn::{Activation, Embedding, LayerNorm, Linear, Loader, RmsNorm};
+pub use lapid_nn::vision::{apply_rope_tables, rope_tables};
+use lapid_nn::vision::{block_order_positions, grid_rope_tables, interpolate_pos_table};
+use lapid_nn::{Activation, LayerNorm, Linear, Loader, RmsNorm};
 use serde::{Deserialize, Serialize};
 
-use super::processor::{Patches, block_order_positions};
+use super::processor::Patches;
 use crate::runtime::Taps;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,51 +222,6 @@ impl Merger {
     }
 }
 
-/// Rotate x [B, H, S, Dh] by host tables cos / sin [S, Dh/2] (HF `rotate_half` pairing:
-/// element i with i + Dh/2, both using angle i).
-pub fn apply_rope_tables(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let dh = x.shape().last().copied().unwrap_or(0);
-    let half = dh / 2;
-    let (cos, sin) = (cos.cast(x.dtype())?, sin.cast(x.dtype())?);
-    let x1 = x.slice(3, 0, half)?;
-    let x2 = x.slice(3, half, dh)?;
-    let o1 = x1.mul(&cos)?.sub(&x2.mul(&sin)?)?;
-    let o2 = x2.mul(&cos)?.add(&x1.mul(&sin)?)?;
-    Tensor::cat(&[&o1, &o2], 3)
-}
-
-/// cos / sin tables [n, Dh/2] from host angles.
-pub fn rope_tables(angles: &[f32], n: usize, half: usize) -> Result<(Tensor, Tensor)> {
-    let cos: Vec<f32> = angles.iter().map(|&a| f64::from(a).cos() as f32).collect();
-    let sin: Vec<f32> = angles.iter().map(|&a| f64::from(a).sin() as f32).collect();
-    Ok((Tensor::from_f32(&cos, &[n, half])?, Tensor::from_f32(&sin, &[n, half])?))
-}
-
-/// Bilinear (align_corners) taps of a `side x side` grid resampled to `gh x gw`, per patch in
-/// merge-block order: 4 (index, weight) pairs (HF `fast_pos_embed_interpolate`).
-pub fn bilinear_taps(gh: usize, gw: usize, side: usize, merge: usize) -> (Vec<u32>, Vec<f32>) {
-    let axis = |i: usize, size: usize| -> [(usize, f32); 2] {
-        let src = if size > 1 { i as f32 * (side - 1) as f32 / (size - 1) as f32 } else { 0.0 };
-        let f = src.floor();
-        let d = src - f;
-        let i0 = (f as usize).min(side - 1);
-        let i1 = (f as usize + 1).min(side - 1);
-        [(i0, 1.0 - d), (i1, d)]
-    };
-    let pos = block_order_positions(gh, gw, merge);
-    let (mut idx, mut wts) = (Vec::with_capacity(pos.len() * 4), Vec::with_capacity(pos.len() * 4));
-    for (r, c) in pos {
-        let (rt, ct) = (axis(r, gh), axis(c, gw));
-        for (ri, rw) in rt {
-            for (ci, cw) in ct {
-                idx.push((ri * side + ci) as u32);
-                wts.push(rw.max(0.0) * cw.max(0.0));
-            }
-        }
-    }
-    (idx, wts)
-}
-
 pub struct VisionEncoder {
     pub cfg: VisionConfig,
     patch: Linear,
@@ -326,19 +283,11 @@ impl VisionEncoder {
         Ok(VisionEncoder { cfg: cfg.clone(), patch, pos, blocks, merger, deepstack, act })
     }
 
-    /// 2-D RoPE tables [N, Dh/2]: first Dh/4 angles from the row, the rest from the column.
+    /// 2-D RoPE tables [N, Dh/2] over (row, col) in merge-block order.
     fn rope(&self, gh: usize, gw: usize) -> Result<Option<(Tensor, Tensor)>> {
         let Some(theta) = self.cfg.rope_theta else { return Ok(None) };
-        let half = self.cfg.head_dim() / 2;
-        let q = half / 2;
-        let inv: Vec<f32> = (0..q).map(|j| 1.0 / theta.powf((2 * j) as f32 / half as f32)).collect();
         let pos = block_order_positions(gh, gw, self.cfg.spatial_merge_size);
-        let mut a = Vec::with_capacity(pos.len() * half);
-        for (r, c) in &pos {
-            a.extend(inv.iter().map(|f| *r as f32 * f));
-            a.extend(inv.iter().map(|f| *c as f32 * f));
-        }
-        Ok(Some(rope_tables(&a, pos.len(), half)?))
+        Ok(Some(grid_rope_tables(&pos, self.cfg.head_dim(), theta)?))
     }
 
     fn attention(&self, b: &Block, x: &Tensor, rope: Option<&(Tensor, Tensor)>) -> Result<Tensor> {
@@ -372,10 +321,7 @@ impl VisionEncoder {
         }
         let mut x = self.patch.forward(&Tensor::from_f32(&p.data, &[n, p.dim])?)?.cast(DType::F32)?;
         if let Some(table) = &self.pos {
-            let (idx, w) = bilinear_taps(p.grid_h, p.grid_w, self.cfg.position_grid, m);
-            let g = Embedding::new(table.clone()).lookup(&idx)?.cast(DType::F32)?.reshape(&[n * 4, self.cfg.hidden_size])?;
-            let pe = g.mul(&Tensor::from_f32(&w, &[n * 4, 1])?)?.reshape(&[n, 4, self.cfg.hidden_size])?.sum(1, false)?;
-            x = x.add(&pe)?;
+            x = x.add(&interpolate_pos_table(table, p.grid_h, p.grid_w, self.cfg.position_grid, m)?)?;
         }
         let rope = self.rope(p.grid_h, p.grid_w)?;
         let mut deep = Vec::new();
@@ -400,23 +346,5 @@ impl VisionEncoder {
         let mut out = vec![merged];
         out.extend(deep);
         Ok(out)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn taps_corners() {
-        // 2x2 grid from a 3x3 table, align_corners: exact corners.
-        let (idx, w) = bilinear_taps(2, 2, 3, 2);
-        assert_eq!(idx.len(), 16);
-        // patch (0,0): all weight on index 0
-        let s: f32 = idx[..4].iter().zip(&w[..4]).filter(|(i, _)| **i == 0).map(|(_, w)| *w).sum();
-        assert!((s - 1.0).abs() < 1e-6);
-        // patch (1,1) (4th in block order): weight on index 8
-        let s: f32 = idx[12..].iter().zip(&w[12..]).filter(|(i, _)| **i == 8).map(|(_, w)| *w).sum();
-        assert!((s - 1.0).abs() < 1e-6);
     }
 }

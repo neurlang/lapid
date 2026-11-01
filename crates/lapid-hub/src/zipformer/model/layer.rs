@@ -11,9 +11,10 @@
 //! scores use the flat-view relative shift `y[i, j] = s[i, T - 1 - i + j]`.
 
 use lapid::{Result, Tensor, bail};
+use lapid_nn::speech::{DepthwiseConv, rel_shift};
 use lapid_nn::{Linear, Loader};
 
-use super::{BiasNorm, bypass, host, kernel_taps, linear, param, swoosh_l, swoosh_r, weighted_sum};
+use super::{BiasNorm, bypass, host, linear, param, swoosh_l, swoosh_r};
 use crate::zipformer::config::ZipformerConfig;
 
 /// Cached left context of one layer (time-major).
@@ -82,10 +83,9 @@ impl FeedForward {
 /// `ConvolutionModule` with `ChunkCausalDepthwiseConv1d`.
 struct ConvModule {
     inp: Linear,
-    causal: Vec<Tensor>,
-    causal_bias: Tensor,
-    chunk: Vec<Tensor>,
-    chunk_bias: Tensor,
+    /// Causal half-kernel over [cache ‖ chunk], and the full kernel within the chunk.
+    causal: DepthwiseConv,
+    chunk: DepthwiseConv,
     /// `chunkwise_conv_scale` [2, C, K] (host).
     edge: Vec<f32>,
     out: Linear,
@@ -106,10 +106,8 @@ impl ConvModule {
         }
         Ok(ConvModule {
             inp: linear(l, &format!("{p}.in_proj"), 2 * c, c)?,
-            causal: kernel_taps(&causal)?,
-            causal_bias: param(l, &format!("{p}.depthwise_conv.causal_conv.bias"), c)?,
-            chunk: kernel_taps(&chunk)?,
-            chunk_bias: param(l, &format!("{p}.depthwise_conv.chunkwise_conv.bias"), c)?,
+            causal: DepthwiseConv::new(&causal, Some(param(l, &format!("{p}.depthwise_conv.causal_conv.bias"), c)?))?,
+            chunk: DepthwiseConv::new(&chunk, Some(param(l, &format!("{p}.depthwise_conv.chunkwise_conv.bias"), c)?))?,
             edge,
             out: linear(l, &format!("{p}.out_proj"), c, c)?,
             c,
@@ -149,11 +147,8 @@ impl ConvModule {
         let h = h.slice(1, 0, c)?.mul(&lapid_nn::ops::sigmoid(&h.slice(1, c, 2 * c)?)?)?;
         let xc = Tensor::cat(&[cache, &h], 0)?; // [pad + T, C]
         let new_cache = xc.slice(0, t, t + pad)?.contiguous()?;
-        let ctaps: Vec<Tensor> = (0..self.causal.len()).map(|i| xc.slice(0, i, i + t)).collect::<Result<_>>()?;
-        let causal = weighted_sum(&ctaps, &self.causal, Some(&self.causal_bias))?;
-        let hp = h.pad(0, pad, pad, 0.0)?;
-        let ktaps: Vec<Tensor> = (0..self.k).map(|i| hp.slice(0, i, i + t)).collect::<Result<_>>()?;
-        let chunk = weighted_sum(&ktaps, &self.chunk, Some(&self.chunk_bias))?;
+        let causal = self.causal.forward(&xc, 0, (0, 0))?;
+        let chunk = self.chunk.forward(&h, 0, (pad, pad))?;
         let y = chunk.mul(scale)?.add(&causal)?;
         Ok((self.out.forward(&swoosh_r(&y)?)?, new_cache))
     }
@@ -166,18 +161,6 @@ struct AttnWeights {
     heads: usize,
     qd: usize,
     pd: usize,
-}
-
-/// `y[h, i, j] = x[h, i, T - 1 - i + j]` for x [H, T, n] (n = 2T + L - 1), j < `k` = L + T.
-pub(crate) fn rel_shift(x: &Tensor, k: usize) -> Result<Tensor> {
-    let s = x.shape();
-    let (h, t, n) = (s[0], s[1], s[2]);
-    if t < 2 || k > n - 1 {
-        bail!("shape_mismatch", "rel_shift: scores {s:?} cannot give {k} key positions (need T >= 2)");
-    }
-    let flat = x.contiguous()?.reshape(&[h, t * n])?;
-    let win = flat.slice(1, t - 1, t - 1 + t * (n - 1))?.contiguous()?;
-    win.reshape(&[h, t, n - 1])?.slice(2, 0, k)
 }
 
 /// [T, H * d] -> [H, T, d] (contiguous).
@@ -322,28 +305,5 @@ impl Layer {
         let x = x.add(&self.ff3.forward(&x)?)?;
         let x = bypass(orig, &self.norm.forward(&x)?, &self.bypass)?;
         Ok((x, LayerState { key, nonlin, val1, val2, conv1, conv2 }))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rel_shift_matches_as_strided() {
-        let (h, t, l) = (2usize, 3usize, 4usize);
-        let n = 2 * t + l - 1;
-        let data: Vec<f32> = (0..h * t * n).map(|i| i as f32).collect();
-        let x = Tensor::from_f32(&data, &[h, t, n]).expect("x");
-        let dev = lapid::Device::cpu();
-        let r = dev.eval(&[&rel_shift(&x, l + t).expect("shift")]).expect("eval");
-        let y = dev.to_vec_f32(&r[0]).expect("vec");
-        for hh in 0..h {
-            for i in 0..t {
-                for j in 0..l + t {
-                    assert_eq!(y[(hh * t + i) * (l + t) + j], data[hh * t * n + i * n + t - 1 - i + j]);
-                }
-            }
-        }
     }
 }

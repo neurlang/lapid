@@ -22,6 +22,7 @@ use lapid_convert::engine::{ConvertHooks, ConvertSpec, Emit, HfExtras, TensorSou
 use lapid_convert::mapping::{RoleRule, Rule};
 use lapid_convert::policy::Role;
 use lapid_convert::safetensors::SafeTensors;
+use lapid_convert::transforms::split_rows;
 use lapid_convert::writer::{ModelWriter, read_json};
 use serde_json::{Value, json};
 
@@ -129,12 +130,9 @@ fn split_in_proj(prefix: &str, shape: &[usize], data: &[f32]) -> Result<Vec<Mapp
     if shape.len() != 2 || !shape[0].is_multiple_of(3) {
         bail!("shape_mismatch", "{prefix}: fused in_proj must be [3*d, d], got {shape:?}");
     }
-    let (rows, cols) = (shape[0] / 3, shape[1]);
-    Ok(["q_proj", "k_proj", "v_proj"]
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (format!("{prefix}.{p}.weight"), vec![rows, cols], data[i * rows * cols..(i + 1) * rows * cols].to_vec()))
-        .collect())
+    let d = shape[0] / 3;
+    let parts = split_rows(data, shape, &[d, d, d])?;
+    Ok(["q_proj", "k_proj", "v_proj"].iter().zip(parts).map(|(p, (s, v))| (format!("{prefix}.{p}.weight"), s, v)).collect())
 }
 
 /// Voice latents `[1, dim, frames]` (or `[dim, frames]`) -> row-major `[frames, dim]`.

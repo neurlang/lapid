@@ -2,12 +2,15 @@
 //! written by [`super::convert`]).
 
 use lapid::{Error, Result};
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 
 /// Blob holding the Hugging Face `tokenizer.json`.
 pub(crate) const TOKENIZER_BLOB: &str = "tokenizer/tokenizer.json";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParakeetConfig {
     // ---- feature extractor
     pub sample_rate: u32,
@@ -15,6 +18,7 @@ pub struct ParakeetConfig {
     pub n_fft: usize,
     pub hop_length: usize,
     pub win_length: usize,
+    #[serde(default = "default_preemphasis")]
     pub preemphasis: f64,
     // ---- encoder (FastConformer)
     pub d_model: usize,
@@ -84,69 +88,19 @@ impl ParakeetConfig {
         self.vocab_size + self.durations.len()
     }
 
+    /// The metadata object (`metadata["parakeet"]`): the fields plus the tokenizer blob name.
     pub fn to_json(&self) -> Value {
-        json!({
-            "sample_rate": self.sample_rate,
-            "n_mels": self.n_mels,
-            "n_fft": self.n_fft,
-            "hop_length": self.hop_length,
-            "win_length": self.win_length,
-            "preemphasis": self.preemphasis,
-            "d_model": self.d_model,
-            "n_layers": self.n_layers,
-            "n_heads": self.n_heads,
-            "ff_dim": self.ff_dim,
-            "conv_kernel": self.conv_kernel,
-            "subsampling_factor": self.subsampling_factor,
-            "subsampling_channels": self.subsampling_channels,
-            "decoder_hidden": self.decoder_hidden,
-            "decoder_layers": self.decoder_layers,
-            "vocab_size": self.vocab_size,
-            "blank_id": self.blank_id,
-            "durations": self.durations,
-            "max_symbols_per_step": self.max_symbols_per_step,
-            "tokenizer_blob": TOKENIZER_BLOB,
-        })
+        let mut v = serde_json::to_value(self).unwrap_or_default();
+        v["tokenizer_blob"] = Value::from(TOKENIZER_BLOB);
+        v
     }
 
     pub fn from_metadata(metadata: &Value) -> Result<ParakeetConfig> {
         let p = metadata
             .get("parakeet")
             .ok_or_else(|| meta_err("not a parakeet model: metadata has no 'parakeet' object"))?;
-        let u = |k: &str| -> Result<usize> {
-            p.get(k)
-                .and_then(Value::as_u64)
-                .map(|v| v as usize)
-                .ok_or_else(|| meta_err(format!("parakeet metadata: missing or invalid integer '{k}'")))
-        };
-        let durations: Vec<usize> = p
-            .get("durations")
-            .and_then(Value::as_array)
-            .ok_or_else(|| meta_err("parakeet metadata: missing 'durations'"))?
-            .iter()
-            .map(|d| d.as_u64().map(|d| d as usize).ok_or_else(|| meta_err("parakeet metadata: bad duration")))
-            .collect::<Result<_>>()?;
-        let cfg = ParakeetConfig {
-            sample_rate: u("sample_rate")? as u32,
-            n_mels: u("n_mels")?,
-            n_fft: u("n_fft")?,
-            hop_length: u("hop_length")?,
-            win_length: u("win_length")?,
-            preemphasis: p.get("preemphasis").and_then(Value::as_f64).unwrap_or(0.97),
-            d_model: u("d_model")?,
-            n_layers: u("n_layers")?,
-            n_heads: u("n_heads")?,
-            ff_dim: u("ff_dim")?,
-            conv_kernel: u("conv_kernel")?,
-            subsampling_factor: u("subsampling_factor")?,
-            subsampling_channels: u("subsampling_channels")?,
-            decoder_hidden: u("decoder_hidden")?,
-            decoder_layers: u("decoder_layers")?,
-            vocab_size: u("vocab_size")?,
-            blank_id: u("blank_id")? as u32,
-            durations,
-            max_symbols_per_step: u("max_symbols_per_step")?.max(1),
-        };
+        let mut cfg = ParakeetConfig::deserialize(p).map_err(|e| meta_err(format!("parakeet metadata: {e}")))?;
+        cfg.max_symbols_per_step = cfg.max_symbols_per_step.max(1);
         cfg.validate()?;
         Ok(cfg)
     }
@@ -170,6 +124,10 @@ impl ParakeetConfig {
         }
         Ok(())
     }
+}
+
+fn default_preemphasis() -> f64 {
+    0.97
 }
 
 fn meta_err(msg: impl Into<String>) -> Error {

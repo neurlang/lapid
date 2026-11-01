@@ -8,19 +8,18 @@
 //! sinusoidal `duration_delta`, each projected) added to every latent position.
 
 use lapid::{DType, Result, Tensor};
-use lapid_nn::{Embedding, LayerNorm, Linear, Loader};
-
-use lapid_nn::KvCache;
+use lapid_nn::speech::streaming_transformer::StreamingTransformer;
+use lapid_nn::{Embedding, KvCache, LayerNorm, Linear, Loader};
 
 use super::config::PhononConfig;
 use super::flow::FlowHead;
-use super::transformer::{Transformer, TransformerSpec};
+use super::transformer::{self, TransformerSpec};
 
 pub(crate) struct FlowLm {
     text_embed: Embedding,
     voice_proj: Linear,
     input_linear: Linear,
-    transformer: Transformer,
+    transformer: StreamingTransformer,
     out_norm: LayerNorm,
     out_eos: Linear,
     speakers_embed: Embedding,
@@ -63,7 +62,7 @@ impl FlowLm {
             text_embed: loader.embedding(&format!("{COND}.transcript_in_segment.embed"))?,
             voice_proj: loader.linear(&format!("{COND}.speaker_wavs.output_proj"), false)?,
             input_linear: loader.linear("flow_lm.input_linear", false)?,
-            transformer: Transformer::load(loader, "flow_lm.transformer", &spec)?,
+            transformer: transformer::load(loader, "flow_lm.transformer", &spec)?,
             out_norm: loader.layer_norm("flow_lm.out_norm", lm.norm_eps)?,
             out_eos: loader.linear("flow_lm.out_eos", true)?,
             speakers_embed: loader.embedding(&format!("{COND}.num_speakers.embed"))?,

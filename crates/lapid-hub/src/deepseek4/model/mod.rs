@@ -13,13 +13,12 @@
 
 pub(crate) mod attention;
 pub(crate) mod compress;
-pub(crate) mod hc;
 pub(crate) mod moe;
-pub(crate) mod rope;
-#[cfg(test)]
-mod tests;
 
 use lapid::{DType, Error, Result, Tensor};
+use lapid_nn::llm::hyper::{SinkhornHc, SinkhornHead};
+use lapid_nn::llm::moe::Experts;
+use lapid_nn::llm::rope::TailRope;
 use lapid_nn::{Embedding, Linear, Loader, RmsNorm};
 use serde_json::Value;
 
@@ -28,16 +27,14 @@ use super::encoding;
 use crate::runtime::{CausalLm, ChatOptions, LmDims, LmState, Rows, Taps};
 use attention::{Attention, Indexer, LayerState};
 use compress::Compressor;
-use hc::{HyperConn, HyperHead};
 use moe::Moe;
-use rope::TailRope;
 
 pub(crate) const EMBED: &str = "embed.weight";
 pub(crate) const HEAD: &str = "head.weight";
 
 struct Layer {
-    attn_hc: HyperConn,
-    ffn_hc: HyperConn,
+    attn_hc: SinkhornHc,
+    ffn_hc: SinkhornHc,
     attn_norm: RmsNorm,
     ffn_norm: RmsNorm,
     attn: Attention,
@@ -96,7 +93,7 @@ pub struct Deepseek4Model {
     embed: Embedding,
     head: Linear,
     norm: RmsNorm,
-    hc_head: HyperHead,
+    hc_head: SinkhornHead,
     layers: Vec<Layer>,
 }
 
@@ -183,23 +180,17 @@ fn load_moe(l: &Loader<'_>, cfg: &Deepseek4Config, i: usize) -> Result<Moe> {
     let p = format!("layers.{i}.ffn");
     let (d, e, inter, k) = (cfg.hidden_size, cfg.n_experts, cfg.moe_intermediate, cfg.top_k);
     let hash = i < cfg.n_hash_layers;
-    let w1 = format!("{p}.experts.w1");
+    let stacks = ["w1", "w3", "w2"].map(|w| format!("{p}.experts.{w}"));
     let shared = |w: &str, o: usize, inp: usize| l.linear_checked(&format!("{p}.shared_experts.{w}"), o, inp, false);
     Ok(Moe {
         router: f32_param(l, &format!("{p}.gate.weight"), &[e, d])?,
         bias: if hash { None } else { Some(f32_param(l, &format!("{p}.gate.bias"), &[e])?) },
         tid2eid: if hash { Some(tid2eid(l, &format!("{p}.gate.tid2eid"), [cfg.vocab_size, k])?) } else { None },
-        act_quant: l.act_quant(&w1)?,
-        w1: l.tensor_checked(&w1, &[e, inter, d])?,
-        w3: l.tensor_checked(&format!("{p}.experts.w3"), &[e, inter, d])?,
-        w2: l.tensor_checked(&format!("{p}.experts.w2"), &[e, d, inter])?,
-        shared_w1: shared("w1", inter, d)?,
-        shared_w3: shared("w3", inter, d)?,
-        shared_w2: shared("w2", d, inter)?,
+        experts: Experts::load(l, stacks.each_ref().map(String::as_str), e, inter, d)?.with_limit(cfg.swiglu_limit),
+        shared: [shared("w1", inter, d)?, shared("w3", inter, d)?, shared("w2", d, inter)?],
         top_k: k,
         n_experts: e,
         route_scale: cfg.route_scale,
-        limit: cfg.swiglu_limit,
     })
 }
 
@@ -213,7 +204,7 @@ impl CausalLm for Deepseek4Model {
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = format!("layers.{i}");
-            let conn = |kind: &str| HyperConn::load(l, &format!("{p}.hc_{kind}"), hc, d, cfg.hc_sinkhorn_iters, cfg.hc_eps, eps);
+            let conn = |kind: &str| SinkhornHc::load(l, &format!("{p}.hc_{kind}"), [hc, d, cfg.hc_sinkhorn_iters], cfg.hc_eps, eps);
             layers.push(Layer {
                 attn_hc: conn("attn")?,
                 ffn_hc: conn("ffn")?,
@@ -227,7 +218,7 @@ impl CausalLm for Deepseek4Model {
             embed: Embedding::new(l.tensor_checked(EMBED, &[cfg.vocab_size, d])?),
             head: l.linear_checked("head", cfg.vocab_size, d, false)?,
             norm: l.rms_norm_checked("norm", d, eps)?,
-            hc_head: HyperHead::load(l, hc, d, cfg.hc_eps, eps)?,
+            hc_head: SinkhornHead::load(l, "hc_head", hc, d, cfg.hc_eps, eps)?,
             layers,
             cfg,
         })
@@ -267,10 +258,10 @@ impl CausalLm for Deepseek4Model {
             let (a, s) = layer.attn.forward(&layer.attn_norm.forward(&pre.collapsed)?, pos, &st.layers[i])?;
             next.push(s);
             taps.tap(format_args!("layers.{i}.op"), &a);
-            x = layer.attn_hc.post(&a, &x, &pre.post, &pre.comb)?;
+            x = layer.attn_hc.post(&a, &x, &pre)?;
             let pre = layer.ffn_hc.pre(&x)?;
             let m = layer.moe.forward(&layer.ffn_norm.forward(&pre.collapsed)?, ids)?;
-            x = layer.ffn_hc.post(&m, &x, &pre.post, &pre.comb)?;
+            x = layer.ffn_hc.post(&m, &x, &pre)?;
             if taps.enabled() {
                 taps.tap(format_args!("layers.{i}"), &x.reshape(&[n, hc * d])?);
             }

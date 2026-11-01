@@ -1,16 +1,16 @@
-//! Image preprocessing for patch-based vision encoders (Qwen2-VL / Qwen3-VL style
-//! `smart_resize` → rescale / normalize → patches in spatial-merge-block order).
+//! Image preprocessing settings of the generic encoder (Qwen2-VL / Qwen3-VL style
+//! `smart_resize`, rescale / normalize, patches in spatial-merge-block order; the math is
+//! `lapid_nn::vision`).
 //!
-//! Patches are `[n, C * P * P]` rows in (channel, row, column) order — the flattening of a
-//! `[D, C, P, P]` convolution kernel, so the patch embedding is one matmul. Video-style temporal
-//! patches (Qwen's Conv3d over 2 identical frames for a still image) are folded into the
-//! kernel at conversion time (sum over the temporal axis), so images carry one frame.
+//! Video-style temporal patches (Qwen's Conv3d over 2 identical frames for a still image) are
+//! folded into the kernel at conversion time (sum over the temporal axis), so images carry one
+//! frame.
 
 use lapid::{Error, Result};
+pub use lapid_nn::vision::Patches;
+use lapid_nn::vision::{Filter, Image, patchify, smart_resize};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-use super::image::{Filter, Image};
 
 /// Preprocessing parameters (HF `preprocessor_config.json` / mmproj `clip.vision.*`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -55,55 +55,6 @@ fn triple(v: Option<&Value>, default: [f32; 3]) -> [f32; 3] {
     }
 }
 
-/// Patches of one image: `data` [n, C*P*P] in merge-block order, the patch grid (rows, cols).
-#[derive(Clone, Debug)]
-pub struct Patches {
-    pub data: Vec<f32>,
-    pub grid_h: usize,
-    pub grid_w: usize,
-    /// Values per patch (C * P * P).
-    pub dim: usize,
-}
-
-impl Patches {
-    pub fn len(&self) -> usize {
-        self.grid_h * self.grid_w
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Output tokens after an `m x m` spatial merge.
-    pub fn merged_tokens(&self, m: usize) -> usize {
-        self.len() / (m * m).max(1)
-    }
-}
-
-/// HF `smart_resize`: (height, width) divisible by `factor`, pixel count within
-/// [`min_pixels`, `max_pixels`], aspect ratio kept (Python `round` = ties to even).
-pub fn smart_resize(height: usize, width: usize, factor: usize, min_pixels: usize, max_pixels: usize) -> Result<(usize, usize)> {
-    if height == 0 || width == 0 || factor == 0 {
-        return Err(Error::new("invalid_argument", "smart_resize: empty image"));
-    }
-    let (h, w, f) = (height as f64, width as f64, factor as f64);
-    if h.max(w) / h.min(w) > 200.0 {
-        return Err(Error::new("invalid_argument", format!("image aspect ratio of {width}x{height} exceeds 200")));
-    }
-    let mut hb = (h / f).round_ties_even() * f;
-    let mut wb = (w / f).round_ties_even() * f;
-    if hb * wb > max_pixels as f64 {
-        let beta = (h * w / max_pixels as f64).sqrt();
-        hb = f.max((h / beta / f).floor() * f);
-        wb = f.max((w / beta / f).floor() * f);
-    } else if hb * wb < min_pixels as f64 {
-        let beta = (min_pixels as f64 / (h * w)).sqrt();
-        hb = (h * beta / f).ceil() * f;
-        wb = (w * beta / f).ceil() * f;
-    }
-    Ok((hb as usize, wb as usize))
-}
-
 impl ImageProcessor {
     /// From an HF `preprocessor_config.json` (Qwen2-VL / Qwen3-VL keys).
     pub fn from_hf(v: &Value) -> ImageProcessor {
@@ -142,70 +93,5 @@ impl ImageProcessor {
         let resized = img.resize(w, h, Filter::from_pil(self.resample))?;
         let chw = resized.to_chw(self.rescale, self.mean, self.std);
         Ok(patchify(&chw, h, w, self.patch_size, self.merge_size))
-    }
-}
-
-/// Cut a planar `[3, H, W]` image into `[n, 3*P*P]` patches ordered by merge block
-/// (block row, block col, row in block, col in block).
-pub fn patchify(chw: &[f32], h: usize, w: usize, p: usize, m: usize) -> Patches {
-    let (gh, gw) = (h / p, w / p);
-    let dim = 3 * p * p;
-    let mut data = Vec::with_capacity(gh * gw * dim);
-    for br in 0..gh / m {
-        for bc in 0..gw / m {
-            for ir in 0..m {
-                for ic in 0..m {
-                    let (r, c) = (br * m + ir, bc * m + ic);
-                    for ch in 0..3 {
-                        for y in 0..p {
-                            let row = ch * h * w + (r * p + y) * w + c * p;
-                            data.extend_from_slice(&chw[row..row + p]);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Patches { data, grid_h: gh, grid_w: gw, dim }
-}
-
-/// (row, col) of every patch in merge-block order.
-pub fn block_order_positions(gh: usize, gw: usize, m: usize) -> Vec<(usize, usize)> {
-    let mut v = Vec::with_capacity(gh * gw);
-    for br in 0..gh / m {
-        for bc in 0..gw / m {
-            for ir in 0..m {
-                for ic in 0..m {
-                    v.push((br * m + ir, bc * m + ic));
-                }
-            }
-        }
-    }
-    v
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn smart_resize_matches_hf() {
-        // Values from transformers' smart_resize (factor 32, min 65536, max 16777216).
-        assert_eq!(smart_resize(240, 320, 32, 65_536, 16_777_216).ok(), Some((256, 320)));
-        assert_eq!(smart_resize(76, 100, 32, 65_536, 16_777_216).ok(), Some((224, 320)));
-        assert_eq!(smart_resize(4000, 3000, 32, 65_536, 1_000_000).ok(), Some((1152, 864)));
-    }
-
-    #[test]
-    fn patch_order() {
-        let (h, w, p) = (4, 4, 1);
-        let chw: Vec<f32> = (0..3 * h * w).map(|i| i as f32).collect();
-        let pt = patchify(&chw, h, w, p, 2);
-        assert_eq!((pt.grid_h, pt.grid_w, pt.dim), (4, 4, 3));
-        // second patch = (row 0, col 1); fourth = (1, 1); fifth = (0, 2)
-        assert_eq!(pt.data[3], 1.0);
-        assert_eq!(pt.data[9], 5.0);
-        assert_eq!(pt.data[12], 2.0);
-        assert_eq!(block_order_positions(4, 4, 2)[4], (0, 2));
     }
 }

@@ -56,7 +56,9 @@ streaming, cancellation and timing. Templates that read globals beyond messages 
 `template_globals` / `date_string`.
 
 Building blocks live in `lapid-nn` (`Attention`, `KvCache`, `Rope`, `ZeroTailRope`,
-`GatedMlp`, `Conv1d`, norms, `Loader::linear_checked` ...). If a model needs a piece that is
+`GatedMlp`, `Conv1d`, norms, `Loader::linear_checked`, `vision` for image towers: images,
+patching, 2-D RoPE, pooling; `llm` for decoder LLMs: MoE experts and routing, gated attention,
+Gated DeltaNet, hyper-connections, RoPE variants, LM head ...). If a model needs a piece that is
 not there and another model could use it, add it there instead of to the model.
 
 ## 2. Conversion

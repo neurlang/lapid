@@ -21,7 +21,7 @@ use lapid_nn::weights::fake_quant_act;
 use lapid_nn::{Linear, RmsNorm, ops};
 
 use super::compress::{CompState, Compressor, NEG};
-use super::rope::TailRope;
+use lapid_nn::llm::rope::TailRope;
 
 /// Lightning indexer (HF `DeepseekV4Indexer`, llama.cpp `LIGHTNING_INDEXER` + `top_k`):
 /// `score[t, s] = sum_h w[t, h] relu(q[t, h] . k_s)`, causal, top-k → attention mask.

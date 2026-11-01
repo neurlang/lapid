@@ -7,14 +7,17 @@
 //!
 //! * [`layers`] — `Linear`, `Embedding`, `LayerNorm`, `RmsNorm`, `Conv1d` (strided, dilated,
 //!   grouped / depthwise, causal with streaming state).
-//! * [`ops`] — activations built from primitives (`silu`, `sigmoid`, `gelu_tanh`, `relu`, `glu`).
+//! * [`ops`] — activations built from primitives (`silu`, `sigmoid`, `gelu_tanh`, `relu`, `elu`, `glu`).
 //! * [`attention`] — multi-head attention with GQA / MQA, causal / sliding-window / custom
 //!   masks, cross attention and a [`attention::KvCache`].
 //! * [`rope`] — rotary position embeddings (half-split or interleaved, partial rotary,
 //!   configurable theta and linear scaling).
 //! * [`mlp`] — `Mlp` (`down(act(up x))`) and `GatedMlp` (SwiGLU / GeGLU).
 //! * [`weights`] — `Loader` (weights from a `.lapid` file, fake-quant reference precisions).
+//! * [`llm`]: decoder-LLM blocks (MoE experts and routing, gated attention, Gated DeltaNet,
+//!   hyper-connections, RoPE variants incl. llama3 / YaRN / M-RoPE, LM head).
 //! * [`audio`] — WAV loading, resampling, STFT and mel filterbanks.
+//! * [`vision`]: images (decode, torchvision-exact resize), patching, 2-D RoPE, patch pooling.
 //! * [`tokenizer`] — Hugging Face `tokenizers` wrapper (`tokenizer.json`, byte-level vocabularies).
 //! * [`sampling`] / [`generate`] — logits processing, seeded sampling, a generation iterator.
 //!
@@ -24,11 +27,14 @@ pub mod attention;
 pub mod audio;
 pub mod generate;
 pub mod layers;
+pub mod llm;
 pub mod mlp;
 pub mod ops;
 pub mod rope;
 pub mod sampling;
+pub mod speech;
 pub mod tokenizer;
+pub mod vision;
 pub mod weights;
 
 #[cfg(test)]

@@ -24,7 +24,9 @@ use serde_json::json;
 use crate::model::{Bytes, Model, ModelInfo, hub_model_path};
 use crate::runtime::audio::{Argmax, AsrModel, AudioDef, BenchRun, Check, EndToEnd, Row, Sample, Stages, asr_entry};
 use crate::runtime::seq2seq::Seq2Seq;
-use crate::runtime::serve::{AsrParams, AsrSegment, TranscriptOut};
+use crate::runtime::serve::{AsrParams, TranscriptOut};
+/// A transcript segment (seconds, text, tokens incl. timestamps).
+pub use crate::runtime::serve::AsrSegment as Segment;
 use config::WhisperConfig;
 pub use lapid_nn::Precision;
 use lapid_nn::KvCache;
@@ -51,14 +53,6 @@ impl Default for TranscribeOptions {
     fn default() -> Self {
         TranscribeOptions { language: None, task: Task::Transcribe, timestamps: true }
     }
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct Segment {
-    pub start: f32,
-    pub end: f32,
-    pub text: String,
-    pub tokens: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -209,8 +203,7 @@ impl AsrModel for Whisper {
         let language = opts.language.clone().filter(|l| !l.is_empty() && l != "auto");
         let task = if opts.translate { Task::Translate } else { Task::Transcribe };
         let t = self.transcribe(samples, &TranscribeOptions { language, task, timestamps: true })?;
-        let segments = t.segments.into_iter().map(|s| AsrSegment { start: s.start, end: s.end, text: s.text, tokens: s.tokens }).collect();
-        Ok(TranscriptOut { text: t.text.trim().to_string(), language: Some(t.language), segments, words: Vec::new() })
+        Ok(TranscriptOut { text: t.text.trim().to_string(), language: Some(t.language), segments: t.segments, words: Vec::new() })
     }
 }
 
