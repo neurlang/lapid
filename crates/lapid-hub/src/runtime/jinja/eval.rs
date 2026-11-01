@@ -9,7 +9,7 @@ use super::builtins;
 use super::value::{Value, arith};
 
 const MAX_DEPTH: usize = 48;
-const BUILTINS: [&str; 4] = ["namespace", "range", "raise_exception", "dict"];
+const BUILTINS: [&str; 5] = ["namespace", "range", "raise_exception", "dict", "strftime_now"];
 
 fn terr(msg: impl Into<String>) -> Error {
     Error::new("template", msg)
@@ -392,6 +392,10 @@ impl<'t> Renderer<'t> {
                 Ok(Value::Namespace(self.namespaces.len() - 1))
             }
             Value::Builtin("range") => builtins::range(&pos),
+            Value::Builtin("strftime_now") => {
+                let fmt = pos.first().map(Value::to_str).unwrap_or_default();
+                Ok(Value::Str(super::time::strftime_now(&fmt)))
+            }
             Value::Builtin("raise_exception") => {
                 Err(terr(pos.first().map(Value::to_str).unwrap_or_default()))
             }

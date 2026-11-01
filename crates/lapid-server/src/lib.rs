@@ -8,17 +8,17 @@
 //! `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`,
 //! `POST /v1/audio/speech`, `GET /health`, `GET /api/info`, and the web UI on every other path.
 
-pub mod adapters;
+pub use lapid_hub::runtime::serve::adapters;
 pub mod api;
 mod assets;
 pub mod cli;
 pub mod format;
 pub mod hf;
-pub mod llm;
+pub use lapid_hub::runtime::serve::llm;
 pub mod load;
 pub mod run;
 pub mod served;
-pub mod text;
+pub use lapid_hub::runtime::serve::text;
 pub mod worker;
 
 use std::sync::Arc;

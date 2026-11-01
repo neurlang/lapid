@@ -1,7 +1,8 @@
 //! Minimal Jinja2 interpreter, scoped to rendering Hugging Face chat templates exactly like
 //! transformers' `apply_chat_template`: `ImmutableSandboxedEnvironment(trim_blocks=True,
 //! lstrip_blocks=True)` with loop controls, `{% generation %}`, `raise_exception(msg)` and a
-//! `tojson` that behaves like `json.dumps(x, ensure_ascii=False)`.
+//! `tojson(indent=None)` that behaves like `json.dumps(x, ensure_ascii=False, indent=indent)`, `dictsort`,
+//! `indent` and `strftime_now(fmt)` (UTC; `LAPID_NOW=<unix seconds>` pins the clock for tests).
 //!
 //! Supported: `{{ }}` / `{% %}` / `{# #}` with `-`/`+` whitespace control; `if`/`elif`/`else`,
 //! `for` (tuple unpacking, inline `if` filter, `else`, `loop.*`, `break`/`continue`), `set`
@@ -15,6 +16,7 @@ mod eval;
 mod json;
 mod lexer;
 mod parser;
+mod time;
 mod value;
 
 #[cfg(test)]

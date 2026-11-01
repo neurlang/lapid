@@ -138,9 +138,9 @@ fn calibrated_file_beats_rtn() {
     let mut toy = Toy { w1: leaf(&w1v, &[h, d]), w2: leaf(&w2v, &[o, h]), xs: xs.clone() };
     // A tiny budget forces one pass per weight.
     let opts = CalibrationOptions { memory_budget: 1, ..Default::default() };
-    convert_calibrated(&fp, &q_cal, OutDType::Int4, role, &mut toy, &CalibrationSource::Builtin, &opts).expect("calibrated");
+    convert_calibrated(&fp, &q_cal, OutDType::Int4, std::sync::Arc::new(role), &mut toy, &CalibrationSource::Builtin, &opts).expect("calibrated");
     let r = Reader::open(&fp).expect("open");
-    requantize(&r, &q_rtn, OutDType::Int4, role, BTreeMap::new(), json!({"method": "rtn"})).expect("rtn");
+    requantize(&r, &q_rtn, OutDType::Int4, std::sync::Arc::new(role), BTreeMap::new(), json!({"method": "rtn"})).expect("rtn");
 
     let cal = Reader::open(&q_cal).expect("open cal");
     assert_eq!(cal.metadata["dtype"], "int4");

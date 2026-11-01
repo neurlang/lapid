@@ -140,25 +140,7 @@ fn token() -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
-/// lapid dtype matching a GGUF file's quant tag (keeps the quantization family).
-pub fn dtype_for_gguf(name: &str) -> &'static str {
-    let n = name.to_ascii_lowercase();
-    if n.contains("q4_k_m") {
-        "q4_k_m"
-    } else if n.contains("q4_k") {
-        "q4_k"
-    } else if n.contains("q5_k") {
-        "q5_k"
-    } else if n.contains("q6_k") {
-        "q6_k"
-    } else if n.contains("f16") || n.contains("bf16") || n.contains("f32") {
-        "fp16"
-    } else if n.contains("q4_0") || n.contains("q4_1") || n.contains("iq4") || n.contains("q3_k") || n.contains("q2_k") {
-        "int4"
-    } else {
-        "int8"
-    }
-}
+pub use lapid_hub::runtime::resolve::dtype_for_gguf;
 
 #[cfg(test)]
 mod tests {

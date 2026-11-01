@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use lapid::{Device, Error, Result};
-use lapid_convert::{OutDType, default_model_path};
+use lapid_convert::OutDType;
 use lapid_verify::timing::ms;
 use lapid_verify::{Activations, Comparison, Stages, tolerance};
 use serde_json::{Value, json};
@@ -90,9 +90,8 @@ pub(crate) fn resolve_model(model: &str, dtype: &str) -> Result<(PathBuf, Option
         return Ok((p.to_path_buf(), None));
     }
     let out = OutDType::parse(dtype)?;
-    let key = if p.is_dir() { format!("local/{}", p.file_name().and_then(|s| s.to_str()).unwrap_or("model")) } else { model.to_string() };
-    let path = default_model_path(&key, out);
-    if path.is_file() {
+    let path = crate::runtime::resolve::cache_path(model, out).0;
+    if path.is_file() && crate::runtime::resolve::cached_matches(&path, model) {
         return Ok((path, None));
     }
     let t = Instant::now();

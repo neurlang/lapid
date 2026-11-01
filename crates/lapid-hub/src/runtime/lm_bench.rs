@@ -1,24 +1,30 @@
-//! `lapid bench lfm3`: prefill tokens/s, decode tokens/s and time-to-first-token.
+//! `lapid bench <causal LM>` for any [`CausalLm`]: prefill tokens/s, decode tokens/s and time
+//! to first token.
 //!
 //! Per measured run (fresh session each): a `prompt_tokens`-token prompt is streamed with
-//! greedy decoding for `gen_tokens` tokens, stop tokens disabled. TTFT = start → first token
-//! (prefill + first sample); prefill tok/s = prompt / TTFT; decode tok/s = (gen − 1) /
-//! (last token − first token). A short chat prompt's TTFT is reported separately.
+//! greedy decoding for `gen_tokens` tokens, stop tokens disabled. TTFT = start -> first token
+//! (prefill + first sample); prefill tok/s = prompt / TTFT; decode tok/s = (gen - 1) /
+//! (last token - first token). A short chat prompt's TTFT is reported separately.
 
+use std::path::Path;
 use std::time::Instant;
 
 use lapid::{Error, Result};
+use lapid_verify::harness::Descriptor;
 use lapid_verify::timing::{median, ms, stats};
 use serde_json::{Value, json};
 
-use super::verify::{file_dtype, resolve_model};
-use super::{GenerateOptions, GenerationStats, Lfm3, Message};
+use super::causal_lm::{CausalLm, Llm};
+use super::chat::Message;
+use super::generate::{GenerateOptions, GenerationStats};
+use super::resolve::{file_dtype, resolve};
+use crate::cmd::ModelArgs;
 
 const FILLER: &str = "The quick brown fox jumps over the lazy dog while the river keeps flowing past old stone \
 bridges, and travellers stop to write short notes about the weather, the roads and the towns they visit. ";
 
 /// A chat prompt of exactly `n` tokens (`text` or filler repeated, truncated).
-pub fn prompt_of(llm: &Lfm3, n: usize, text: Option<&str>) -> Result<Vec<u32>> {
+pub fn prompt_of<M: CausalLm>(llm: &Llm<M>, n: usize, text: Option<&str>) -> Result<Vec<u32>> {
     let unit = text.filter(|t| !t.trim().is_empty()).unwrap_or(FILLER);
     let mut text = String::new();
     loop {
@@ -30,7 +36,7 @@ pub fn prompt_of(llm: &Lfm3, n: usize, text: Option<&str>) -> Result<Vec<u32>> {
     }
 }
 
-fn run(llm: &Lfm3, prompt: &[u32], n_gen: usize) -> Result<GenerationStats> {
+fn run<M: CausalLm>(llm: &Llm<M>, prompt: &[u32], n_gen: usize) -> Result<GenerationStats> {
     let mut session = llm.new_session();
     let opts = GenerateOptions { max_new_tokens: n_gen, stop_tokens: Some(Vec::new()), ..Default::default() };
     let mut stream = llm.generate(&mut session, prompt, opts)?;
@@ -40,24 +46,24 @@ fn run(llm: &Lfm3, prompt: &[u32], n_gen: usize) -> Result<GenerationStats> {
     Ok(stream.stats())
 }
 
-pub fn bench(
-    model: &str,
-    dtype: &str,
-    device: Option<&str>,
-    runs: usize,
-    prompt_tokens: usize,
-    gen_tokens: usize,
-    text: Option<&str>,
-) -> Result<Value> {
+/// `input` (optional): a text file used as the user message instead of the filler.
+pub fn bench<M: CausalLm>(desc: &Descriptor, input: Option<&Path>, args: &ModelArgs, runs: usize) -> Result<Value> {
+    let model = args.model.as_deref().unwrap_or(desc.default_model);
+    let dtype = args.dtype.as_deref().unwrap_or(desc.default_dtype);
+    let (prompt_tokens, gen_tokens) = desc.bench_sizes()?;
     if runs == 0 || prompt_tokens == 0 || gen_tokens < 2 {
         return Err(Error::new("invalid_argument", "need runs >= 1, prompt tokens >= 1, gen tokens >= 2"));
     }
-    let dev = lapid_verify::open_device(device)?;
-    let (path, convert_ms) = resolve_model(model, dtype)?;
+    let text = match input {
+        Some(p) => Some(std::fs::read_to_string(p).map_err(|e| Error::new("io", format!("{}: {e}", p.display())))?),
+        None => None,
+    };
+    let dev = lapid_verify::open_device(args.device.as_deref())?;
+    let res = resolve(model, Some(dtype))?;
     let t = Instant::now();
-    let llm = Lfm3::load(&path, &dev)?;
+    let llm = Llm::<M>::load(&res.path, &dev)?;
     let load_ms = ms(t);
-    let prompt = prompt_of(&llm, prompt_tokens, text)?;
+    let prompt = prompt_of(&llm, prompt_tokens, text.as_deref())?;
     let chat = llm.encode(&llm.render_chat(&[Message::user("Hello! How are you?")], true, Some(false))?)?;
 
     let t = Instant::now();
@@ -76,15 +82,15 @@ pub fn bench(
     Ok(json!({
         "engine": "lapid",
         "model": model,
-        "model_file": path.display().to_string(),
-        "dtype": file_dtype(&path)?,
+        "model_file": res.path.display().to_string(),
+        "dtype": file_dtype(&res.path)?,
         "device": dev.description(),
         "backend": dev.name(),
         "host": {"arch": std::env::consts::ARCH, "os": std::env::consts::OS, "threads": threads},
         "runs": runs,
         "prompt_tokens": prompt.len(),
         "gen_tokens": gen_tokens,
-        "convert_ms": convert_ms,
+        "convert_ms": res.convert_ms,
         "load_ms": load_ms,
         "warmup_ms": warmup_ms,
         "prefill_tokens_per_s": median(col(&|s| s.prefill_tokens_per_s())),

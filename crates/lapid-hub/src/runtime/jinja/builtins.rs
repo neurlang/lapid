@@ -136,7 +136,12 @@ pub(crate) fn filter(name: &str, v: Value, pos: &[Value], kw: &[(String, Value)]
             let boolean = arg(pos, kw, 1, "boolean").is_some_and(Value::truthy);
             if matches!(v, Value::Undefined) || (boolean && !v.truthy()) { fallback } else { v }
         }
-        "tojson" => Value::Str(json::dumps(&v)?),
+        "tojson" => match arg(pos, kw, 0, "indent") {
+            Some(Value::Int(n)) if *n >= 0 => Value::Str(json::dumps_indent(&v, Some(*n as usize))?),
+            _ => Value::Str(json::dumps(&v)?),
+        },
+        "dictsort" => dictsort(v, pos, kw)?,
+        "indent" => Value::Str(indent(&v.to_str(), pos, kw)),
         "string" => Value::Str(v.to_str()),
         "safe" => v,
         "trim" => Value::Str(py_strip(&v.to_str(), arg(pos, kw, 0, "chars"), true, true).to_string()),
@@ -202,6 +207,62 @@ pub(crate) fn filter(name: &str, v: Value, pos: &[Value], kw: &[(String, Value)]
         }
         other => return Err(terr(format!("no filter named '{other}'"))),
     })
+}
+
+/// `dictsort(case_sensitive=False, by="key", reverse=False)`: `[key, value]` pairs sorted.
+fn dictsort(v: Value, pos: &[Value], kw: &[(String, Value)]) -> Result<Value> {
+    let pairs = match v {
+        Value::Map(m) => m,
+        Value::Undefined => Vec::new(),
+        other => return Err(terr(format!("dictsort filter needs a mapping, got {}", other.type_name()))),
+    };
+    let case = arg(pos, kw, 0, "case_sensitive").is_some_and(Value::truthy);
+    let by_value = arg(pos, kw, 1, "by").is_some_and(|b| b.to_str() == "value");
+    let reverse = arg(pos, kw, 2, "reverse").is_some_and(Value::truthy);
+    let key = |k: &str, v: &Value| -> Value {
+        let x = if by_value { v.clone() } else { Value::str(k) };
+        match x {
+            Value::Str(s) if !case => Value::Str(s.to_lowercase()),
+            other => other,
+        }
+    };
+    let mut keyed: Vec<(Value, String, Value)> = pairs.into_iter().map(|(k, v)| (key(&k, &v), k, v)).collect();
+    let mut err = None;
+    keyed.sort_by(|a, b| {
+        a.0.py_cmp(&b.0).unwrap_or_else(|e| {
+            err.get_or_insert(e);
+            std::cmp::Ordering::Equal
+        })
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    if reverse {
+        keyed.reverse();
+    }
+    Ok(Value::List(keyed.into_iter().map(|(_, k, v)| Value::List(vec![Value::Str(k), v])).collect()))
+}
+
+/// `indent(width=4, first=False, blank=False)`.
+fn indent(s: &str, pos: &[Value], kw: &[(String, Value)]) -> String {
+    let pad = match arg(pos, kw, 0, "width") {
+        Some(Value::Int(n)) => " ".repeat((*n).max(0) as usize),
+        Some(Value::Str(p)) => p.clone(),
+        _ => "    ".to_string(),
+    };
+    let first = arg(pos, kw, 1, "first").is_some_and(Value::truthy);
+    let blank = arg(pos, kw, 2, "blank").is_some_and(Value::truthy);
+    let mut out = String::new();
+    for (i, line) in s.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if (i > 0 || first) && (blank || !line.trim().is_empty()) {
+            out.push_str(&pad);
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 fn replace(s: &str, old: &str, new: &str, count: Option<&Value>) -> String {

@@ -176,11 +176,22 @@ impl GgufFile {
     /// dequantized and re-encoded. `shape` overrides the stored shape (same element count),
     /// e.g. to flatten biases. 3-D tensors are expert stacks `[E, rows, cols]`.
     pub fn write_tensor(&self, w: &mut ModelWriter, name: &str, t: &GgufTensor, shape: Option<&[usize]>) -> Result<()> {
+        write_ggml_tensor(w, name, t, self.tensor_data(t), shape)
+    }
+
+    /// All metadata as a JSON object (arrays included; large token arrays can be big).
+    pub fn metadata_json(&self) -> Value {
+        Value::Object(self.metadata.iter().map(|(k, v)| (k.clone(), v.to_json())).collect())
+    }
+}
+
+/// [`GgufFile::write_tensor`] with the tensor's (possibly edited, e.g. row-permuted) raw bytes.
+pub fn write_ggml_tensor(w: &mut ModelWriter, name: &str, t: &GgufTensor, data: &[u8], shape: Option<&[usize]>) -> Result<()> {
+    {
         let shape = shape.map_or_else(|| t.shape.clone(), <[usize]>::to_vec);
         if shape.iter().product::<usize>() != t.numel() {
             bail!("shape_mismatch", "tensor {:?}: shape {shape:?} does not match {:?}", t.name, t.shape);
         }
-        let data = self.tensor_data(t);
         let target = w.target(name, &shape);
         let keep = match (t.ggml_type.lapid_format(), target) {
             (Some(f @ (Format::Int8 | Format::Int4)), Target::Quant(g)) if f == g => Some(f),
@@ -204,13 +215,12 @@ impl GgufFile {
         match (t.ggml_type, target) {
             (GgmlType::F16, Target::F16) => w.add_raw(name, DType::F16, &shape, data),
             (GgmlType::F32, Target::F32) => w.add_raw(name, DType::F32, &shape, data),
-            _ => w.add_f32(name, &shape, &self.to_f32(t)?),
+            _ => {
+                let v = ggml::dequantize(t.ggml_type, data, t.numel())
+                    .map_err(|e| Error::new(e.code, format!("tensor {:?}: {}", t.name, e.message)))?;
+                w.add_f32(name, &shape, &v)
+            }
         }
-    }
-
-    /// All metadata as a JSON object (arrays included; large token arrays can be big).
-    pub fn metadata_json(&self) -> Value {
-        Value::Object(self.metadata.iter().map(|(k, v)| (k.clone(), v.to_json())).collect())
     }
 }
 

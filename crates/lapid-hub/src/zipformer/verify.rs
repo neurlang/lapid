@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use lapid::{Error, Result};
-use lapid_convert::{OutDType, default_model_path};
+use lapid_convert::OutDType;
 use lapid_verify::{Activations, Comparison, KERNEL_TOLERANCE, tolerance};
 use serde_json::{Value, json};
 
@@ -43,19 +43,12 @@ pub(crate) fn resolve_model(model: &str, dtype: &str) -> Result<PathBuf> {
         return Ok(p.to_path_buf());
     }
     let out_dtype = OutDType::parse(dtype)?;
-    let key = if p.is_dir() {
-        let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-        let parts: Vec<String> = canon.components().rev().take(2).map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
-        format!("local/zipformer-{}", parts.into_iter().rev().collect::<Vec<_>>().join("-"))
-    } else {
-        model.to_string()
-    };
-    let path = default_model_path(&key, out_dtype);
+    let path = crate::runtime::resolve::cache_path(model, out_dtype).0;
     let stale = |src: &Path| -> bool {
         let m = |q: &Path| std::fs::metadata(q).and_then(|m| m.modified()).ok();
         matches!((m(src), m(&path)), (Some(s), Some(o)) if s > o)
     };
-    if path.is_file() && !(p.is_dir() && stale(&p.join("model.safetensors"))) {
+    if path.is_file() && crate::runtime::resolve::cached_matches(&path, model) && !(p.is_dir() && stale(&p.join("model.safetensors"))) {
         return Ok(path);
     }
     super::convert::convert_hf(model, out_dtype, &path)?;

@@ -33,9 +33,10 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-std", "io-util"] }
 tokio-stream = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-tower-http = { version = "0.6", features = ["cors", "compression-gzip", "compression-br", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 rust-embed = { version = "8", features = ["debug-embed"] }
 mime_guess = "2"
 base64 = "0.22"

@@ -127,7 +127,7 @@ fn main() -> lapid::Result<()> {
         }
         let opts = ChatOptions {
             enable_thinking: Some(args.think),
-            generate: GenerateOptions { max_new_tokens: args.max_tokens, sampling: sampling.clone(), stop_tokens: None, cancel: Some(cancel) },
+            generate: GenerateOptions { max_new_tokens: args.max_tokens, sampling: sampling.clone(), stop_tokens: None, cancel: Some(cancel), ..Default::default() },
         };
         let mut stream = llm.chat_stream(&mut session, &messages, &opts)?;
         for token in stream.by_ref() {

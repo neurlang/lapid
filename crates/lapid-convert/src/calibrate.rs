@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 use crate::OutDType;
 pub use crate::gptq::GptqOptions;
 use crate::policy::{Target, target_named};
-use crate::writer::{ModelWriter, RoleFn};
+use crate::writer::{ModelWriter, RoleArc};
 
 /// The built-in calibration text (mixed prose, dialogue, code, lists, several languages).
 pub const BUILTIN_TEXT: &str = include_str!("calibration.txt");
@@ -361,14 +361,14 @@ pub fn requantize(
     float_file: &Reader,
     out: &Path,
     dtype: OutDType,
-    role: RoleFn,
+    role: RoleArc,
     prequantized: Encoded,
     quantization: Value,
 ) -> Result<()> {
     let mut meta = float_file.metadata.clone();
     meta["dtype"] = json!(dtype.name());
     meta["quantization"] = quantization;
-    let mut w = ModelWriter::create(out, meta, dtype, role, float_file.tensors.len())?;
+    let mut w = ModelWriter::create_shared(out, meta, dtype, role, float_file.tensors.len())?;
     w.set_prequantized(prequantized);
     for b in float_file.blobs() {
         w.add_blob(&b.name, &b.media_type, float_file.blob_bytes(b))?;
@@ -395,7 +395,7 @@ pub fn convert_calibrated(
     float_file: &Path,
     out: &Path,
     dtype: OutDType,
-    role: RoleFn,
+    role: RoleArc,
     cal: &mut dyn Calibrator,
     source: &CalibrationSource,
     opts: &CalibrationOptions,

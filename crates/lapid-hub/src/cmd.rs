@@ -1,6 +1,7 @@
 //! Developer entry points the `lapid` binary routes to: `convert`, `verify <model>`,
-//! `bench <model>`. Each model implements `verify` / `bench` in its own `<model>/cmd.rs`;
-//! this module only routes by model name. Apps (transcription, ...) are examples.
+//! `bench <model>`. Registered models (`runtime::registry`) get the generic harness from
+//! their descriptor; the others implement `verify` / `bench` in their own `<model>/cmd.rs`.
+//! This module only routes by model name. Apps (transcription, ...) are examples.
 
 use std::path::Path;
 
@@ -29,11 +30,13 @@ fn unknown(model: &str) -> lapid::Error {
 
 /// Verify `model` against a reference directory (default: the model's own). Check `"ok"`.
 pub fn verify(model: &str, reference: Option<&Path>, args: &ModelArgs) -> Result<Value> {
+    if let Some(e) = crate::runtime::registry::find(model) {
+        return (e.verify)(reference, args);
+    }
     match model {
         "whisper" => crate::whisper::cmd::verify(reference, args),
         "embeddinggemma" => crate::embeddinggemma::cmd::verify(reference, args),
         "parakeet" => crate::parakeet::cmd::verify(reference, args),
-        "lfm3" => crate::lfm3::cmd::verify(reference, args),
         "phonon" => crate::phonon::cmd::verify(reference, args),
         "qwen35" => crate::qwen35::cmd::verify(reference, args),
         "deepseek4" => crate::deepseek4::cmd::verify(reference, args),
@@ -54,11 +57,13 @@ pub fn bench(model: &str, input: Option<&Path>, args: &ModelArgs, runs: usize) -
     if runs == 0 {
         bail!("invalid_argument", "--runs must be at least 1");
     }
+    if let Some(e) = crate::runtime::registry::find(model) {
+        return (e.bench)(input, args, runs);
+    }
     match model {
         "whisper" => crate::whisper::cmd::bench(input, args, runs),
         "embeddinggemma" => crate::embeddinggemma::cmd::bench(input, args, runs),
         "parakeet" => crate::parakeet::cmd::bench(input, args, runs),
-        "lfm3" => crate::lfm3::cmd::bench(input, args, runs),
         "phonon" => crate::phonon::cmd::bench(input, args, runs),
         "qwen35" => crate::qwen35::cmd::bench(input, args, runs),
         "deepseek4" => crate::deepseek4::cmd::bench(input, args, runs),

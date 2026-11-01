@@ -1,19 +1,22 @@
-//! Chat / completion adapter for the hub's text-generation models (LFM3, Qwen3.5, Gemma 4).
-//! They share one generation surface (`TokenStream`, `GenerateOptions`); [`Llm`] names it
-//! once so a single [`LlmServed`] serves all of them with a small pool of sessions: a
+//! Chat / completion adapter for the hub's text-generation models: every
+//! `runtime::Llm<M: CausalLm>` plus the not yet migrated Qwen3.5 / Gemma 4. They share one
+//! generation surface (`TokenStream`, `GenerateOptions`); [`ChatLm`] names it once so a
+//! single [`LlmServed`] serves all of them with a small pool of sessions: a
 //! request reuses the session whose consumed tokens are a prefix of its prompt (the earlier
 //! turns of a conversation), so only the new tokens are prefilled.
 
 use lapid::{Error, Result};
-use lapid_hub::lfm3::{FinishReason, GenerateOptions, TokenStream};
-use lapid_hub::{Gemma4, Lfm3, ModelInfo, Qwen35};
+use crate::runtime::causal_lm::{CausalLm, Llm};
+use crate::runtime::generate::{FinishReason, GenerateOptions, TokenStream};
+use crate::runtime::session::Session;
+use crate::{Gemma4, ModelInfo, Qwen35};
 use lapid_nn::SamplingParams;
 
-use crate::served::{Capability, ChatParams, Delta, GenParams, GenSummary, ModelMeta, Served};
-use crate::text::{OutputFilter, ThinkSplitter};
+use super::{Capability, ChatParams, Delta, GenParams, GenSummary, ModelMeta, AnyModel};
+use super::text::{OutputFilter, ThinkSplitter};
 
 /// The generation surface the adapter needs from a hub LLM.
-pub trait Llm {
+pub trait ChatLm {
     type Session;
     fn new_session(&self) -> Self::Session;
     fn session_tokens(s: &Self::Session) -> &[u32];
@@ -30,7 +33,7 @@ pub trait Llm {
 
 macro_rules! impl_llm {
     ($ty:ty, $session:ty, $markers:expr) => {
-        impl Llm for $ty {
+        impl ChatLm for $ty {
             type Session = $session;
             fn new_session(&self) -> $session {
                 <$ty>::new_session(self)
@@ -51,7 +54,7 @@ macro_rules! impl_llm {
                 self.recommended_sampling()
             }
             fn info(&self) -> ModelInfo {
-                lapid_hub::Model::info(self)
+                crate::Model::info(self)
             }
             fn think_markers(&self) -> (&'static str, &'static str) {
                 $markers
@@ -60,9 +63,36 @@ macro_rules! impl_llm {
     };
 }
 
-impl_llm!(Lfm3, lapid_hub::lfm3::Session, ("<think>", "</think>"));
-impl_llm!(Qwen35, lapid_hub::qwen35::Session, ("<think>", "</think>"));
-impl_llm!(Gemma4, lapid_hub::gemma4::Session, ("<|channel>thought\n", "<channel|>"));
+impl<M: CausalLm> ChatLm for Llm<M> {
+    type Session = Session<M::State>;
+    fn new_session(&self) -> Self::Session {
+        Llm::new_session(self)
+    }
+    fn session_tokens(s: &Self::Session) -> &[u32] {
+        s.tokens()
+    }
+    fn render(&self, messages: &str, tools: Option<&str>, enable_thinking: Option<bool>) -> Result<String> {
+        self.render_chat_json(messages, tools, true, enable_thinking)
+    }
+    fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        Llm::encode(self, text)
+    }
+    fn generate<'a>(&'a self, s: &'a mut Self::Session, prompt: &[u32], opts: GenerateOptions) -> Result<TokenStream<'a>> {
+        Llm::generate(self, s, prompt, opts)
+    }
+    fn recommended(&self) -> SamplingParams {
+        self.recommended_sampling()
+    }
+    fn info(&self) -> ModelInfo {
+        crate::Model::info(self)
+    }
+    fn think_markers(&self) -> (&'static str, &'static str) {
+        Llm::think_markers(self)
+    }
+}
+
+impl_llm!(Qwen35, crate::qwen35::Session, ("<think>", "</think>"));
+impl_llm!(Gemma4, crate::gemma4::Session, ("<|channel>thought\n", "<channel|>"));
 
 struct Slot<S> {
     session: S,
@@ -70,7 +100,7 @@ struct Slot<S> {
 }
 
 /// A hub LLM with a session pool.
-pub struct LlmServed<M: Llm> {
+pub struct LlmServed<M: ChatLm> {
     model: M,
     meta: ModelMeta,
     slots: Vec<Slot<M::Session>>,
@@ -79,8 +109,8 @@ pub struct LlmServed<M: Llm> {
     defaults: GenParams,
 }
 
-impl<M: Llm> LlmServed<M> {
-    pub fn new(model: M, meta: ModelMeta, opts: &crate::load::LoadOptions) -> LlmServed<M> {
+impl<M: ChatLm> LlmServed<M> {
+    pub fn new(model: M, meta: ModelMeta, opts: &super::LoadOptions) -> LlmServed<M> {
         let mut meta = meta;
         meta.capabilities = vec![Capability::Chat, Capability::Completion];
         let max_slots = opts.sessions.max(1);
@@ -152,6 +182,7 @@ impl<M: Llm> LlmServed<M> {
             max_new_tokens: g.max_tokens.or(self.defaults.max_tokens).unwrap_or(2048).max(1),
             sampling: self.sampling(g),
             stop_tokens: None,
+            stop_strings: Vec::new(),
             cancel: None,
         };
         let slot = self.pick_slot(&ids);
@@ -205,7 +236,7 @@ impl<M: Llm> LlmServed<M> {
     }
 }
 
-impl<M: Llm> Served for LlmServed<M> {
+impl<M: ChatLm> AnyModel for LlmServed<M> {
     fn meta(&self) -> &ModelMeta {
         &self.meta
     }

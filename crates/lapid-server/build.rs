@@ -15,7 +15,7 @@ const PLACEHOLDER: &str = r#"<!doctype html><html><head><meta charset="utf-8"><t
 fn main() {
     let dist = Path::new("ui/dist");
     println!("cargo:rerun-if-changed=ui/dist");
-    if !dist.join("index.html").exists() {
+    if !dist.join("index.html").exists() && !dist.join("index.html.gz").exists() {
         let _ = std::fs::create_dir_all(dist);
         let _ = std::fs::write(dist.join("index.html"), PLACEHOLDER);
     }

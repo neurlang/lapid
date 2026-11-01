@@ -81,6 +81,27 @@ impl<'a> Loader<'a> {
         Ok(Linear::new(weight, bias).with_act_quant(self.act_quant(&name)?))
     }
 
+    /// [`linear`](Self::linear) checked to be `[out, inp]`.
+    pub fn linear_checked(&self, prefix: &str, out: usize, inp: usize, bias: bool) -> Result<Linear> {
+        let lin = self.linear(prefix, bias)?;
+        self.expect_shape(&lin.weight, &format!("{prefix}.weight"), &[out, inp])?;
+        Ok(lin)
+    }
+
+    /// [`tensor`](Self::tensor) checked to have `shape`.
+    pub fn tensor_checked(&self, name: &str, shape: &[usize]) -> Result<Tensor> {
+        let t = self.tensor(name)?;
+        self.expect_shape(&t, name, shape)?;
+        Ok(t)
+    }
+
+    /// [`rms_norm`](Self::rms_norm) checked to be `[dim]`.
+    pub fn rms_norm_checked(&self, prefix: &str, dim: usize, eps: f32) -> Result<RmsNorm> {
+        let n = self.rms_norm(prefix, eps)?;
+        self.expect_shape(&n.weight, &format!("{prefix}.weight"), &[dim])?;
+        Ok(n)
+    }
+
     /// `{prefix}.weight` and `{prefix}.bias`.
     pub fn layer_norm(&self, prefix: &str, eps: f32) -> Result<LayerNorm> {
         Ok(LayerNorm::new(

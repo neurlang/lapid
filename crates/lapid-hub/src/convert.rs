@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 use lapid::{Error, Result, bail};
 use lapid_convert::calibrate::{CalibrationOptions, CalibrationSource, Calibrator, convert_calibrated};
 use lapid_convert::gguf::{GgufFile, is_gguf};
-use lapid_convert::writer::{RoleFn, read_json};
+use lapid_convert::writer::{RoleArc, read_json};
 use lapid_convert::{OutDType, default_model_path, download_hf};
 
+use crate::runtime::registry;
 use crate::whisper;
 
 /// Where a checkpoint comes from.
@@ -30,7 +31,6 @@ enum Architecture {
     Whisper,
     EmbeddingGemma,
     Parakeet,
-    Lfm3,
     Phonon,
     Qwen35,
     Deepseek4,
@@ -73,7 +73,6 @@ fn hf_architecture(config: &Path) -> Result<Architecture> {
         Some("whisper") => Ok(Architecture::Whisper),
         Some("gemma3_text") => Ok(Architecture::EmbeddingGemma),
         Some("parakeet_tdt") => Ok(Architecture::Parakeet),
-        Some("lfm3") => Ok(Architecture::Lfm3),
         Some("llama" | "mistral" | "qwen2" | "qwen3" | "qwen3_moe") => Ok(Architecture::Llama),
         Some("gemma4" | "gemma4_text") if gemma4_is_moe(&cfg) => Ok(Architecture::Gemma4Moe),
         Some("gemma4" | "gemma4_text") => Ok(Architecture::Gemma4),
@@ -109,9 +108,6 @@ fn gguf_architecture(path: &Path) -> Result<Architecture> {
     if crate::parakeet::convert::is_parakeet_gguf(&f) {
         return Ok(Architecture::Parakeet);
     }
-    if crate::lfm3::convert::is_lfm3_gguf(&f) {
-        return Ok(Architecture::Lfm3);
-    }
     if crate::llama::convert::is_llama_gguf(&f) {
         return Ok(Architecture::Llama);
     }
@@ -143,6 +139,36 @@ fn file_label(p: &Path) -> String {
     p.file_stem().and_then(|s| s.to_str()).unwrap_or("model").to_string()
 }
 
+/// `config.json` `model_type`.
+fn model_type(config: &Path) -> Option<String> {
+    read_json(config).ok()?.get("model_type")?.as_str().map(str::to_string)
+}
+
+/// The source as a converter argument (repo id or path).
+fn source_str(source: &Source) -> Result<String> {
+    match source {
+        Source::HfRepo(r) => Ok(r.clone()),
+        Source::HfDir(d) | Source::Ggml(d) | Source::Gguf(d) => {
+            d.to_str().map(str::to_string).ok_or_else(|| Error::new("invalid_argument", "model path is not UTF-8"))
+        }
+    }
+}
+
+/// `out`, or the default cache path of `source`; its directory is created.
+fn out_path(source: &Source, out: Option<&Path>, dtype: OutDType) -> Result<PathBuf> {
+    let out = match out {
+        Some(o) => o.to_path_buf(),
+        None => match source {
+            Source::HfRepo(r) => default_model_path(r, dtype),
+            Source::HfDir(d) | Source::Ggml(d) | Source::Gguf(d) => crate::runtime::resolve::cache_path(&d.to_string_lossy(), dtype).0,
+        },
+    };
+    if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| Error::new("io", format!("create {}: {e}", dir.display())))?;
+    }
+    Ok(out)
+}
+
 /// Convert `src` (HF repo id, HF directory, or whisper.cpp ggml file) to `.lapid` at
 /// `dtype` ("fp32", "fp16", "int8", "int4", "q4_k", "q5_k", "q6_k", "q4_k_m"). `out`
 /// defaults to `lapid_convert::default_model_path(..)`. Returns the written path.
@@ -158,7 +184,7 @@ fn calibrated(
     out: &Path,
     dtype: OutDType,
     source: &CalibrationSource,
-    role: RoleFn,
+    role: RoleArc,
     to_f32: impl FnOnce(&Path) -> Result<()>,
     open: impl FnOnce(&Path, &lapid::Device) -> Result<Box<dyn Calibrator>>,
 ) -> Result<()> {
@@ -186,27 +212,32 @@ fn calibrated(
 pub fn convert_with(src: &str, dtype: &str, out: Option<&Path>, calibrate: Option<&str>) -> Result<PathBuf> {
     let dtype = OutDType::parse(dtype)?;
     let source = classify(src)?;
+    let entry = match &source {
+        Source::HfRepo(r) => model_type(&download_hf(r, "config.json")?).as_deref().and_then(registry::for_model_type),
+        Source::HfDir(d) => model_type(&d.join("config.json")).as_deref().and_then(registry::for_model_type),
+        Source::Gguf(f) => registry::for_gguf(&GgufFile::open(f)?),
+        Source::Ggml(_) => None,
+    };
+    if let Some(e) = entry {
+        let out = out_path(&source, out, dtype)?;
+        let src = source_str(&source)?;
+        match calibrate {
+            Some(cal) => {
+                let cal = CalibrationSource::parse(cal);
+                let open = e.calibrate.ok_or_else(|| Error::new("unsupported_model", format!("calibrated quantization is not implemented for {}", e.name)))?;
+                calibrated(&out, dtype, &cal, e.convert.role_arc(), |tmp| e.convert.convert(&src, OutDType::F32, tmp), |p, d| open(p, d, &cal))?;
+            }
+            None => e.convert.convert(&src, dtype, &out)?,
+        }
+        return Ok(out);
+    }
     let arch = match &source {
         Source::HfRepo(r) => hf_architecture(&download_hf(r, "config.json")?)?,
         Source::HfDir(d) => hf_architecture(&d.join("config.json"))?,
         Source::Ggml(f) => ggml_architecture(f),
         Source::Gguf(f) => gguf_architecture(f)?,
     };
-    let out = match out {
-        Some(o) => o.to_path_buf(),
-        None => match &source {
-            Source::HfRepo(r) => default_model_path(r, dtype),
-            Source::HfDir(d) => {
-                let name = d.canonicalize().ok().as_deref().map(file_label).unwrap_or_else(|| file_label(d));
-                default_model_path(&format!("local/{name}"), dtype)
-            }
-            Source::Ggml(f) => default_model_path(&format!("whisper.cpp/{}", file_label(f)), dtype),
-            Source::Gguf(f) => default_model_path(&format!("gguf/{}", file_label(f)), dtype),
-        },
-    };
-    if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).map_err(|e| Error::new("io", format!("create {}: {e}", dir.display())))?;
-    }
+    let out = out_path(&source, out, dtype)?;
     if let Some(cal) = calibrate {
         let cal = CalibrationSource::parse(cal);
         let hf_src = match &source {
@@ -218,25 +249,11 @@ pub fn convert_with(src: &str, dtype: &str, out: Option<&Path>, calibrate: Optio
         };
         let gguf = matches!(source, Source::Gguf(_));
         match arch {
-            Architecture::Lfm3 => calibrated(
-                &out,
-                dtype,
-                &cal,
-                crate::lfm3::convert::role,
-                |tmp| {
-                    if gguf {
-                        crate::lfm3::convert::convert_gguf(Path::new(&hf_src), OutDType::F32, tmp)
-                    } else {
-                        crate::lfm3::convert::convert_hf(&hf_src, OutDType::F32, tmp)
-                    }
-                },
-                |p, d| Ok(Box::new(crate::lfm3::convert::calibrate::Lfm3Calibrator::open(p, d, &cal)?)),
-            )?,
             Architecture::EmbeddingGemma if !gguf => calibrated(
                 &out,
                 dtype,
                 &cal,
-                crate::embeddinggemma::convert::role,
+                std::sync::Arc::new(crate::embeddinggemma::convert::role),
                 |tmp| crate::embeddinggemma::convert::convert_hf(&hf_src, OutDType::F32, tmp),
                 |p, d| Ok(Box::new(crate::embeddinggemma::convert::calibrate::GemmaCalibrator::open(p, d, &cal)?)),
             )?,
@@ -267,15 +284,6 @@ pub fn convert_with(src: &str, dtype: &str, out: Option<&Path>, calibrate: Optio
         (Architecture::Parakeet, Source::Gguf(f)) => crate::parakeet::convert::convert_gguf(f, dtype, &out)?,
         (Architecture::Parakeet, Source::Ggml(f)) => {
             bail!("unsupported_model", "{}: Parakeet has no ggml converter", f.display())
-        }
-        (Architecture::Lfm3, Source::HfRepo(r)) => crate::lfm3::convert::convert_hf(r, dtype, &out)?,
-        (Architecture::Lfm3, Source::HfDir(d)) => {
-            let s = d.to_str().ok_or_else(|| Error::new("invalid_argument", "model directory path is not UTF-8"))?;
-            crate::lfm3::convert::convert_hf(s, dtype, &out)?
-        }
-        (Architecture::Lfm3, Source::Gguf(f)) => crate::lfm3::convert::convert_gguf(f, dtype, &out)?,
-        (Architecture::Lfm3, Source::Ggml(f)) => {
-            bail!("unsupported_model", "{}: LFM3 has no ggml converter", f.display())
         }
         (Architecture::Phonon, Source::HfRepo(r)) => crate::phonon::convert::convert_hf(r, dtype, &out)?,
         (Architecture::Phonon, Source::HfDir(d)) => {

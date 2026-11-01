@@ -37,7 +37,7 @@ pub(crate) mod testutil;
 pub use attention::{Attention, KvCache, Mask};
 pub use layers::{Conv1d, Embedding, LayerNorm, Linear, RmsNorm};
 pub use mlp::{Activation, GatedMlp, Mlp};
-pub use rope::{Rope, RopeLayout, RopeScaling};
+pub use rope::{Rope, RopeLayout, RopeScaling, ZeroTailRope};
 pub use sampling::{Sampler, SamplingParams, argmax};
 pub use tokenizer::Tokenizer;
 pub use weights::{Loader, Precision};

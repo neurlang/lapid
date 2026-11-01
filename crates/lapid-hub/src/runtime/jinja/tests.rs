@@ -136,3 +136,18 @@ fn deep_nesting_is_an_error_not_a_crash() {
     let src = "{% if 1 %}".repeat(200);
     assert_eq!(Template::parse(&src).expect_err("deep").code, "template");
 }
+
+#[test]
+fn dictsort_tojson_indent_strftime() {
+    let m = json(r#"{"b": 1, "A": 2, "c": [1, {"x": null}], "e": []}"#);
+    assert_eq!(render("{% for k, v in m | dictsort %}{{ k }}{% endfor %}", &[("m", m.clone())]), "Abce");
+    assert_eq!(render("{% for k, v in m | dictsort(true) %}{{ k }}{% endfor %}", &[("m", m.clone())]), "Abce");
+    assert_eq!(render("{% for k, v in m | dictsort(reverse=true) %}{{ k }}{% endfor %}", &[("m", m.clone())]), "ecbA");
+    // Python: json.dumps(m, indent=2, ensure_ascii=False)
+    let want = "{\n  \"b\": 1,\n  \"A\": 2,\n  \"c\": [\n    1,\n    {\n      \"x\": null\n    }\n  ],\n  \"e\": []\n}";
+    assert_eq!(render("{{ m | tojson(indent=2) }}", &[("m", m)]), want);
+    assert_eq!(render("{{ 'a\nb\n\nc' | indent(2) }}", &[]), "a\n  b\n\n  c");
+    let d = render("{{ strftime_now('%Y') }}", &[]);
+    assert_eq!(d.len(), 4);
+    assert!(d.starts_with("20"));
+}

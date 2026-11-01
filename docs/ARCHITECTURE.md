@@ -79,6 +79,7 @@ A model is only its own math: about 300 to 500 lines. Everything else is shared 
 - **Verification and benchmarks:** a generic harness driven by a short per-model description.
 
 If a model needs more than that, the missing piece belongs in the shared layer, not in the model.
+The step-by-step guide, with LFM3 as the worked example, is [`MODELS.md`](MODELS.md).
 
 ## Verification
 

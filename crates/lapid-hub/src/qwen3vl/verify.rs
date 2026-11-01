@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use lapid::{Device, Error, Result};
-use lapid_convert::{OutDType, default_model_path};
+use lapid_convert::OutDType;
 use lapid_verify::timing::ms;
 use lapid_verify::{Activations, Comparison, KERNEL_TOLERANCE, argmax_rows, tolerance};
 use serde_json::{Value, json};
@@ -30,23 +30,8 @@ pub fn resolve_model(model: &str, dtype: &str) -> Result<(PathBuf, Option<f64>)>
     }
     let out_dtype = OutDType::parse(dtype)?;
     let is_gguf = p.is_file() && lapid_convert::gguf::is_gguf(p)?;
-    let path = if is_gguf {
-        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
-        default_model_path(&format!("gguf/{stem}"), out_dtype)
-    } else if p.is_dir() {
-        // HF cache snapshots (`models--org--name/snapshots/<hash>`) are named after the repo.
-        let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-        let name = c
-            .ancestors()
-            .filter_map(|a| a.file_name()?.to_str())
-            .find_map(|n| n.strip_prefix("models--").map(|r| r.replace("--", "-")))
-            .or_else(|| c.file_name().and_then(|n| n.to_str()).map(str::to_string))
-            .unwrap_or_else(|| "qwen3vl".into());
-        default_model_path(&format!("local/{name}"), out_dtype)
-    } else {
-        default_model_path(model, out_dtype)
-    };
-    if path.is_file() {
+    let path = crate::runtime::resolve::cache_path(model, out_dtype).0;
+    if path.is_file() && crate::runtime::resolve::cached_matches(&path, model) {
         return Ok((path, None));
     }
     let t = std::time::Instant::now();

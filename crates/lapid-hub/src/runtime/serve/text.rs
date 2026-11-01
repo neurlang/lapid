@@ -2,7 +2,7 @@
 //! OpenAI stop strings. Both hold back the shortest tail that could still become a marker,
 //! so streamed deltas never contain partial markers.
 
-use crate::served::Delta;
+use super::Delta;
 
 /// Length (bytes) of the longest suffix of `s` that is a proper prefix of one of `markers`.
 fn partial_suffix(s: &str, markers: &[&str]) -> usize {

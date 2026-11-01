@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use lapid::{Error, Result};
-use lapid_convert::{OutDType, default_model_path};
+use lapid_convert::OutDType;
 use lapid_verify::timing::ms;
 use lapid_verify::{Activations, Comparison, argmax_rows, tolerance};
 use serde_json::{Value, json};
@@ -39,16 +39,8 @@ pub(crate) fn resolve_model(model: &str, dtype: &str) -> Result<(PathBuf, Option
     }
     let out_dtype = OutDType::parse(dtype)?;
     let is_gguf = p.is_file() && lapid_convert::gguf::is_gguf(p)?;
-    let path = if is_gguf {
-        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
-        default_model_path(&format!("gguf/{stem}-vision"), out_dtype)
-    } else if p.is_dir() {
-        let name = p.canonicalize().ok().and_then(|c| c.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()));
-        default_model_path(&format!("local/gemma4vl-{}", name.unwrap_or_else(|| "model".into())), out_dtype)
-    } else {
-        default_model_path(&format!("{}-vision", model.trim_end_matches('/')), out_dtype)
-    };
-    if path.is_file() {
+    let path = crate::runtime::resolve::cache_path_tagged(model, out_dtype, "vision");
+    if path.is_file() && crate::runtime::resolve::cached_matches(&path, model) {
         return Ok((path, None));
     }
     let t = std::time::Instant::now();

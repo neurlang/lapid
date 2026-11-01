@@ -96,7 +96,7 @@ fn main() -> lapid::Result<()> {
     let mut messages: Vec<Message> = args.system.iter().map(|s| Message::system(s.clone())).collect();
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
-    eprintln!("ready ({} layers, thinking {}). /reset, /quit", llm.config().n_layers, if args.think { "on" } else { "off" });
+    eprintln!("ready ({} layers, thinking {}). /reset, /quit", llm.config().layer_types.len(), if args.think { "on" } else { "off" });
     loop {
         eprint!("\n> ");
         let mut line = String::new();
@@ -125,7 +125,7 @@ fn main() -> lapid::Result<()> {
         }
         let opts = ChatOptions {
             enable_thinking: Some(args.think),
-            generate: GenerateOptions { max_new_tokens: args.max_tokens, sampling: sampling.clone(), stop_tokens: None, cancel: Some(cancel) },
+            generate: GenerateOptions { max_new_tokens: args.max_tokens, sampling: sampling.clone(), stop_tokens: None, cancel: Some(cancel), ..Default::default() },
         };
         let mut stream = llm.chat_stream(&mut session, &messages, &opts)?;
         for token in stream.by_ref() {

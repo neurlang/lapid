@@ -1,6 +1,6 @@
-import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { brotliCompressSync, constants, gzipSync } from "node:zlib";
+import { gzipSync } from "node:zlib";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig, type Plugin } from "vite";
@@ -16,7 +16,11 @@ function walk(dir: string): string[] {
     });
 }
 
-/** Writes deterministic `.br` (q11) and `.gz` (level 9) siblings for compressible assets > 1 KB. */
+/**
+ * Replaces each compressible asset > 1 KB with a deterministic `.gz` (level 9). Only the
+ * compressed copy is embedded in the binary; the server sends it as is (every browser accepts
+ * gzip) and decompresses on the fly for the rare client that doesn't.
+ */
 function precompress(): Plugin {
   let outDir = "";
   return {
@@ -30,16 +34,10 @@ function precompress(): Plugin {
         if (!COMPRESSIBLE.test(file)) continue;
         const data = readFileSync(file);
         if (data.length <= 1024) continue;
-        const br = brotliCompressSync(data, {
-          params: {
-            [constants.BROTLI_PARAM_QUALITY]: 11,
-            [constants.BROTLI_PARAM_SIZE_HINT]: data.length,
-          },
-        });
         const gz = gzipSync(data, { level: 9 });
         gz[9] = 3; // pin the gzip OS byte (unix) so output is identical across platforms
-        writeFileSync(`${file}.br`, br);
         writeFileSync(`${file}.gz`, gz);
+        unlinkSync(file);
       }
     },
   };

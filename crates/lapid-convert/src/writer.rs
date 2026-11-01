@@ -15,6 +15,9 @@ use crate::policy::{Role, Target, encode, target_named};
 /// Classifies a tensor (by name and shape) for the dtype policy.
 pub type RoleFn = fn(&str, &[usize]) -> Role;
 
+/// A shared role classifier (e.g. a closure over a declarative role table).
+pub type RoleArc = std::sync::Arc<dyn Fn(&str, &[usize]) -> Role + Send + Sync>;
+
 /// The required `.lapid` metadata keys. Models add their own config object
 /// (e.g. `meta["whisper"] = ...`).
 pub fn metadata(name: &str, architecture: &str, dtype: OutDType, license: &str, source: Value) -> Value {
@@ -58,7 +61,7 @@ pub fn read_json(path: &Path) -> Result<Value> {
 pub struct ModelWriter {
     writer: Writer,
     dtype: OutDType,
-    role: RoleFn,
+    role: RoleArc,
     written: BTreeSet<String>,
     total: usize,
     tty: bool,
@@ -87,6 +90,11 @@ fn find_layer_count(meta: &Value) -> Option<usize> {
 
 impl ModelWriter {
     pub fn create(out: &Path, metadata: Value, dtype: OutDType, role: RoleFn, total: usize) -> Result<ModelWriter> {
+        ModelWriter::create_shared(out, metadata, dtype, std::sync::Arc::new(role), total)
+    }
+
+    /// [`create`](Self::create) with a shared classifier.
+    pub fn create_shared(out: &Path, metadata: Value, dtype: OutDType, role: RoleArc, total: usize) -> Result<ModelWriter> {
         if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).map_err(|e| Error::new("io", format!("create {}: {e}", dir.display())))?;
         }

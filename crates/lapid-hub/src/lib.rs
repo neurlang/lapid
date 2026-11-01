@@ -1,8 +1,9 @@
 //! lapid-hub — ready-to-run models on lapid (Whisper speech recognition, ...).
 //!
-//! Each model lives in its own module (`whisper`, ...) with everything model-specific:
-//! graphs, tokenizer, decoding, conversion from upstream checkpoints and verification
-//! wiring. [`convert::convert`] routes a source checkpoint to its model's converter.
+//! Each model lives in its own module (`whisper`, ...) with what is model-specific; the
+//! shared framework (pipelines, conversion engine glue, verification harness, serving) is
+//! [`runtime`] (see `docs/MODELS.md`). [`convert::convert`] routes a source checkpoint to
+//! its model's converter; [`load`] serves any model through [`AnyModel`].
 //!
 //! ```no_run
 //! use lapid_hub::Model;
@@ -62,6 +63,7 @@ pub mod phonon;
 pub mod qwen35;
 pub mod qwen4exp;
 pub mod qwen3vl;
+pub mod runtime;
 pub mod vad;
 pub mod zipformer;
 pub mod vision;
@@ -77,9 +79,17 @@ pub use parakeet::Parakeet;
 pub use phonon::{Phonon, SpeakOptions};
 pub use qwen35::Qwen35;
 pub use qwen4exp::Qwen4Exp;
+pub use runtime::serve::{AnyModel, LoadOptions};
 pub use vad::{SpeechSegment, Vad, VadEvent, VadOptions, VadStream};
 pub use zipformer::{StreamOptions, StreamResult, Zipformer, ZipformerStream};
 pub use whisper::{Segment, Task, TranscribeOptions, Transcript, Whisper};
+
+/// Load any servable model from `source` (HF repo id, HF directory, `.gguf`, `.lapid`;
+/// converted into the lapid cache on first use) as one object-safe [`AnyModel`] with
+/// capability methods (chat, complete, transcribe, embed, speak).
+pub fn load(source: &str, device: &lapid::Device, opts: &LoadOptions) -> lapid::Result<Box<dyn AnyModel>> {
+    runtime::serve::load(source, None, device, opts)
+}
 
 pub(crate) fn debug_enabled() -> bool {
     std::env::var("LAPID_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0" && v != "false")

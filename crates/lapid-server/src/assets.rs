@@ -1,6 +1,7 @@
-//! The embedded web UI (`ui/dist`, built with `pnpm build`; not committed, see build.rs). Files are served
-//! with their MIME type; precompressed `.br` / `.gz` siblings are sent when the client
-//! accepts them; unknown non-API paths fall back to `index.html` (client-side routing).
+//! The embedded web UI (`ui/dist`, built with `pnpm build`; not committed, see build.rs).
+//! Compressible assets are embedded only as `.gz` (smaller binary): sent as is when the client
+//! accepts gzip, decompressed on the fly otherwise. Unknown non-API paths fall back to
+//! `index.html` (client-side routing).
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
@@ -22,29 +23,30 @@ fn accepts(headers: &HeaderMap, encoding: &str) -> bool {
 }
 
 fn file_response(path: &str, headers: &HeaderMap) -> Option<Response> {
-    let file = Dist::get(path)?;
     let mime = mime_guess::from_path(path).first_or_octet_stream();
     let cache = if path.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
-    let mut body = file.data;
-    let mut encoding = None;
-    for (enc, ext) in [("br", "br"), ("gzip", "gz")] {
-        if accepts(headers, enc)
-            && let Some(c) = Dist::get(&format!("{path}.{ext}"))
-        {
-            body = c.data;
-            encoding = Some(enc);
-            break;
+    let (body, gzipped) = match Dist::get(path) {
+        Some(f) => (f.data.into_owned(), false),
+        None => {
+            let gz = Dist::get(&format!("{path}.gz"))?.data.into_owned();
+            if accepts(headers, "gzip") {
+                (gz, true)
+            } else {
+                let mut out = Vec::new();
+                std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&gz[..]), &mut out).ok()?;
+                (out, false)
+            }
         }
-    }
-    let mut res = (StatusCode::OK, body.into_owned()).into_response();
+    };
+    let mut res = (StatusCode::OK, body).into_response();
     let h = res.headers_mut();
     if let Ok(v) = HeaderValue::from_str(mime.as_ref()) {
         h.insert(header::CONTENT_TYPE, v);
     }
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
     h.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
-    if let Some(enc) = encoding {
-        h.insert(header::CONTENT_ENCODING, HeaderValue::from_static(enc));
+    if gzipped {
+        h.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
     }
     Some(res)
 }

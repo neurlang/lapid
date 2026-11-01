@@ -6,11 +6,14 @@
 //!   tolerances, collecting per-tensor rows and notes.
 //! * [`timing`]: timed stages, medians, run statistics.
 //! * [`report`]: metrics (`diff`), report rows, dtype tolerances.
+//! * [`harness`]: the per-model [`Descriptor`], reference directories, tap naming and the
+//!   fake-quant kernel comparison behind the generic `lapid verify` / `lapid bench`.
 //!
 //! Model wiring (which tensors, prompts, end-to-end checks) lives with the model in
 //! `lapid-hub`. Reports are JSON (`serde_json::Value`) for the CLI and for agents.
 
 pub mod compare;
+pub mod harness;
 pub mod reference;
 pub mod report;
 pub mod timing;
@@ -19,6 +22,7 @@ use lapid::{Device, Result};
 use serde_json::Value;
 
 pub use compare::Comparison;
+pub use harness::{Descriptor, Reference};
 pub use reference::Activations;
 pub use report::{Diff, KERNEL_TOLERANCE, LayerReport, argmax_rows, diff, tolerance};
 pub use timing::Stages;

@@ -216,12 +216,26 @@ impl Parser<'_> {
 
 /// `json.dumps(v, ensure_ascii=False)` with default separators.
 pub(crate) fn dumps(v: &Value) -> Result<String> {
+    dumps_indent(v, None)
+}
+
+/// `json.dumps(v, ensure_ascii=False, indent=indent)` (with an indent, items are separated
+/// by `","` + newline, as Python does).
+pub(crate) fn dumps_indent(v: &Value, indent: Option<usize>) -> Result<String> {
     let mut out = String::new();
-    dump(v, &mut out)?;
+    dump(v, &mut out, indent, 0)?;
     Ok(out)
 }
 
-fn dump(v: &Value, out: &mut String) -> Result<()> {
+fn newline(out: &mut String, indent: Option<usize>, level: usize) {
+    if let Some(n) = indent {
+        out.push('\n');
+        out.push_str(&" ".repeat(n * level));
+    }
+}
+
+fn dump(v: &Value, out: &mut String, indent: Option<usize>, level: usize) -> Result<()> {
+    let sep = if indent.is_some() { "," } else { ", " };
     match v {
         Value::None => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -240,9 +254,13 @@ fn dump(v: &Value, out: &mut String) -> Result<()> {
             out.push('[');
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
-                    out.push_str(", ");
+                    out.push_str(sep);
                 }
-                dump(item, out)?;
+                newline(out, indent, level + 1);
+                dump(item, out, indent, level + 1)?;
+            }
+            if !items.is_empty() {
+                newline(out, indent, level);
             }
             out.push(']');
         }
@@ -250,11 +268,15 @@ fn dump(v: &Value, out: &mut String) -> Result<()> {
             out.push('{');
             for (i, (k, item)) in pairs.iter().enumerate() {
                 if i > 0 {
-                    out.push_str(", ");
+                    out.push_str(sep);
                 }
+                newline(out, indent, level + 1);
                 dump_str(k, out);
                 out.push_str(": ");
-                dump(item, out)?;
+                dump(item, out, indent, level + 1)?;
+            }
+            if !pairs.is_empty() {
+                newline(out, indent, level);
             }
             out.push('}');
         }

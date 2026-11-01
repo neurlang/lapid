@@ -2,20 +2,26 @@
 //!
 //! Hugging Face Hub downloads (cached), a safetensors reader, a GGUF reader with ggml
 //! dequantizers, the output dtype policy and quantized encoding, and a streaming,
-//! policy-applying writer. Model-specific converters
-//! (tensor naming, metadata, upstream formats) live with their model in `lapid-hub`.
+//! policy-applying writer, and the declarative converter engine (`engine`, `mapping`,
+//! `transforms`, `assets`): a model describes its tensor names and roles as tables plus
+//! small hooks, and the engine does the rest. Model-specific tables and hooks live with
+//! their model in `lapid-hub`.
 
 use std::path::PathBuf;
 
 use lapid_tensor::{Result, bail};
 
+pub mod assets;
 pub mod calibrate;
+pub mod engine;
 pub mod ggml;
 mod gptq;
 pub mod gguf;
 mod hf;
+pub mod mapping;
 pub mod policy;
 pub mod safetensors;
+pub mod transforms;
 pub mod writer;
 
 pub use hf::{download_hf, download_hf_optional};

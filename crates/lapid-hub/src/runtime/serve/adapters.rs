@@ -2,13 +2,13 @@
 //! synthesis (Phonon) and text embeddings (EmbeddingGemma).
 
 use lapid::Result;
-use lapid_hub::embeddinggemma::EmbedOptions;
-use lapid_hub::whisper::{Task, TranscribeOptions};
-use lapid_hub::{EmbeddingGemma, Parakeet, Phonon, SpeakOptions, Whisper};
+use crate::embeddinggemma::EmbedOptions;
+use crate::whisper::{Task, TranscribeOptions};
+use crate::{EmbeddingGemma, Parakeet, Phonon, SpeakOptions, Whisper};
 use serde_json::{Value, json};
 
-use crate::served::{
-    AsrParams, AsrSegment, AsrWord, Capability, EmbedParams, Embeddings, ModelMeta, Served, TranscriptOut, TtsParams,
+use super::{
+    AsrParams, AsrSegment, AsrWord, Capability, EmbedParams, Embeddings, ModelMeta, AnyModel, TranscriptOut, TtsParams,
 };
 
 pub struct WhisperServed {
@@ -24,7 +24,7 @@ impl WhisperServed {
     }
 }
 
-impl Served for WhisperServed {
+impl AnyModel for WhisperServed {
     fn meta(&self) -> &ModelMeta {
         &self.meta
     }
@@ -66,7 +66,7 @@ impl ParakeetServed {
     }
 }
 
-impl Served for ParakeetServed {
+impl AnyModel for ParakeetServed {
     fn meta(&self) -> &ModelMeta {
         &self.meta
     }
@@ -79,7 +79,7 @@ impl Served for ParakeetServed {
         let sr = self.model.config().sample_rate;
         let resampled;
         let samples = if sr != 16_000 {
-            resampled = lapid_hub::audio::resample(samples, 16_000, sr);
+            resampled = crate::audio::resample(samples, 16_000, sr);
             &resampled[..]
         } else {
             samples
@@ -113,7 +113,7 @@ impl PhononServed {
     }
 }
 
-impl Served for PhononServed {
+impl AnyModel for PhononServed {
     fn meta(&self) -> &ModelMeta {
         &self.meta
     }
@@ -160,7 +160,7 @@ impl EmbedServed {
     }
 }
 
-impl Served for EmbedServed {
+impl AnyModel for EmbedServed {
     fn meta(&self) -> &ModelMeta {
         &self.meta
     }

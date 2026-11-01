@@ -88,7 +88,7 @@ fn reply(llm: &Gemma4Moe, session: &mut lapid_hub::gemma4moe::Session, messages:
     let sampling = if args.sample { llm.recommended_sampling() } else { Default::default() };
     let opts = ChatOptions {
         enable_thinking: Some(args.think),
-        generate: GenerateOptions { max_new_tokens: args.max_tokens, sampling, stop_tokens: None, cancel: None },
+        generate: GenerateOptions { max_new_tokens: args.max_tokens, sampling, stop_tokens: None, cancel: None, ..Default::default() },
     };
     let mut out = std::io::stdout();
     let mut stream = llm.chat_stream(session, messages, &opts)?;
