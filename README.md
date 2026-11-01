@@ -5,7 +5,7 @@
 **Fast ML inference on every device. Pure Rust.**
 
 [![CI](https://github.com/thewh1teagle/lapid/actions/workflows/ci.yml/badge.svg)](https://github.com/thewh1teagle/lapid/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-CC%20BY%204.0-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
 </div>
 
@@ -32,6 +32,6 @@ println!("{:?}", Device::best().to_vec_f32(&y)?);  // compiles, fuses, runs
 
 <div align="center">
 
-[Examples](crates/lapid-hub/examples/) · [Docs](docs/) · CC BY 4.0
+[Examples](crates/lapid-hub/examples/) · [Docs](docs/) · Apache-2.0
 
 </div>
