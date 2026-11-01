@@ -18,7 +18,7 @@
 
 ## Why
 
-| | The problem |
+| | In short |
 |---|---|
 | **ONNX Runtime** | Fast on NVIDIA, slow on other GPUs, big and hard to change |
 | **llama.cpp** | Fast, but you need a different build for each GPU |
