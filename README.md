@@ -22,7 +22,23 @@
 - **vs llama.cpp**: one build for all GPUs, no SDKs to install.
 - **vs Candle, Burn, Tract**: more GPUs, made for inference, and runs on both CPU and GPU.
 
-## Quick start
+## Command line
+
+Install the `lapid` binary (about 15 MB, every GPU backend and the web UI included):
+
+```sh
+cargo binstall --git https://github.com/thewh1teagle/lapid lapid-cli
+```
+
+It takes the same commands, flags and GGUF files as llama.cpp:
+
+```sh
+lapid run -hf unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M -p "Hello"
+lapid serve -hf unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M   # OpenAI API and chat UI on :8080
+lapid run nvidia/parakeet-tdt-0.6b-v3 audio.wav     # speech to text
+```
+
+## Library
 
 ```sh
 cargo add --git https://github.com/thewh1teagle/lapid lapid lapid-hub
@@ -51,6 +67,6 @@ println!("{:?}", Device::best().to_vec_f32(&y)?);  // compiles, fuses, runs
 
 <div align="center">
 
-[Examples](crates/lapid-hub/examples/) · [Docs](docs/)
+[Examples](crates/lapid-hub/examples/) · [Models](docs/MODELS.md) · [C API](crates/lapid-c/) · [Docs](docs/)
 
 </div>
