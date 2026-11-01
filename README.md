@@ -11,7 +11,7 @@
 
 ## Highlights
 
-- 📦 **No SDKs**: no CUDA toolkit, Vulkan SDK or C++ compiler. Drivers load at runtime.
+- 📦 **Just `cargo add`**: builds anywhere with plain Rust; GPU drivers are picked up at runtime.
 - 🪶 **Small models**: runs quantized weights (`fp16`, `int8`, `int4`, GGUF) to use less memory.
 - 🖥️ **Every GPU**: CUDA, Vulkan, Metal and WebGPU, with a fast CPU fallback. The best one is picked at runtime.
 - 🌐 **Runs in the browser**: the same code builds for WebAssembly and WebGPU.
