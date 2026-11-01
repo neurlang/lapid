@@ -1,0 +1,195 @@
+// Top-k (k up to {{KMAX}}) of each row of a [rows, cols] matrix, one 256-thread block per
+// row. Values map to order-preserving u32 keys. A 4-pass radix select (8 bits per pass,
+// shared-memory histograms) finds the k-th largest key T; one ordered pass then collects
+// the keys > T and the lowest-column keys == T (block-wide ballot prefix sums keep column
+// order), and a rank sort over the k candidates writes the columns by value descending,
+// ties by column ascending. Barriers are `barrier.sync` (non-aligned): several follow
+// divergent code (thread 0 / lane 0 sections).
+// Params: [rows, cols, k]
+.shared .align 16 .b32 hist[256];
+.shared .align 16 .b32 wt[16];
+.shared .align 16 .b32 ck[{{KMAX}}];
+.shared .align 16 .b32 ci[{{KMAX}}];
+
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %p, %pg, %pe, %pv;
+    .reg .b32 %row, %cols, %k, %tx, %lane, %warp, %j, %e, %base, %key, %t, %d, %acc, %c;
+    .reg .b32 %prefix, %mask, %rem, %shift, %h, %gtb, %eqb, %cgt, %c0, %bg, %be, %lt;
+    .reg .b32 %preg, %pree, %totg, %tote, %slot, %kc, %ic, %k2, %i2, %rank, %c2, %ww;
+    .reg .f32 %x;
+    .reg .b64 %a;
+{{PTRS}}
+    mov.u32 %row, %ctaid.x;
+    mov.u32 %tx, %tid.x;
+    and.b32 %lane, %tx, 31;
+    shr.u32 %warp, %tx, 5;
+    ld.param.u32 %cols, [P+4];
+    ld.param.u32 %k, [P+8];
+    mul.lo.u32 %base, %row, %cols;
+    mov.u32 %prefix, 0;
+    mov.u32 %mask, 0;
+    mov.u32 %rem, %k;
+    mov.u32 %shift, 24;
+    mov.u32 %h, hist;
+PASS:
+    // histogram of digit (key >> shift) & 255 over the keys matching the prefix so far
+    shl.b32 %t, %tx, 2;
+    add.u32 %t, %t, %h;
+    mov.u32 %c, 0;
+    st.shared.u32 [%t], %c;
+    barrier.sync 0;
+    mov.u32 %j, %tx;
+HLOOP:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra HEND;
+    add.u32 %e, %base, %j;
+{{LOAD}}
+{{KEY}}
+    and.b32 %t, %key, %mask;
+    setp.ne.u32 %p, %t, %prefix;
+    @%p bra HNEXT;
+    shr.u32 %d, %key, %shift;
+    and.b32 %d, %d, 255;
+    shl.b32 %d, %d, 2;
+    add.u32 %d, %d, %h;
+    atom.shared.add.u32 %t, [%d], 1;
+HNEXT:
+    add.u32 %j, %j, 256;
+    bra HLOOP;
+HEND:
+    barrier.sync 0;
+    // every thread (uniformly): the digit d holding the rem-th largest key, bins from 255 down
+    mov.u32 %acc, 0;
+    mov.u32 %d, 255;
+    add.u32 %ww, %h, 1020;
+SEL:
+    ld.shared.u32 %c, [%ww];
+    add.u32 %t, %acc, %c;
+    setp.ge.u32 %p, %t, %rem;
+    @%p bra FOUND;
+    mov.u32 %acc, %t;
+    setp.eq.u32 %p, %d, 0;
+    @%p bra FOUND;
+    sub.u32 %d, %d, 1;
+    sub.u32 %ww, %ww, 4;
+    bra SEL;
+FOUND:
+    sub.u32 %rem, %rem, %acc;
+    shl.b32 %d, %d, %shift;
+    or.b32 %prefix, %prefix, %d;
+    mov.u32 %t, 255;
+    shl.b32 %t, %t, %shift;
+    or.b32 %mask, %mask, %t;
+    setp.eq.u32 %p, %shift, 0;
+    @%p bra PASSES_DONE;
+    sub.u32 %shift, %shift, 8;
+    barrier.sync 0;
+    bra PASS;
+PASSES_DONE:
+    // T = prefix; take every key > T (cgt of them) and the first rem keys == T
+    sub.u32 %cgt, %k, %rem;
+    mov.u32 %gtb, 0;
+    mov.u32 %eqb, 0;
+    mov.u32 %c0, 0;
+    mov.u32 %lt, %lanemask_lt;
+CLOOP:
+    setp.ge.u32 %p, %c0, %cols;
+    @%p bra CEND;
+    add.u32 %j, %c0, %tx;
+    setp.lt.u32 %pv, %j, %cols;
+    mov.u32 %key, 0;
+    @!%pv bra CLOADED;
+    add.u32 %e, %base, %j;
+{{LOAD}}
+{{KEY}}
+CLOADED:
+    setp.gt.and.u32 %pg, %key, %prefix, %pv;
+    setp.eq.and.u32 %pe, %key, %prefix, %pv;
+    vote.sync.ballot.b32 %bg, %pg, -1;
+    vote.sync.ballot.b32 %be, %pe, -1;
+    and.b32 %t, %bg, %lt;
+    popc.b32 %preg, %t;
+    and.b32 %t, %be, %lt;
+    popc.b32 %pree, %t;
+    setp.ne.u32 %p, %lane, 0;
+    @%p bra WT_DONE;
+    popc.b32 %t, %bg;
+    popc.b32 %c, %be;
+    mov.u32 %ww, wt;
+    shl.b32 %d, %warp, 2;
+    add.u32 %ww, %ww, %d;
+    st.shared.u32 [%ww], %t;
+    st.shared.u32 [%ww+32], %c;
+WT_DONE:
+    barrier.sync 0;
+{{PREFIX}}
+    @!%pg bra NOT_GT;
+    add.u32 %slot, %gtb, %preg;
+    bra STORE_CAND;
+NOT_GT:
+    @!%pe bra CNEXT;
+    add.u32 %slot, %eqb, %pree;
+    setp.ge.u32 %p, %slot, %rem;
+    @%p bra CNEXT;
+    add.u32 %slot, %slot, %cgt;
+STORE_CAND:
+    shl.b32 %slot, %slot, 2;
+    mov.u32 %t, ck;
+    add.u32 %t, %t, %slot;
+    st.shared.u32 [%t], %key;
+    mov.u32 %t, ci;
+    add.u32 %t, %t, %slot;
+    st.shared.u32 [%t], %j;
+CNEXT:
+    add.u32 %gtb, %gtb, %totg;
+    add.u32 %eqb, %eqb, %tote;
+    barrier.sync 0;
+    add.u32 %c0, %c0, 256;
+    // done once every candidate is placed (block-uniform)
+    setp.ge.u32 %p, %gtb, %cgt;
+    setp.ge.and.u32 %p, %eqb, %rem, %p;
+    @%p bra CEND;
+    bra CLOOP;
+CEND:
+    barrier.sync 0;
+    // rank sort: rank(c) = #{c2 : key2 > key or (key2 == key and col2 < col)}
+    mov.u32 %c, %tx;
+RLOOP:
+    setp.ge.u32 %p, %c, %k;
+    @%p bra DONE;
+    shl.b32 %t, %c, 2;
+    mov.u32 %d, ck;
+    add.u32 %d, %d, %t;
+    ld.shared.u32 %kc, [%d];
+    mov.u32 %d, ci;
+    add.u32 %d, %d, %t;
+    ld.shared.u32 %ic, [%d];
+    mov.u32 %rank, 0;
+    mov.u32 %c2, 0;
+    mov.u32 %d, ck;
+    mov.u32 %ww, ci;
+R2:
+    ld.shared.u32 %k2, [%d];
+    ld.shared.u32 %i2, [%ww];
+    setp.eq.u32 %p, %k2, %kc;
+    setp.lt.and.u32 %p, %i2, %ic, %p;
+    setp.gt.or.u32 %p, %k2, %kc, %p;
+    selp.u32 %t, 1, 0, %p;
+    add.u32 %rank, %rank, %t;
+    add.u32 %d, %d, 4;
+    add.u32 %ww, %ww, 4;
+    add.u32 %c2, %c2, 1;
+    setp.lt.u32 %p, %c2, %k;
+    @%p bra R2;
+    mad.lo.u32 %t, %row, %k, %rank;
+    mul.wide.u32 %a, %t, 4;
+    add.s64 %a, %a, %g_out;
+    st.global.u32 [%a], %ic;
+    add.u32 %c, %c, 256;
+    bra RLOOP;
+DONE:
+    ret;
+}

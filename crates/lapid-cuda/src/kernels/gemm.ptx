@@ -1,0 +1,128 @@
+// Scalar tiled GEMM (exact f32 math, any dtypes): 64x64 output tile per 256-thread block,
+// k-tiles of 16 staged in shared memory (As[k][m], Bs[k][n], f32), each thread owns a 4x4
+// micro-tile. The accumulators are staged through shared memory so the fused epilogue
+// runs as one coalesced loop.
+// Grid: (tiles_n, tiles_m, batch).
+// Params: [batch, m, n, k, a.off, a.bs, a.rs, b.off, b.bs, b.rs, scales_off, -, -,
+//          extra_e(off, s_batch, s_m, s_n)...]
+.shared .align 16 .b8 smem[16384];
+
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %p, %q;
+    .reg .b32 %tx, %ty, %tz, %bt, %row0, %col0, %M, %N, %K, %k0, %abase, %bbase, %ars, %brs, %so;
+    .reg .b32 %sm, %sa, %sb, %kk, %e, %r, %c, %gi, %gj, %cs;
+    .reg .f32 %a0, %a1, %a2, %a3, %b0, %b1, %b2, %b3, %acc;
+    .reg .f32 %c00, %c01, %c02, %c03, %c10, %c11, %c12, %c13;
+    .reg .f32 %c20, %c21, %c22, %c23, %c30, %c31, %c32, %c33;
+{{PTRS}}
+    mov.u32 %tz, %tid.x;
+    and.b32 %tx, %tz, 15;
+    shr.u32 %ty, %tz, 4;
+    mov.u32 %bt, %ctaid.z;
+    mov.u32 %r, %ctaid.y;
+    shl.b32 %row0, %r, 6;
+    mov.u32 %c, %ctaid.x;
+    shl.b32 %col0, %c, 6;
+    ld.param.u32 %M, [P+4];
+    ld.param.u32 %N, [P+8];
+    ld.param.u32 %K, [P+12];
+    ld.param.u32 %abase, [P+16];
+    ld.param.u32 %r, [P+20];
+    mad.lo.u32 %abase, %bt, %r, %abase;
+    ld.param.u32 %ars, [P+24];
+    ld.param.u32 %bbase, [P+28];
+    ld.param.u32 %r, [P+32];
+    mad.lo.u32 %bbase, %bt, %r, %bbase;
+    ld.param.u32 %brs, [P+36];
+    ld.param.u32 %so, [P+40];
+    mov.u32 %sm, smem;
+    mov.f32 %c00, 0f00000000;
+    mov.f32 %c01, 0f00000000;
+    mov.f32 %c02, 0f00000000;
+    mov.f32 %c03, 0f00000000;
+    mov.f32 %c10, 0f00000000;
+    mov.f32 %c11, 0f00000000;
+    mov.f32 %c12, 0f00000000;
+    mov.f32 %c13, 0f00000000;
+    mov.f32 %c20, 0f00000000;
+    mov.f32 %c21, 0f00000000;
+    mov.f32 %c22, 0f00000000;
+    mov.f32 %c23, 0f00000000;
+    mov.f32 %c30, 0f00000000;
+    mov.f32 %c31, 0f00000000;
+    mov.f32 %c32, 0f00000000;
+    mov.f32 %c33, 0f00000000;
+    // per-thread shared addresses of the micro-tile operands: As[kk][ty*4], Bs[kk][tx*4]
+    mad.lo.u32 %sa, %ty, 16, %sm;
+    mad.lo.u32 %sb, %tx, 16, %sm;
+    add.u32 %sb, %sb, 4096;
+    mov.u32 %k0, 0;
+K_LOOP:
+    setp.ge.u32 %p, %k0, %K;
+    @%p bra K_DONE;
+    // stage A[row0.., k0..k0+16] -> As[kk][m] and B -> Bs[kk][n] (4 elements each)
+{{LOAD_A}}
+{{LOAD_B}}
+    bar.sync 0;
+    mov.u32 %kk, 0;
+INNER:
+    mad.lo.u32 %r, %kk, 256, %sa;
+    ld.shared.v4.f32 {%a0, %a1, %a2, %a3}, [%r];
+    mad.lo.u32 %r, %kk, 256, %sb;
+    ld.shared.v4.f32 {%b0, %b1, %b2, %b3}, [%r];
+    fma.rn.f32 %c00, %a0, %b0, %c00;
+    fma.rn.f32 %c01, %a0, %b1, %c01;
+    fma.rn.f32 %c02, %a0, %b2, %c02;
+    fma.rn.f32 %c03, %a0, %b3, %c03;
+    fma.rn.f32 %c10, %a1, %b0, %c10;
+    fma.rn.f32 %c11, %a1, %b1, %c11;
+    fma.rn.f32 %c12, %a1, %b2, %c12;
+    fma.rn.f32 %c13, %a1, %b3, %c13;
+    fma.rn.f32 %c20, %a2, %b0, %c20;
+    fma.rn.f32 %c21, %a2, %b1, %c21;
+    fma.rn.f32 %c22, %a2, %b2, %c22;
+    fma.rn.f32 %c23, %a2, %b3, %c23;
+    fma.rn.f32 %c30, %a3, %b0, %c30;
+    fma.rn.f32 %c31, %a3, %b1, %c31;
+    fma.rn.f32 %c32, %a3, %b2, %c32;
+    fma.rn.f32 %c33, %a3, %b3, %c33;
+    add.u32 %kk, %kk, 1;
+    setp.lt.u32 %p, %kk, 16;
+    @%p bra INNER;
+    bar.sync 0;
+    add.u32 %k0, %k0, 16;
+    bra K_LOOP;
+K_DONE:
+    // stage the 64x64 accumulator tile: Cs[ty*4 + i][tx*4 .. +4]
+    shl.b32 %r, %ty, 2;
+    mad.lo.u32 %cs, %r, 64, %tx;
+    mad.lo.u32 %cs, %tx, 3, %cs;
+    mad.lo.u32 %cs, %cs, 4, %sm;
+    st.shared.v4.f32 [%cs], {%c00, %c01, %c02, %c03};
+    st.shared.v4.f32 [%cs+256], {%c10, %c11, %c12, %c13};
+    st.shared.v4.f32 [%cs+512], {%c20, %c21, %c22, %c23};
+    st.shared.v4.f32 [%cs+768], {%c30, %c31, %c32, %c33};
+    bar.sync 0;
+    mov.u32 %e, %tz;
+EPI_LOOP:
+    setp.ge.u32 %p, %e, 4096;
+    @%p bra DONE;
+    shr.u32 %r, %e, 6;
+    and.b32 %c, %e, 63;
+    add.u32 %gi, %row0, %r;
+    add.u32 %gj, %col0, %c;
+    setp.ge.u32 %p, %gi, %M;
+    setp.ge.or.u32 %p, %gj, %N, %p;
+    @%p bra EPI_NEXT;
+    mad.lo.u32 %r, %e, 4, %sm;
+    ld.shared.f32 %acc, [%r];
+{{EPILOGUE}}
+EPI_NEXT:
+    add.u32 %e, %e, 256;
+    bra EPI_LOOP;
+DONE:
+    ret;
+}

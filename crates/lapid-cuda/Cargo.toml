@@ -1,0 +1,16 @@
+[package]
+name = "lapid-cuda"
+description = "lapid: CUDA backend (PTX kernel templates JIT-compiled by the driver, loaded at runtime)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lapid-tensor.workspace = true
+lapid-compiler.workspace = true
+lapid-quant.workspace = true
+libloading.workspace = true
+
+[dev-dependencies]
+lapid-cpu.workspace = true
+half.workspace = true

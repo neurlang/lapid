@@ -1,0 +1,42 @@
+// Gather rows of a (possibly quantized) [rows, cols] table by i32 indices, one thread per
+// output element. An index outside [0, rows) sets the backend error flag and reads the
+// clamped row instead.
+// Params: [rows, cols, count, scales_offset_bytes, total = count * cols]
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %p, %bad;
+    .reg .b32 %e, %i, %c, %r, %src, %rows, %cols, %so, %total, %bx, %tx;
+    .reg .b64 %a;
+    .reg .f32 %v;
+{{PTRS}}
+    mov.u32 %bx, %ctaid.x;
+    mov.u32 %tx, %tid.x;
+    mad.lo.u32 %e, %bx, 256, %tx;
+    ld.param.u32 %total, [P+16];
+    setp.ge.u32 %p, %e, %total;
+    @%p bra DONE;
+    ld.param.u32 %rows, [P];
+    ld.param.u32 %cols, [P+4];
+    ld.param.u32 %so, [P+12];
+    div.u32 %i, %e, %cols;
+    mul.lo.u32 %c, %i, %cols;
+    sub.u32 %c, %e, %c;
+    mul.wide.u32 %a, %i, 4;
+    add.s64 %a, %a, %g_idx;
+    ld.global.s32 %r, [%a];
+    setp.ge.u32 %bad, %r, %rows;
+    @!%bad bra IN_RANGE;
+    mov.u32 %bx, 1;
+    st.global.u32 [%g_flag], %bx;
+IN_RANGE:
+    sub.u32 %rows, %rows, 1;
+    max.s32 %r, %r, 0;
+    min.s32 %r, %r, %rows;
+    mad.lo.u32 %src, %r, %cols, %c;
+{{LOAD}}
+{{STORE}}
+DONE:
+    ret;
+}

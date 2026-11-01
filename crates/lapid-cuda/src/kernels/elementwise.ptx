@@ -1,0 +1,21 @@
+// Elementwise: out[out_view(idx)] = expr(in_i[in_view_i(idx)]) for every idx of a rank-R
+// space, one thread per element. Views are Flat (offset + lin), Scalar (offset) or
+// Strided (offset + sum(c_d * stride_d)); the coordinates are only decoded when needed.
+// Params: [numel, shape[R], out(off, strides[R]), in_i(off, strides[R])...]
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %done;
+    .reg .b32 %lin, %numel, %bx, %tx;
+{{PTRS}}
+    mov.u32 %bx, %ctaid.x;
+    mov.u32 %tx, %tid.x;
+    mad.lo.u32 %lin, %bx, 256, %tx;
+    ld.param.u32 %numel, [P];
+    setp.ge.u32 %done, %lin, %numel;
+    @%done bra DONE;
+{{BODY}}
+DONE:
+    ret;
+}

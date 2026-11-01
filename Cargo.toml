@@ -1,0 +1,81 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.98"
+
+[workspace.dependencies]
+lapid = { path = "crates/lapid" }
+lapid-hub = { path = "crates/lapid-hub", default-features = false }
+lapid-nn = { path = "crates/lapid-nn" }
+lapid-tensor = { path = "crates/lapid-tensor" }
+lapid-compiler = { path = "crates/lapid-compiler" }
+lapid-cpu = { path = "crates/lapid-cpu" }
+lapid-vulkan = { path = "crates/lapid-vulkan" }
+lapid-wgsl = { path = "crates/lapid-wgsl" }
+lapid-webgpu = { path = "crates/lapid-webgpu" }
+lapid-metal = { path = "crates/lapid-metal" }
+lapid-cuda = { path = "crates/lapid-cuda" }
+lapid-quant = { path = "crates/lapid-quant" }
+lapid-format = { path = "crates/lapid-format" }
+# Downloads are opt-in per member (`features = ["download"]`); lapid-hub enables it by default.
+lapid-convert = { path = "crates/lapid-convert", default-features = false }
+lapid-verify = { path = "crates/lapid-verify" }
+
+# CUDA driver (libcuda / nvcuda.dll) is loaded at runtime; libloading is pure Rust.
+libloading = "0.8"
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }
+half = { version = "2.7", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
+memmap2 = "0.9"
+rustfft = "6.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+# Pure-Rust crypto for rustls (the default `ring` provider compiles C).
+rustls-rustcrypto = "0.0.2-alpha"
+clap = { version = "4.6", features = ["derive"] }
+blake3 = { version = "1", default-features = false, features = ["std", "pure"] }
+# Metal (Apple targets only; the system framework is loaded by the OS, no C build step).
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSError", "NSArray", "NSObject"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLDevice",
+    "MTLEvent",
+    "MTLLibrary",
+    "MTLResource",
+    "MTLTypes",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# GPTQ / k-quant reference loops are compute heavy (calibrated conversion in dev builds).
+[profile.dev.package.lapid-convert]
+opt-level = 3
+
+[profile.dev.package.lapid-quant]
+opt-level = 3

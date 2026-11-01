@@ -1,0 +1,9 @@
+[package]
+name = "lapid-compiler"
+description = "lapid: graph lowering, fusion and the kernel IR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lapid-tensor.workspace = true

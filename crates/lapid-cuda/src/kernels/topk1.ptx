@@ -1,0 +1,105 @@
+// Top-1 (argmax) of each row of a [rows, cols] matrix, one 256-thread block per row.
+// Each value maps to an order-preserving u32 key; (key << 32 | ~col) packed in a u64 makes
+// the largest value win and ties go to the lower column, so the reduction is one max.u64
+// per element (4 independent loads per loop iteration), then warp shuffles and shared memory.
+// Long rows are split over grid.y chunks of `per` columns: with more than one chunk each
+// block writes its packed best to scratch[row * nchunks + chunk] (u64) and the merge stage
+// (`topk_merge.ptx`) reduces them; with one chunk the block writes the index directly.
+// Params: [rows, cols, k = 1, numel, per, nchunks]
+.shared .align 8 .b64 red64[8];
+
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %p;
+    .reg .b32 %row, %cols, %tx, %lane, %warp, %j, %base, %lo, %hi, %lo2, %hi2, %w, %ch, %per, %nch, %end;
+    .reg .b64 %best, %t64, %a;
+{{PTRS}}
+    mov.u32 %row, %ctaid.x;
+    mov.u32 %tx, %tid.x;
+    and.b32 %lane, %tx, 31;
+    shr.u32 %warp, %tx, 5;
+    mov.u32 %ch, %ctaid.y;
+    ld.param.u32 %cols, [P+4];
+    ld.param.u32 %per, [P+16];
+    ld.param.u32 %nch, [P+20];
+    mul.lo.u32 %base, %row, %cols;
+    mul.lo.u32 %j, %ch, %per;
+    add.u32 %end, %j, %per;
+    min.u32 %end, %end, %cols;
+    add.u32 %j, %j, %tx;
+    mov.u64 %best, 0;
+LOOP:
+    setp.ge.u32 %p, %j, %end;
+    @%p bra LOOP_END;
+{{BODY}}
+    add.u32 %j, %j, 1024;
+    bra LOOP;
+LOOP_END:
+    mov.b64 {%lo, %hi}, %best;
+    shfl.sync.bfly.b32 %lo2, %lo, 16, 31, -1;
+    shfl.sync.bfly.b32 %hi2, %hi, 16, 31, -1;
+    mov.b64 %t64, {%lo2, %hi2};
+    max.u64 %best, %best, %t64;
+    mov.b64 {%lo, %hi}, %best;
+    shfl.sync.bfly.b32 %lo2, %lo, 8, 31, -1;
+    shfl.sync.bfly.b32 %hi2, %hi, 8, 31, -1;
+    mov.b64 %t64, {%lo2, %hi2};
+    max.u64 %best, %best, %t64;
+    mov.b64 {%lo, %hi}, %best;
+    shfl.sync.bfly.b32 %lo2, %lo, 4, 31, -1;
+    shfl.sync.bfly.b32 %hi2, %hi, 4, 31, -1;
+    mov.b64 %t64, {%lo2, %hi2};
+    max.u64 %best, %best, %t64;
+    mov.b64 {%lo, %hi}, %best;
+    shfl.sync.bfly.b32 %lo2, %lo, 2, 31, -1;
+    shfl.sync.bfly.b32 %hi2, %hi, 2, 31, -1;
+    mov.b64 %t64, {%lo2, %hi2};
+    max.u64 %best, %best, %t64;
+    mov.b64 {%lo, %hi}, %best;
+    shfl.sync.bfly.b32 %lo2, %lo, 1, 31, -1;
+    shfl.sync.bfly.b32 %hi2, %hi, 1, 31, -1;
+    mov.b64 %t64, {%lo2, %hi2};
+    max.u64 %best, %best, %t64;
+    setp.ne.u32 %p, %lane, 0;
+    @%p bra STORED;
+    mov.u32 %w, red64;
+    mad.lo.u32 %w, %warp, 8, %w;
+    st.shared.u64 [%w], %best;
+STORED:
+    barrier.sync 0;
+    setp.ne.u32 %p, %tx, 0;
+    @%p bra DONE;
+    ld.shared.u64 %t64, [red64];
+    max.u64 %best, %best, %t64;
+    ld.shared.u64 %t64, [red64+8];
+    max.u64 %best, %best, %t64;
+    ld.shared.u64 %t64, [red64+16];
+    max.u64 %best, %best, %t64;
+    ld.shared.u64 %t64, [red64+24];
+    max.u64 %best, %best, %t64;
+    ld.shared.u64 %t64, [red64+32];
+    max.u64 %best, %best, %t64;
+    ld.shared.u64 %t64, [red64+40];
+    max.u64 %best, %best, %t64;
+    ld.shared.u64 %t64, [red64+48];
+    max.u64 %best, %best, %t64;
+    ld.shared.u64 %t64, [red64+56];
+    max.u64 %best, %best, %t64;
+    setp.eq.u32 %p, %nch, 1;
+    @%p bra DIRECT;
+    mad.lo.u32 %w, %row, %nch, %ch;
+    mul.wide.u32 %a, %w, 8;
+    add.s64 %a, %a, %g_scratch;
+    st.global.u64 [%a], %best;
+    bra DONE;
+DIRECT:
+    mov.b64 {%lo, %hi}, %best;
+    not.b32 %lo, %lo;
+    mul.wide.u32 %a, %row, 4;
+    add.s64 %a, %a, %g_out;
+    st.global.u32 [%a], %lo;
+DONE:
+    ret;
+}

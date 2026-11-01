@@ -1,0 +1,180 @@
+// Flash attention on tensor cores (many queries, e.g. the encoder): 64 queries per
+// 128-thread block, 16 per warp. Q (f16 A fragments) stays in registers; K / V tiles of
+// 64 keys are staged in shared memory as f16 ([key][d], row stride LD = D + 8 halves,
+// conflict-free for ldmatrix). Per tile: S = Q K^T (mma.sync m16n8k16, f32), online
+// softmax on the S fragments (base-2 exponent, scale * log2 e folded in), P re-packed
+// as f16 A fragments in registers, O += P V (V fragments via ldmatrix.trans).
+// Head dim D is baked in (multiple of 16, <= 128).
+// Grid: (q_blocks, B * H).
+// Params: [B, H, sq, sk, d, scale_bits, q_blocks, q(off, s0..s3), k(..), v(..), mask(..)?]
+.shared .align 16 .b8 smem[{{SMEM}}];
+
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %p, %qv0, %qv1;
+    .reg .b32 %tx, %lane, %warp, %qb, %bh, %h, %b, %H, %SQ, %SK, %q0, %qr0, %qr1, %t, %u, %e, %sm;
+    .reg .b32 %qbase, %qs, %qd, %kbase, %ks, %kd, %vbase, %vs, %vd, %kt0, %kend0, %kend1, %kendb, %kl2;
+    .reg .b32 %q_lane, %k_lane, %v_lane, %orow0, %orow1;
+    .reg .s32 %st;
+    .reg .f32 %scl, %m0, %m1, %l0, %l1;
+// #if MASK
+    .reg .b32 %mrow0, %mrow1, %mstep;
+// #endif
+{{REGS}}
+{{PTRS}}
+    mov.u32 %tx, %tid.x;
+    and.b32 %lane, %tx, 31;
+    shr.u32 %warp, %tx, 5;
+    mov.u32 %qb, %ctaid.x;
+    mov.u32 %bh, %ctaid.y;
+    ld.param.u32 %H, [P+4];
+    ld.param.u32 %SQ, [P+8];
+    ld.param.u32 %SK, [P+12];
+    ld.param.f32 %scl, [P+20];
+    mul.f32 %scl, %scl, 0f3FB8AA3B;
+    rem.u32 %h, %bh, %H;
+    div.u32 %b, %bh, %H;
+    shl.b32 %q0, %qb, 6;
+    mov.u32 %sm, smem;
+    ld.param.u32 %qbase, [P+28];
+    ld.param.u32 %t, [P+32];
+    mad.lo.u32 %qbase, %b, %t, %qbase;
+    ld.param.u32 %t, [P+36];
+    mad.lo.u32 %qbase, %h, %t, %qbase;
+    ld.param.u32 %qs, [P+40];
+    ld.param.u32 %qd, [P+44];
+    ld.param.u32 %kbase, [P+48];
+    ld.param.u32 %t, [P+52];
+    mad.lo.u32 %kbase, %b, %t, %kbase;
+    ld.param.u32 %t, [P+56];
+    mad.lo.u32 %kbase, %h, %t, %kbase;
+    ld.param.u32 %ks, [P+60];
+    ld.param.u32 %kd, [P+64];
+    ld.param.u32 %vbase, [P+68];
+    ld.param.u32 %t, [P+72];
+    mad.lo.u32 %vbase, %b, %t, %vbase;
+    ld.param.u32 %t, [P+76];
+    mad.lo.u32 %vbase, %h, %t, %vbase;
+    ld.param.u32 %vs, [P+80];
+    ld.param.u32 %vd, [P+84];
+
+    // this thread's two query rows (fragment rows lane / 4 and lane / 4 + 8)
+    shr.u32 %t, %lane, 2;
+    mad.lo.u32 %qr0, %warp, 16, %t;
+    add.u32 %qr0, %qr0, %q0;
+    add.u32 %qr1, %qr0, 8;
+    setp.lt.u32 %qv0, %qr0, %SQ;
+    setp.lt.u32 %qv1, %qr1, %SQ;
+    and.b32 %kl2, %lane, 3;
+    shl.b32 %kl2, %kl2, 1;
+    // output element index of (row, d = 2 * (lane % 4))
+    mad.lo.u32 %orow0, %bh, %SQ, %qr0;
+    mad.lo.u32 %orow0, %orow0, {{D}}, %kl2;
+    mad.lo.u32 %orow1, %bh, %SQ, %qr1;
+    mad.lo.u32 %orow1, %orow1, {{D}}, %kl2;
+// #if MASK
+    // mask rows of the two query rows (clamped to sq - 1 for padding rows)
+    sub.u32 %e, %SQ, 1;
+    ld.param.u32 %mrow0, [P+88];
+    ld.param.u32 %t, [P+92];
+    mad.lo.u32 %mrow0, %b, %t, %mrow0;
+    ld.param.u32 %t, [P+96];
+    mad.lo.u32 %mrow0, %h, %t, %mrow0;
+    ld.param.u32 %t, [P+100];
+    min.u32 %u, %qr1, %e;
+    mad.lo.u32 %mrow1, %u, %t, %mrow0;
+    min.u32 %u, %qr0, %e;
+    mad.lo.u32 %mrow0, %u, %t, %mrow0;
+    ld.param.u32 %mstep, [P+104];
+// #endif
+// #if CAUSAL
+    // key j visible to query i iff j <= i + sk - sq
+    add.s32 %st, %qr0, 1;
+    add.s32 %st, %st, %SK;
+    sub.s32 %st, %st, %SQ;
+    max.s32 %st, %st, 0;
+    min.s32 %st, %st, %SK;
+    mov.b32 %kend0, %st;
+    add.s32 %st, %qr1, 1;
+    add.s32 %st, %st, %SK;
+    sub.s32 %st, %st, %SQ;
+    max.s32 %st, %st, 0;
+    min.s32 %st, %st, %SK;
+    mov.b32 %kend1, %st;
+    add.u32 %t, %q0, 63;
+    sub.u32 %e, %SQ, 1;
+    min.u32 %t, %t, %e;
+    add.s32 %st, %t, 1;
+    add.s32 %st, %st, %SK;
+    sub.s32 %st, %st, %SQ;
+    max.s32 %st, %st, 0;
+    min.s32 %st, %st, %SK;
+    mov.b32 %kendb, %st;
+// #endif
+// #if !CAUSAL
+    mov.u32 %kend0, %SK;
+    mov.u32 %kend1, %SK;
+    mov.u32 %kendb, %SK;
+// #endif
+
+    // ldmatrix lane addresses
+    // Q (A, row-major [q][d]): row warp*16 + lane % 16, d (lane / 16) * 8
+    and.b32 %t, %lane, 15;
+    mad.lo.u32 %t, %warp, 16, %t;
+    shr.u32 %u, %lane, 4;
+    mul.lo.u32 %t, %t, {{LD}};
+    mad.lo.u32 %t, %u, 8, %t;
+    mad.lo.u32 %q_lane, %t, 2, %sm;
+    // K (B, [key][d] = [n][k]): key lane % 8 + (lane / 16) * 8, d ((lane / 8) % 2) * 8
+    and.b32 %t, %lane, 7;
+    mad.lo.u32 %t, %u, 8, %t;
+    bfe.u32 %e, %lane, 3, 1;
+    mul.lo.u32 %t, %t, {{LD}};
+    mad.lo.u32 %t, %e, 8, %t;
+    mad.lo.u32 %k_lane, %t, 2, %sm;
+    // V (B via .trans, [key][d] = [k][n]): key lane % 8 + ((lane / 8) % 2) * 8, d (lane / 16) * 8
+    and.b32 %t, %lane, 7;
+    mad.lo.u32 %t, %e, 8, %t;
+    mul.lo.u32 %t, %t, {{LD}};
+    mad.lo.u32 %t, %u, 8, %t;
+    mad.lo.u32 %v_lane, %t, 2, %sm;
+    add.u32 %v_lane, %v_lane, {{KV_BYTES}};
+
+    // stage the Q tile (f16) in the K region, then load the A fragments
+    mov.u32 %e, %tx;
+Q_LOOP:
+    setp.ge.u32 %p, %e, {{QD}};
+    @%p bra Q_DONE;
+{{LOAD_Q}}
+    add.u32 %e, %e, 128;
+    bra Q_LOOP;
+Q_DONE:
+    bar.sync 0;
+{{Q_FRAGS}}
+    bar.sync 0;
+{{INIT}}
+    mov.u32 %kt0, 0;
+KV_LOOP:
+    setp.ge.u32 %p, %kt0, %kendb;
+    @%p bra KV_DONE;
+    mov.u32 %e, %tx;
+KV_LD:
+    setp.ge.u32 %p, %e, {{KV_ITEMS}};
+    @%p bra KV_LD_DONE;
+{{LOAD_KV}}
+    add.u32 %e, %e, 128;
+    bra KV_LD;
+KV_LD_DONE:
+    bar.sync 0;
+{{QK}}
+{{SOFTMAX}}
+{{PV}}
+    bar.sync 0;
+    add.u32 %kt0, %kt0, 64;
+    bra KV_LOOP;
+KV_DONE:
+{{FINAL}}
+    ret;
+}

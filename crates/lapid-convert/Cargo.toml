@@ -1,0 +1,25 @@
+[package]
+name = "lapid-convert"
+description = "lapid: generic model conversion helpers (HF download, safetensors, dtype policy, writer)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["download"]
+# Hugging Face Hub downloads. Off: `download_hf` serves cached files only and otherwise
+# fails with "download_disabled" (no HTTP/TLS stack in the build).
+download = ["dep:ureq", "dep:rustls-rustcrypto"]
+
+[dependencies]
+lapid-tensor.workspace = true
+lapid-quant.workspace = true
+lapid-format.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+memmap2.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+ureq = { workspace = true, optional = true }
+rustls-rustcrypto = { workspace = true, optional = true }
+blake3.workspace = true

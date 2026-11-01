@@ -1,0 +1,36 @@
+[package]
+name = "lapid"
+description = "Fast ML inference on any device (CPU, Vulkan, Metal), in pure Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["vulkan", "metal", "cuda"]
+vulkan = ["dep:lapid-vulkan"]
+# CUDA backend; the driver is loaded at runtime (builds on every OS, no toolkit needed).
+cuda = ["dep:lapid-cuda"]
+# Metal backend; only has an effect on Apple targets (the dependency is Apple-only).
+# vulkan / cuda have no effect on wasm32 (CPU only).
+metal = ["dep:lapid-metal"]
+# WebGPU backend on wgpu (native Vulkan/Metal/DX12, and browsers on wasm32). Opt-in.
+webgpu = ["dep:lapid-webgpu"]
+
+[dependencies]
+lapid-tensor.workspace = true
+lapid-compiler.workspace = true
+lapid-cpu.workspace = true
+lapid-quant.workspace = true
+lapid-format.workspace = true
+serde_json.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+lapid-webgpu = { workspace = true, optional = true }
+
+# GPU backends load native drivers at runtime; none exist on wasm (CPU only there).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+lapid-vulkan = { workspace = true, optional = true }
+lapid-cuda = { workspace = true, optional = true }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+lapid-metal = { workspace = true, optional = true }

@@ -1,0 +1,9 @@
+[package]
+name = "lapid-quant"
+description = "lapid: quantization formats (int8, int4) and reference kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+half.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "lapid-vulkan"
+description = "lapid: Vulkan backend (WGSL codegen -> naga -> SPIR-V, ash runtime)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lapid-tensor.workspace = true
+lapid-compiler.workspace = true
+lapid-quant.workspace = true
+lapid-wgsl.workspace = true
+ash.workspace = true
+naga.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+lapid-cpu.workspace = true

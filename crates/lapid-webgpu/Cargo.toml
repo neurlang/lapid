@@ -1,0 +1,27 @@
+[package]
+name = "lapid-webgpu"
+description = "lapid: WebGPU backend on wgpu (native Vulkan/Metal/DX12 and browsers), sharing the lapid-wgsl kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lapid-tensor.workspace = true
+lapid-compiler.workspace = true
+lapid-wgsl.workspace = true
+
+# Native: wgpu-core with the platform's primary backends (all pure Rust, drivers loaded at runtime).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "metal", "dx12"] }
+pollster = "0.4"
+
+# Browsers: navigator.gpu (the browser compiles the WGSL). Single-threaded wasm, so the
+# fragile Send/Sync impls are sound.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "webgpu", "fragile-send-sync-non-atomic-wasm"] }
+
+[dev-dependencies]
+lapid-cpu.workspace = true
+lapid-quant.workspace = true
+half.workspace = true
+bytemuck.workspace = true

@@ -1,0 +1,69 @@
+// Combine the per-chunk partials of `attn_split`: one thread per output element.
+// out[r, d] = sum_s e^(m_s - M) o_s[d] / sum_s e^(m_s - M) l_s,  M = max_s m_s.
+// Scratch row r, chunk s: [m, l, o[D]] at (r * NS + s) * (D + 2).
+// Params: [rows = B * H * sq, d, nsplit]
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %p;
+    .reg .b32 %e, %rows, %D, %NS, %total, %r, %d, %s, %stride, %base, %t, %bx, %tx;
+    .reg .b64 %ad;
+    .reg .f32 %M, %l, %o, %w, %ms, %ls, %os, %x;
+{{PTRS}}
+    mov.u32 %bx, %ctaid.x;
+    mov.u32 %tx, %tid.x;
+    mad.lo.u32 %e, %bx, 256, %tx;
+    ld.param.u32 %rows, [P];
+    ld.param.u32 %D, [P+4];
+    ld.param.u32 %NS, [P+8];
+    mul.lo.u32 %total, %rows, %D;
+    setp.ge.u32 %p, %e, %total;
+    @%p bra DONE;
+    div.u32 %r, %e, %D;
+    rem.u32 %d, %e, %D;
+    add.u32 %stride, %D, 2;
+    mul.lo.u32 %base, %r, %NS;
+    mul.lo.u32 %base, %base, %stride;
+    mov.f32 %M, 0fFF7FFFFF;
+    mov.u32 %s, 0;
+MAX_LOOP:
+    mad.lo.u32 %t, %s, %stride, %base;
+    mul.wide.u32 %ad, %t, 4;
+    add.s64 %ad, %ad, %g_scr;
+    ld.global.f32 %ms, [%ad];
+    max.f32 %M, %M, %ms;
+    add.u32 %s, %s, 1;
+    setp.lt.u32 %p, %s, %NS;
+    @%p bra MAX_LOOP;
+    mov.f32 %l, 0f00000000;
+    mov.f32 %o, 0f00000000;
+    setp.le.f32 %p, %M, 0fFF7FFFFF;
+    @%p bra WRITE;
+    mov.u32 %s, 0;
+SUM_LOOP:
+    mad.lo.u32 %t, %s, %stride, %base;
+    mul.wide.u32 %ad, %t, 4;
+    add.s64 %ad, %ad, %g_scr;
+    ld.global.f32 %ms, [%ad];
+    ld.global.f32 %ls, [%ad+4];
+    add.u32 %t, %t, %d;
+    mul.wide.u32 %ad, %t, 4;
+    add.s64 %ad, %ad, %g_scr;
+    ld.global.f32 %os, [%ad+8];
+    sub.f32 %w, %ms, %M;
+    mul.f32 %w, %w, 0f3FB8AA3B;
+    ex2.approx.f32 %w, %w;
+    fma.rn.f32 %l, %w, %ls, %l;
+    fma.rn.f32 %o, %w, %os, %o;
+    add.u32 %s, %s, 1;
+    setp.lt.u32 %p, %s, %NS;
+    @%p bra SUM_LOOP;
+WRITE:
+    div.rn.f32 %x, %o, %l;
+    setp.gt.f32 %p, %l, 0f00000000;
+    selp.f32 %x, %x, 0f00000000, %p;
+{{STORE}}
+DONE:
+    ret;
+}

@@ -1,0 +1,122 @@
+// Gated delta rule (Gated DeltaNet), sequential over t. Columns j of the state S [Dk, Dv]
+// evolve independently: per step S[:, j] = exp(g) S[:, j]; d = beta (v_j - S[:, j] . k);
+// S[:, j] += d k; o_j = scale (S[:, j] . q).
+// Block = 128 threads = 16 columns x 8 parts; part p keeps rows p*R .. p*R + R of its
+// column in registers (R = ceil(Dk / 8), baked in); dot products reduce over the 8 parts
+// with butterfly shuffles (no shared memory, no barriers). The inputs of token t + 1 are
+// loaded (into the *n registers) before the math of token t, hiding their latency.
+// Grid: B * H * ceil(Dv / 16) blocks.
+// Params: [B, T, H, Dk, Dv, scale (f32 bits), col_blocks]
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %p, %cv, %p0;
+    .reg .b32 %tx, %part, %j, %jc, %item, %ncb, %cb, %bh, %b, %h, %T, %H, %DK, %DV;
+    .reg .b32 %tok, %x, %i0, %sbase, %obase, %tt, %tn, %tlast;
+    .reg .f32 %scale, %gv, %gt, %bv, %dk, %sh, %delta, %o, %vj, %gn, %bn, %vn;
+    .reg .b64 %ad;
+{{REGS}}
+{{PTRS}}
+    mov.u32 %tx, %tid.x;
+    and.b32 %part, %tx, 7;
+    ld.param.u32 %T, [P+4];
+    ld.param.u32 %H, [P+8];
+    ld.param.u32 %DK, [P+12];
+    ld.param.u32 %DV, [P+16];
+    ld.param.f32 %scale, [P+20];
+    ld.param.u32 %ncb, [P+24];
+    mov.u32 %item, %ctaid.x;
+    rem.u32 %cb, %item, %ncb;
+    div.u32 %bh, %item, %ncb;
+    rem.u32 %h, %bh, %H;
+    div.u32 %b, %bh, %H;
+    shr.u32 %j, %tx, 3;
+    mad.lo.u32 %j, %cb, 16, %j;
+    setp.lt.u32 %cv, %j, %DV;
+    selp.b32 %jc, %j, 0, %cv;
+    mul.lo.u32 %i0, %part, {{R}};
+    // S[i0][jc] of this (b, h)
+    mul.lo.u32 %sbase, %bh, %DK;
+    add.u32 %sbase, %sbase, %i0;
+    mad.lo.u32 %sbase, %sbase, %DV, %jc;
+{{LOAD_STATE}}
+    // out[b, h, 0, jc]
+    add.u32 %x, %T, %DK;
+    mul.lo.u32 %obase, %bh, %x;
+    mad.lo.u32 %obase, %obase, %DV, %jc;
+    setp.eq.u32 %p0, %part, 0;
+    and.pred %p0, %p0, %cv;
+    mov.u32 %tt, 0;
+    setp.eq.u32 %p, %T, 0;
+    @%p bra END;
+    sub.u32 %tlast, %T, 1;
+    mov.u32 %tn, 0;
+    // prefetch token tn
+// #if PREFETCH
+    mad.lo.u32 %tok, %b, %T, %tn;
+    mad.lo.u32 %tok, %tok, %H, %h;
+    mul.wide.u32 %ad, %tok, 4;
+    add.s64 %ad, %ad, %g_g;
+    ld.global.nc.f32 %gn, [%ad];
+    mul.wide.u32 %ad, %tok, 4;
+    add.s64 %ad, %ad, %g_beta;
+    ld.global.nc.f32 %bn, [%ad];
+    mad.lo.u32 %x, %tok, %DK, %i0;
+{{LOAD_KQ}}
+    mad.lo.u32 %x, %tok, %DV, %jc;
+    mul.wide.u32 %ad, %x, 4;
+    add.s64 %ad, %ad, %g_v;
+    ld.global.nc.f32 %vn, [%ad];
+// #endif
+LOOP:
+    setp.ge.u32 %p, %tt, %T;
+    @%p bra END;
+{{TAKE}}
+    add.u32 %tn, %tt, 1;
+    min.u32 %tn, %tn, %tlast;
+// #if PREFETCH
+    mad.lo.u32 %tok, %b, %T, %tn;
+    mad.lo.u32 %tok, %tok, %H, %h;
+    mul.wide.u32 %ad, %tok, 4;
+    add.s64 %ad, %ad, %g_g;
+    ld.global.nc.f32 %gn, [%ad];
+    mul.wide.u32 %ad, %tok, 4;
+    add.s64 %ad, %ad, %g_beta;
+    ld.global.nc.f32 %bn, [%ad];
+    mad.lo.u32 %x, %tok, %DK, %i0;
+{{LOAD_KQ}}
+    mad.lo.u32 %x, %tok, %DV, %jc;
+    mul.wide.u32 %ad, %x, 4;
+    add.s64 %ad, %ad, %g_v;
+    ld.global.nc.f32 %vn, [%ad];
+// #endif
+{{EXP}}
+{{DOT_K}}
+    shfl.sync.bfly.b32 %sh, %dk, 1, 31, -1;
+    add.f32 %dk, %dk, %sh;
+    shfl.sync.bfly.b32 %sh, %dk, 2, 31, -1;
+    add.f32 %dk, %dk, %sh;
+    shfl.sync.bfly.b32 %sh, %dk, 4, 31, -1;
+    add.f32 %dk, %dk, %sh;
+    sub.f32 %delta, %vj, %dk;
+    mul.f32 %delta, %delta, %bv;
+{{DOT_Q}}
+    shfl.sync.bfly.b32 %sh, %o, 1, 31, -1;
+    add.f32 %o, %o, %sh;
+    shfl.sync.bfly.b32 %sh, %o, 2, 31, -1;
+    add.f32 %o, %o, %sh;
+    shfl.sync.bfly.b32 %sh, %o, 4, 31, -1;
+    add.f32 %o, %o, %sh;
+    mul.f32 %o, %o, %scale;
+    mad.lo.u32 %x, %tt, %DV, %obase;
+{{STORE_O}}
+    add.u32 %tt, %tt, 1;
+    bra LOOP;
+END:
+    // final state: out rows T + i
+    mad.lo.u32 %x, %T, %DV, %obase;
+    mad.lo.u32 %x, %i0, %DV, %x;
+{{STORE_STATE}}
+    ret;
+}

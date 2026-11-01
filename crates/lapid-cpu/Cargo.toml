@@ -1,0 +1,13 @@
+[package]
+name = "lapid-cpu"
+description = "lapid: CPU backend (SIMD kernels, thread pool)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lapid-tensor.workspace = true
+lapid-compiler.workspace = true
+lapid-quant.workspace = true
+half.workspace = true
+bytemuck.workspace = true

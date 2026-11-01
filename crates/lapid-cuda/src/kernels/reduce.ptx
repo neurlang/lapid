@@ -1,0 +1,53 @@
+// Reduce over the last axis with a fused prologue expression.
+// ROW: one 256-thread block per output (threads stride the reduced axis, then a block
+// reduction); otherwise one thread per output.
+// Params: [outer, inner, shape[0..R-1], in_i(off, strides[R])...]
+.shared .align 16 .f32 red[8];
+
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %p;
+    .reg .b32 %o, %j, %outer, %inner, %tx, %lane, %warp, %bx;
+    .reg .f32 %acc;
+{{PTRS}}
+    mov.u32 %tx, %tid.x;
+    mov.u32 %bx, %ctaid.x;
+    and.b32 %lane, %tx, 31;
+    shr.u32 %warp, %tx, 5;
+    ld.param.u32 %outer, [P];
+    ld.param.u32 %inner, [P+4];
+// #if ROW
+    mov.u32 %o, %bx;
+    mov.u32 %j, %tx;
+// #endif
+// #if !ROW
+    mad.lo.u32 %o, %bx, 256, %tx;
+    setp.ge.u32 %p, %o, %outer;
+    @%p bra DONE;
+    mov.u32 %j, 0;
+// #endif
+{{SETUP}}
+    mov.f32 %acc, {{IDENTITY}};
+LOOP:
+    setp.ge.u32 %p, %j, %inner;
+    @%p bra LOOP_END;
+{{BODY}}
+// #if ROW
+    add.u32 %j, %j, 256;
+// #endif
+// #if !ROW
+    add.u32 %j, %j, 1;
+// #endif
+    bra LOOP;
+LOOP_END:
+// #if ROW
+{{BLOCK_REDUCE}}
+    setp.ne.u32 %p, %tx, 0;
+    @%p bra DONE;
+// #endif
+{{STORE}}
+DONE:
+    ret;
+}

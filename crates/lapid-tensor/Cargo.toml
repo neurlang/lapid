@@ -1,0 +1,13 @@
+[package]
+name = "lapid-tensor"
+description = "lapid: dtypes, ops and the lazy tensor graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lapid-quant.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+half.workspace = true
+bytemuck.workspace = true

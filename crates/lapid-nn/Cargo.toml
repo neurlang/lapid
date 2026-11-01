@@ -1,0 +1,16 @@
+[package]
+name = "lapid-nn"
+description = "lapid model-building library: layers, attention, RoPE, MLPs, audio front-end, tokenizers, sampling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lapid.workspace = true
+rustfft.workspace = true
+serde_json.workspace = true
+# Hugging Face tokenizers, pure Rust: no `onig` (C), `fancy-regex` instead.
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokenizers = { version = "0.23.2", default-features = false, features = ["unstable_wasm"] }

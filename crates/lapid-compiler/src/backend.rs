@@ -1,0 +1,31 @@
+//! Backend trait. CONTRACT FILE — owned by the coordinator.
+
+use lapid_tensor::{DeviceData, Result};
+
+use crate::ir::Launch;
+
+pub trait Backend: Send + Sync {
+    /// "cpu" or "vulkan"; equals `DeviceBuffer::backend()` of its buffers.
+    fn name(&self) -> &'static str;
+    /// Human readable, e.g. "NVIDIA GB10" / "cpu (20 threads, neon+dotprod)".
+    fn device_name(&self) -> String;
+    /// Allocate uninitialized device memory.
+    fn alloc(&self, bytes: usize) -> Result<DeviceData>;
+    /// Allocate and fill.
+    fn upload(&self, bytes: &[u8]) -> Result<DeviceData>;
+    /// Copy back to host (waits for pending work).
+    fn download(&self, buf: &DeviceData) -> Result<Vec<u8>>;
+    /// Compile / cache everything the launches need. Optional (execute must also work cold).
+    fn prepare(&self, _launches: &[Launch]) -> Result<()> {
+        Ok(())
+    }
+    /// Run the launches in order and wait for completion. `buffers[id]` is the device buffer
+    /// of BufId `id` (several ids may share one buffer — temp slots). Launch k+1 sees all
+    /// writes of launch k.
+    fn execute(&self, launches: &[Launch], buffers: &[DeviceData]) -> Result<()>;
+    /// Per-kernel-kind time totals `(kind, launches, ms)` accumulated by `execute` since the
+    /// last call, when the backend profiles (`LAPID_PROFILE=1`). Default: not supported.
+    fn take_profile(&self) -> Vec<(&'static str, usize, f64)> {
+        Vec::new()
+    }
+}

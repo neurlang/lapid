@@ -1,0 +1,159 @@
+// MatMulId routing (one 1024-thread block): groups the t * r rows by expert.
+// Writes to scratch (u32): off[E+1] (exclusive prefix of the per-expert row counts),
+// ts[E+1] at E+1 (exclusive prefix of the per-expert 64-row tile counts), and the row-id
+// list at 2(E+1) (rows of expert e at off[e] .. off[e+1], in no particular order).
+// An id outside [0, E) raises the error flag and the row is dropped.
+// Params: [rows = t * r, E]
+.shared .align 4 .b32 cnt[{{MAX_E}}];
+.shared .align 4 .b32 cur[{{MAX_E}}];
+
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %p, %q;
+    .reg .b32 %tx, %lane, %rows, %ne, %i, %ex, %t, %u, %one, %sc, %scnt, %stl, %lo, %hi;
+    .reg .b32 %cs, %ts, %ic, %it, %pos, %tp, %shc, %sht;
+    .reg .b64 %ad, %g_ts, %g_list;
+{{PTRS}}
+    mov.u32 %tx, %tid.x;
+    and.b32 %lane, %tx, 31;
+    ld.param.u32 %rows, [P];
+    ld.param.u32 %ne, [P+4];
+    mov.u32 %sc, cnt;
+    mov.u32 %u, cur;
+    add.u32 %t, %ne, 1;
+    mul.wide.u32 %ad, %t, 4;
+    add.s64 %g_ts, %g_scratch, %ad;
+    mul.wide.u32 %ad, %t, 8;
+    add.s64 %g_list, %g_scratch, %ad;
+    mov.u32 %one, 1;
+
+    mov.u32 %i, %tx;
+ZERO:
+    setp.ge.u32 %p, %i, %ne;
+    @%p bra ZERO_DONE;
+    mad.lo.u32 %t, %i, 4, %sc;
+    st.shared.u32 [%t], 0;
+    add.u32 %i, %i, 1024;
+    bra ZERO;
+ZERO_DONE:
+    bar.sync 0;
+
+    mov.u32 %i, %tx;
+COUNT:
+    setp.ge.u32 %p, %i, %rows;
+    @%p bra COUNT_DONE;
+    mul.wide.u32 %ad, %i, 4;
+    add.s64 %ad, %ad, %g_ids;
+    ld.global.u32 %ex, [%ad];
+    setp.ge.u32 %q, %ex, %ne;
+    @%q st.global.u32 [%g_flag], %one;
+    @!%q mad.lo.u32 %t, %ex, 4, %sc;
+    @!%q atom.shared.add.u32 %t, [%t], 1;
+    add.u32 %i, %i, 1024;
+    bra COUNT;
+COUNT_DONE:
+    bar.sync 0;
+
+    // warp 0: lane handles experts [lane * chunk, min(E, (lane + 1) * chunk))
+    setp.ge.u32 %p, %tx, 32;
+    @%p bra SCAN_DONE;
+    add.u32 %t, %ne, 31;
+    shr.u32 %t, %t, 5;
+    mul.lo.u32 %lo, %lane, %t;
+    add.u32 %hi, %lo, %t;
+    min.u32 %hi, %hi, %ne;
+    min.u32 %lo, %lo, %ne;
+    mov.u32 %scnt, 0;
+    mov.u32 %stl, 0;
+    mov.u32 %i, %lo;
+SUM:
+    setp.ge.u32 %p, %i, %hi;
+    @%p bra SUM_DONE;
+    mad.lo.u32 %t, %i, 4, %sc;
+    ld.shared.u32 %t, [%t];
+    add.u32 %scnt, %scnt, %t;
+    add.u32 %t, %t, 63;
+    shr.u32 %t, %t, 6;
+    add.u32 %stl, %stl, %t;
+    add.u32 %i, %i, 1;
+    bra SUM;
+SUM_DONE:
+    // inclusive warp scans of (scnt, stl)
+    mov.u32 %ic, %scnt;
+    mov.u32 %it, %stl;
+    shfl.sync.up.b32 %shc|%q, %ic, 1, 0, -1;
+    shfl.sync.up.b32 %sht, %it, 1, 0, -1;
+    @%q add.u32 %ic, %ic, %shc;
+    @%q add.u32 %it, %it, %sht;
+    shfl.sync.up.b32 %shc|%q, %ic, 2, 0, -1;
+    shfl.sync.up.b32 %sht, %it, 2, 0, -1;
+    @%q add.u32 %ic, %ic, %shc;
+    @%q add.u32 %it, %it, %sht;
+    shfl.sync.up.b32 %shc|%q, %ic, 4, 0, -1;
+    shfl.sync.up.b32 %sht, %it, 4, 0, -1;
+    @%q add.u32 %ic, %ic, %shc;
+    @%q add.u32 %it, %it, %sht;
+    shfl.sync.up.b32 %shc|%q, %ic, 8, 0, -1;
+    shfl.sync.up.b32 %sht, %it, 8, 0, -1;
+    @%q add.u32 %ic, %ic, %shc;
+    @%q add.u32 %it, %it, %sht;
+    shfl.sync.up.b32 %shc|%q, %ic, 16, 0, -1;
+    shfl.sync.up.b32 %sht, %it, 16, 0, -1;
+    @%q add.u32 %ic, %ic, %shc;
+    @%q add.u32 %it, %it, %sht;
+    sub.u32 %pos, %ic, %scnt;
+    sub.u32 %tp, %it, %stl;
+    mov.u32 %i, %lo;
+WRITE:
+    setp.ge.u32 %p, %i, %hi;
+    @%p bra WRITE_DONE;
+    mul.wide.u32 %ad, %i, 4;
+    add.s64 %ad, %ad, %g_scratch;
+    st.global.u32 [%ad], %pos;
+    mul.wide.u32 %ad, %i, 4;
+    add.s64 %ad, %ad, %g_ts;
+    st.global.u32 [%ad], %tp;
+    mad.lo.u32 %t, %i, 4, %sc;
+    ld.shared.u32 %cs, [%t];
+    mad.lo.u32 %t, %i, 4, %u;
+    st.shared.u32 [%t], %pos;
+    add.u32 %pos, %pos, %cs;
+    add.u32 %cs, %cs, 63;
+    shr.u32 %cs, %cs, 6;
+    add.u32 %tp, %tp, %cs;
+    add.u32 %i, %i, 1;
+    bra WRITE;
+WRITE_DONE:
+    setp.ne.u32 %p, %lane, 31;
+    @%p bra SCAN_DONE;
+    mul.wide.u32 %ad, %ne, 4;
+    add.s64 %ad, %ad, %g_scratch;
+    st.global.u32 [%ad], %ic;
+    mul.wide.u32 %ad, %ne, 4;
+    add.s64 %ad, %ad, %g_ts;
+    st.global.u32 [%ad], %it;
+SCAN_DONE:
+    bar.sync 0;
+
+    mov.u32 %i, %tx;
+FILL:
+    setp.ge.u32 %p, %i, %rows;
+    @%p bra DONE;
+    mul.wide.u32 %ad, %i, 4;
+    add.s64 %ad, %ad, %g_ids;
+    ld.global.u32 %ex, [%ad];
+    setp.ge.u32 %q, %ex, %ne;
+    @%q bra FILL_NEXT;
+    mad.lo.u32 %t, %ex, 4, %u;
+    atom.shared.add.u32 %t, [%t], 1;
+    mul.wide.u32 %ad, %t, 4;
+    add.s64 %ad, %ad, %g_list;
+    st.global.u32 [%ad], %i;
+FILL_NEXT:
+    add.u32 %i, %i, 1024;
+    bra FILL;
+DONE:
+    ret;
+}

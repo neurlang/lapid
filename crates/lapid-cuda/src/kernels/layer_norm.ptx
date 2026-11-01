@@ -1,0 +1,68 @@
+// Layer norm over rows, one 256-thread block per row (two-pass mean / variance; the row
+// is re-read per pass, which hits L1 for model-sized rows).
+// Params: [rows, cols, eps_bits]
+.shared .align 16 .f32 red[8];
+
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %p;
+    .reg .b32 %row, %cols, %base, %j, %idx, %tx, %lane, %warp;
+    .reg .f32 %x, %w, %b, %sum, %sq, %mean, %rstd, %eps, %fcols, %d, %y;
+{{PTRS}}
+    mov.u32 %tx, %tid.x;
+    and.b32 %lane, %tx, 31;
+    shr.u32 %warp, %tx, 5;
+    mov.u32 %row, %ctaid.x;
+    ld.param.u32 %cols, [P+4];
+    ld.param.f32 %eps, [P+8];
+    cvt.rn.f32.u32 %fcols, %cols;
+    mul.lo.u32 %base, %row, %cols;
+
+    mov.f32 %sum, 0f00000000;
+    mov.u32 %j, %tx;
+MEAN_LOOP:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra MEAN_DONE;
+    add.u32 %idx, %base, %j;
+{{LOAD_X}}
+    add.f32 %sum, %sum, %x;
+    add.u32 %j, %j, 256;
+    bra MEAN_LOOP;
+MEAN_DONE:
+{{REDUCE_SUM}}
+    div.rn.f32 %mean, %sum, %fcols;
+    mov.f32 %sq, 0f00000000;
+    mov.u32 %j, %tx;
+VAR_LOOP:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra VAR_DONE;
+    add.u32 %idx, %base, %j;
+{{LOAD_X}}
+    sub.f32 %d, %x, %mean;
+    fma.rn.f32 %sq, %d, %d, %sq;
+    add.u32 %j, %j, 256;
+    bra VAR_LOOP;
+VAR_DONE:
+{{REDUCE_SQ}}
+    div.rn.f32 %rstd, %sq, %fcols;
+    add.f32 %rstd, %rstd, %eps;
+    sqrt.rn.f32 %rstd, %rstd;
+    rcp.rn.f32 %rstd, %rstd;
+    mov.u32 %j, %tx;
+OUT_LOOP:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra DONE;
+    add.u32 %idx, %base, %j;
+{{LOAD_X}}
+{{LOAD_WB}}
+    sub.f32 %d, %x, %mean;
+    mul.f32 %d, %d, %rstd;
+    fma.rn.f32 %y, %d, %w, %b;
+{{STORE}}
+    add.u32 %j, %j, 256;
+    bra OUT_LOOP;
+DONE:
+    ret;
+}

@@ -1,0 +1,137 @@
+// Matrix-vector product for small m with transposed B (the decoder hot path).
+// One warp per output column, 8 columns per 256-thread block, no shared memory and no
+// block barriers. Lane l covers 8 consecutive k per 256-wide step (coalesced A and B
+// reads), two steps per iteration with all loads issued before the math; the column sum
+// is a warp butterfly and lane 0 runs the fused epilogue.
+// SPLIT (few columns): W = {{W}} warps per column split k (warp s starts at 512 s, steps
+// 512 W), 8 / W columns per block, partial sums combined through shared memory.
+// Grid: batch * m * col_blocks blocks.
+// Params: [batch, m, n, k, a.off, a.bs, a.rs, b.off, b.bs, b.rs, scales_off, col_blocks,
+//          r (ID), out.off, out.bs, out.rs, extra_e(off, s_batch, s_m, s_n)...]
+// ID (MatMulId, batch = t * r rows, m = 1): row bt uses expert ids[bt] (B pointer moved by
+// expert * P[17] bytes; ids >= P[16] raise the error flag) and A row bt / r.
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %p, %q;
+    .reg .b32 %tx, %lane, %warp, %item, %ncb, %cb, %rest, %M, %N, %K, %bt, %gi, %gj;
+    .reg .b32 %arow, %bbase, %brs, %so, %k0, %ka, %kb, %t, %abt;
+    .reg .f32 %part, %sa, %sb, %acc, %sh;
+    .reg .b32 %ks;
+// #if SPLIT
+    .reg .pred %inval;
+    .shared .align 4 .f32 red[8];
+// #endif
+{{PTRS}}
+    mov.u32 %tx, %tid.x;
+    and.b32 %lane, %tx, 31;
+    shr.u32 %warp, %tx, 5;
+    mov.u32 %item, %ctaid.x;
+    ld.param.u32 %M, [P+4];
+    ld.param.u32 %N, [P+8];
+    ld.param.u32 %K, [P+12];
+    ld.param.u32 %ncb, [P+44];
+    rem.u32 %cb, %item, %ncb;
+    div.u32 %rest, %item, %ncb;
+    rem.u32 %gi, %rest, %M;
+    div.u32 %bt, %rest, %M;
+// #if !SPLIT
+    mad.lo.u32 %gj, %cb, 8, %warp;
+    mov.u32 %ks, 0;
+    setp.ge.u32 %p, %gj, %N;
+    @%p bra DONE;
+// #endif
+// #if SPLIT
+    // every warp reaches the barrier: columns past N compute column N - 1, never stored
+    shr.u32 %t, %warp, {{WLOG}};
+    mad.lo.u32 %gj, %cb, {{CPB}}, %t;
+    and.b32 %ks, %warp, {{WMASK}};
+    setp.ge.u32 %inval, %gj, %N;
+    sub.u32 %t, %N, 1;
+    min.u32 %gj, %gj, %t;
+// #endif
+// #if ID
+    {
+    .reg .b64 %ad;
+    .reg .b32 %ex, %one;
+    mul.wide.u32 %ad, %bt, 4;
+    add.s64 %ad, %ad, %g_ids;
+    ld.global.nc.u32 %ex, [%ad];
+    ld.param.u32 %t, [P+64];
+    setp.ge.u32 %p, %ex, %t;
+    mov.u32 %one, 1;
+    @%p st.global.u32 [%g_flag], %one;
+    @%p bra DONE;
+    ld.param.u32 %t, [P+68];
+    mul.wide.u32 %ad, %ex, %t;
+    add.s64 %g_b, %g_b, %ad;
+    ld.param.u32 %t, [P+48];
+    div.u32 %abt, %bt, %t;
+    }
+// #endif
+// #if !ID
+    mov.u32 %abt, %bt;
+// #endif
+    // A row start and B batch base, in elements
+    ld.param.u32 %arow, [P+16];
+    ld.param.u32 %t, [P+20];
+    mad.lo.u32 %arow, %abt, %t, %arow;
+    ld.param.u32 %t, [P+24];
+    mad.lo.u32 %arow, %gi, %t, %arow;
+    ld.param.u32 %bbase, [P+28];
+    ld.param.u32 %t, [P+32];
+    mad.lo.u32 %bbase, %bt, %t, %bbase;
+    ld.param.u32 %brs, [P+36];
+    ld.param.u32 %so, [P+40];
+    mov.f32 %part, 0f00000000;
+    shl.b32 %k0, %lane, 3;
+    mad.lo.u32 %k0, %ks, 512, %k0;
+LOOP:
+    setp.ge.u32 %p, %k0, %K;
+    @%p bra LOOP_END;
+    mov.u32 %ka, %k0;
+    add.u32 %kb, %k0, 256;
+    setp.lt.u32 %q, %kb, %K;
+    selp.b32 %kb, %kb, %k0, %q;
+{{DOT_A}}
+{{DOT_B}}
+    selp.f32 %sb, %sb, 0f00000000, %q;
+    add.f32 %part, %part, %sa;
+    add.f32 %part, %part, %sb;
+    add.u32 %k0, %k0, {{KSTEP}};
+    bra LOOP;
+LOOP_END:
+    shfl.sync.bfly.b32 %sh, %part, 16, 31, -1;
+    add.f32 %part, %part, %sh;
+    shfl.sync.bfly.b32 %sh, %part, 8, 31, -1;
+    add.f32 %part, %part, %sh;
+    shfl.sync.bfly.b32 %sh, %part, 4, 31, -1;
+    add.f32 %part, %part, %sh;
+    shfl.sync.bfly.b32 %sh, %part, 2, 31, -1;
+    add.f32 %part, %part, %sh;
+    shfl.sync.bfly.b32 %sh, %part, 1, 31, -1;
+    add.f32 %part, %part, %sh;
+// #if SPLIT
+    {
+    .reg .b32 %ra;
+    mov.u32 %ra, red;
+    shl.b32 %t, %warp, 2;
+    add.u32 %ra, %ra, %t;
+    setp.eq.u32 %p, %lane, 0;
+    @%p st.shared.f32 [%ra], %part;
+    bar.sync 0;
+    setp.ne.u32 %p, %lane, 0;
+    setp.ne.or.u32 %p, %ks, 0, %p;
+    or.pred %p, %p, %inval;
+    @%p bra DONE;
+{{SPLIT_SUM}}
+    }
+// #endif
+    setp.ne.u32 %p, %lane, 0;
+    @%p bra DONE;
+    mov.f32 %acc, %part;
+{{EPILOGUE}}
+DONE:
+    ret;
+}

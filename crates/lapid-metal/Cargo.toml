@@ -1,0 +1,20 @@
+[package]
+name = "lapid-metal"
+description = "lapid: Metal backend (MSL kernel templates, simdgroup matrices, unified memory)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lapid-tensor.workspace = true
+lapid-compiler.workspace = true
+lapid-quant.workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-metal.workspace = true
+
+[dev-dependencies]
+half.workspace = true
+lapid-cpu.workspace = true

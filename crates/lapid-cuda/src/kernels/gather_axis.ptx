@@ -1,0 +1,55 @@
+// take_along_axis over the canonical [outer, n, inner] space, one thread per output
+// element: out[e] = x[x.off + o*xs0 + idx*xs1 + i*xs2] with
+// idx = indices[ix.off + o*is0 + j*is1 + i*is2] (exact element copy). An index outside
+// [0, axis_len) sets the backend error flag and writes zero (never reads out of bounds).
+// Params: [total = outer*n*inner, n, inner, axis_len, x(off, s0, s1, s2), ix(off, s0, s1, s2)]
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %p;
+    .reg .b32 %e, %o, %j, %i, %t, %n, %inner, %len, %ix, %src, %s, %bx, %tx;
+    .reg .b64 %a;
+{{PTRS}}
+    mov.u32 %bx, %ctaid.x;
+    mov.u32 %tx, %tid.x;
+    mad.lo.u32 %e, %bx, 256, %tx;
+    ld.param.u32 %t, [P];
+    setp.ge.u32 %p, %e, %t;
+    @%p bra DONE;
+    ld.param.u32 %n, [P+4];
+    ld.param.u32 %inner, [P+8];
+    ld.param.u32 %len, [P+12];
+    rem.u32 %i, %e, %inner;
+    div.u32 %t, %e, %inner;
+    rem.u32 %j, %t, %n;
+    div.u32 %o, %t, %n;
+    ld.param.u32 %ix, [P+32];
+    ld.param.u32 %s, [P+36];
+    mad.lo.u32 %ix, %o, %s, %ix;
+    ld.param.u32 %s, [P+40];
+    mad.lo.u32 %ix, %j, %s, %ix;
+    ld.param.u32 %s, [P+44];
+    mad.lo.u32 %ix, %i, %s, %ix;
+    mul.wide.u32 %a, %ix, 4;
+    add.s64 %a, %a, %g_idx;
+    ld.global.nc.u32 %ix, [%a];
+    // negative indices are >= len as u32
+    setp.ge.u32 %p, %ix, %len;
+    @%p bra BAD;
+    ld.param.u32 %src, [P+16];
+    ld.param.u32 %s, [P+20];
+    mad.lo.u32 %src, %o, %s, %src;
+    ld.param.u32 %s, [P+24];
+    mad.lo.u32 %src, %ix, %s, %src;
+    ld.param.u32 %s, [P+28];
+    mad.lo.u32 %src, %i, %s, %src;
+{{COPY}}
+    bra DONE;
+BAD:
+    mov.u32 %s, 1;
+    st.global.u32 [%g_flag], %s;
+{{ZERO}}
+DONE:
+    ret;
+}

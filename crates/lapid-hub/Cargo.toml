@@ -1,0 +1,23 @@
+[package]
+name = "lapid-hub"
+description = "Ready-to-run models on lapid: Whisper speech recognition"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["download"]
+# Hugging Face downloads in `from_hub` / conversion. Off: `from_hub` only loads models
+# (or HF files) already in the cache, else fails with "download_disabled";
+# `load` / `load_bytes` always work.
+download = ["lapid-convert/download"]
+
+[dependencies]
+lapid.workspace = true
+lapid-nn.workspace = true
+lapid-convert.workspace = true
+lapid-verify.workspace = true
+half.workspace = true
+memmap2.workspace = true
+serde.workspace = true
+serde_json.workspace = true

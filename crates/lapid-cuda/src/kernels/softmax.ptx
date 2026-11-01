@@ -1,0 +1,63 @@
+// Row softmax, one 256-thread block per row: max pass, exp-sum pass, normalize pass.
+// Params: [rows, cols]
+.shared .align 16 .f32 red[8];
+
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %p;
+    .reg .b32 %row, %cols, %base, %j, %idx, %tx, %lane, %warp;
+    .reg .f32 %x, %m, %sum, %inv, %e;
+{{PTRS}}
+    mov.u32 %tx, %tid.x;
+    and.b32 %lane, %tx, 31;
+    shr.u32 %warp, %tx, 5;
+    mov.u32 %row, %ctaid.x;
+    ld.param.u32 %cols, [P+4];
+    mul.lo.u32 %base, %row, %cols;
+
+    mov.f32 %m, 0fFF800000;
+    mov.u32 %j, %tx;
+MAX_LOOP:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra MAX_DONE;
+    add.u32 %idx, %base, %j;
+{{LOAD_X}}
+    max.f32 %m, %m, %x;
+    add.u32 %j, %j, 256;
+    bra MAX_LOOP;
+MAX_DONE:
+{{REDUCE_MAX}}
+    mov.f32 %sum, 0f00000000;
+    mov.u32 %j, %tx;
+SUM_LOOP:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra SUM_DONE;
+    add.u32 %idx, %base, %j;
+{{LOAD_X}}
+    sub.f32 %e, %x, %m;
+    mul.f32 %e, %e, 0f3FB8AA3B;
+    ex2.approx.f32 %e, %e;
+    add.f32 %sum, %sum, %e;
+    add.u32 %j, %j, 256;
+    bra SUM_LOOP;
+SUM_DONE:
+{{REDUCE_SUM}}
+    rcp.rn.f32 %inv, %sum;
+    mov.u32 %j, %tx;
+OUT_LOOP:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra DONE;
+    add.u32 %idx, %base, %j;
+{{LOAD_X}}
+    sub.f32 %e, %x, %m;
+    mul.f32 %e, %e, 0f3FB8AA3B;
+    ex2.approx.f32 %e, %e;
+    mul.f32 %e, %e, %inv;
+{{STORE}}
+    add.u32 %j, %j, 256;
+    bra OUT_LOOP;
+DONE:
+    ret;
+}

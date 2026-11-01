@@ -1,0 +1,4 @@
+# Golden kernel sources and kernel templates are compared byte for byte.
+*.wgsl text eol=lf
+*.metal text eol=lf
+*.ptx text eol=lf

@@ -1,0 +1,38 @@
+// Merge stage of the split argmax (`topk1.ptx`): one warp per row reduces the packed u64
+// partials scratch[row * nchunks + c] with max.u64 and writes the column (~low word).
+// Params: [rows, cols, k = 1, numel, per, nchunks]
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %p;
+    .reg .b32 %row, %lane, %nch, %j, %w, %lo, %hi, %lo2, %hi2;
+    .reg .b64 %best, %t64, %a;
+{{PTRS}}
+    mov.u32 %row, %ctaid.x;
+    mov.u32 %lane, %tid.x;
+    ld.param.u32 %nch, [P+20];
+    mov.u64 %best, 0;
+    mov.u32 %j, %lane;
+LOOP:
+    setp.ge.u32 %p, %j, %nch;
+    @%p bra LOOP_END;
+    mad.lo.u32 %w, %row, %nch, %j;
+    mul.wide.u32 %a, %w, 8;
+    add.s64 %a, %a, %g_scratch;
+    ld.global.u64 %t64, [%a];
+    max.u64 %best, %best, %t64;
+    add.u32 %j, %j, 32;
+    bra LOOP;
+LOOP_END:
+{{WARP_MAX}}
+    setp.ne.u32 %p, %lane, 0;
+    @%p bra DONE;
+    mov.b64 {%lo, %hi}, %best;
+    not.b32 %lo, %lo;
+    mul.wide.u32 %a, %row, 4;
+    add.s64 %a, %a, %g_out;
+    st.global.u32 [%a], %lo;
+DONE:
+    ret;
+}

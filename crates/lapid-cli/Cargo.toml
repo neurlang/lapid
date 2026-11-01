@@ -1,0 +1,32 @@
+[package]
+name = "lapid-cli"
+description = "The lapid command line (developer tooling)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lapid"
+path = "src/main.rs"
+
+[features]
+default = ["vulkan", "cuda", "metal", "download"]
+vulkan = ["lapid/vulkan", "dep:lapid-vulkan"]
+cuda = ["lapid/cuda", "dep:lapid-cuda"]
+metal = ["lapid/metal", "dep:lapid-metal"]
+# Hugging Face downloads for `convert` / `verify` / `bench` (off: cached models only).
+download = ["lapid-hub/download"]
+
+[dependencies]
+lapid.workspace = true
+lapid-hub = { workspace = true, default-features = false }
+lapid-format.workspace = true
+lapid-cpu.workspace = true
+lapid-vulkan = { workspace = true, optional = true }
+lapid-cuda = { workspace = true, optional = true }
+half.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+lapid-metal = { workspace = true, optional = true }

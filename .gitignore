@@ -1,0 +1,6 @@
+/target
+/data
+*.lapid
+__pycache__/
+.venv/
+/plans

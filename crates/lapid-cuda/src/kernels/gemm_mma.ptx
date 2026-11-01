@@ -1,0 +1,229 @@
+// Tensor-core GEMM: out = epilogue(A x B), f16 operands, f32 accumulation (mma.sync
+// m16n8k16). 64x128 output tile per 256-thread block (8 warps as 2 (m) x 4 (n), each warp
+// 32x32 = 2 x 4 mma tiles), k-tiles of 32.
+// Shared memory (f16, row stride LDS = 40 halves = 80 bytes, conflict-free for ldmatrix):
+//   As[2][64][LDS] at 0, Bs[2][128][LDS] at 10240 (double buffered; B stored [n][k]),
+//   overlaid after the main loop by the f32 accumulator tile Cs[64][132].
+// Pipeline: the next k-tile is loaded from global memory into registers (A converted to
+// f16 / B dequantized only when stored) while the current one is multiplied; one barrier
+// per k-tile.
+// Grid: (tiles_n, tiles_m, batch).
+// Params: [batch, m, n, k, a.off, a.bs, a.rs, b.off, b.bs, b.rs, scales_off, -, r (ID),
+//          out.off, out.bs, out.rs, extra_e(off, s_batch, s_m, s_n)...]
+// ID (MatMulId, after the `moe_route` stage): grid y enumerates the (expert, 64-row tile)
+// pairs; scratch holds off[E+1] (row list offsets per expert), ts[E+1] (first tile of each
+// expert) and the row-id list. Rows of a tile are row ids (t * r + j) of one expert: A row
+// = id / r, output row = id. P[16] = E, P[17] = expert stride in bytes.
+.shared .align 16 .b8 smem[33792];
+
+.visible .entry lapid_main(
+{{ARGS}}
+)
+{
+    .reg .pred %p, %more;
+    .reg .b32 %tz, %lane, %warp, %wm, %wn, %bt, %row0, %col0, %M, %N, %K, %k0, %kt, %nk;
+    .reg .b32 %abase, %bbase, %ars, %brs, %so, %sm, %t, %r, %cc, %e, %gi, %gj;
+    .reg .b32 %a_lane, %b_lane, %c_lane, %pa, %pb, %sa_st, %sb_st;
+    .reg .b32 %fa<8>;
+    .reg .b32 %fb<8>;
+    .reg .f32 %c<32>;
+    .reg .f32 %acc;
+// #if ID
+    .reg .pred %q;
+    .reg .b32 %lbase, %rr, %ne, %y, %lo, %hi, %mid, %tv;
+    .reg .b64 %g_list, %g_ts, %ad;
+// #endif
+{{REGS}}
+{{PTRS}}
+    mov.u32 %tz, %tid.x;
+    and.b32 %lane, %tz, 31;
+    shr.u32 %warp, %tz, 5;
+    and.b32 %wm, %warp, 1;
+    shr.u32 %wn, %warp, 1;
+    mov.u32 %bt, %ctaid.z;
+    mov.u32 %t, %ctaid.y;
+    shl.b32 %row0, %t, 6;
+    mov.u32 %t, %ctaid.x;
+    shl.b32 %col0, %t, 7;
+    ld.param.u32 %M, [P+4];
+    ld.param.u32 %N, [P+8];
+    ld.param.u32 %K, [P+12];
+    ld.param.u32 %abase, [P+16];
+    ld.param.u32 %t, [P+20];
+    mad.lo.u32 %abase, %bt, %t, %abase;
+    ld.param.u32 %ars, [P+24];
+    ld.param.u32 %bbase, [P+28];
+    ld.param.u32 %t, [P+32];
+    mad.lo.u32 %bbase, %bt, %t, %bbase;
+    ld.param.u32 %brs, [P+36];
+    ld.param.u32 %so, [P+40];
+// #if ID
+    ld.param.u32 %ne, [P+64];
+    mov.u32 %y, %ctaid.y;
+    add.u32 %tv, %ne, 1;
+    mul.wide.u32 %ad, %tv, 4;
+    add.s64 %g_ts, %g_scratch, %ad;
+    mul.wide.u32 %ad, %tv, 8;
+    add.s64 %g_list, %g_scratch, %ad;
+    mul.wide.u32 %ad, %ne, 4;
+    add.s64 %ad, %ad, %g_ts;
+    ld.global.u32 %tv, [%ad];
+    setp.ge.u32 %q, %y, %tv;
+    @%q ret;
+    // expert = largest e with ts[e] <= y
+    mov.u32 %lo, 0;
+    mov.u32 %hi, %ne;
+BS_LOOP:
+    sub.u32 %tv, %hi, %lo;
+    setp.le.u32 %q, %tv, 1;
+    @%q bra BS_DONE;
+    add.u32 %mid, %lo, %hi;
+    shr.u32 %mid, %mid, 1;
+    mul.wide.u32 %ad, %mid, 4;
+    add.s64 %ad, %ad, %g_ts;
+    ld.global.u32 %tv, [%ad];
+    setp.le.u32 %q, %tv, %y;
+    selp.b32 %lo, %mid, %lo, %q;
+    selp.b32 %hi, %hi, %mid, %q;
+    bra BS_LOOP;
+BS_DONE:
+    mul.wide.u32 %ad, %lo, 4;
+    add.s64 %ad, %ad, %g_ts;
+    ld.global.u32 %tv, [%ad];
+    sub.u32 %tv, %y, %tv;
+    shl.b32 %row0, %tv, 6;
+    mul.wide.u32 %ad, %lo, 4;
+    add.s64 %ad, %ad, %g_scratch;
+    ld.global.u32 %lbase, [%ad];
+    ld.global.u32 %tv, [%ad+4];
+    sub.u32 %M, %tv, %lbase;
+    ld.param.u32 %tv, [P+68];
+    mul.wide.u32 %ad, %lo, %tv;
+    add.s64 %g_b, %g_b, %ad;
+    ld.param.u32 %rr, [P+48];
+{{A_ROWS}}
+// #endif
+    mov.u32 %sm, smem;
+    add.u32 %nk, %K, 31;
+    shr.u32 %nk, %nk, 5;
+
+    // ldmatrix lane addresses (bytes, relative to a buffer):
+    // A: row wm*32 + lane%16, k (lane/16)*8 ; B: n wn*32 + lane%8 + (lane/16)*8, k ((lane/8)%2)*8
+    and.b32 %t, %lane, 15;
+    mad.lo.u32 %t, %wm, 32, %t;
+    shr.u32 %r, %lane, 4;
+    mul.lo.u32 %t, %t, 40;
+    mad.lo.u32 %t, %r, 8, %t;
+    shl.b32 %a_lane, %t, 1;
+    and.b32 %t, %lane, 7;
+    mad.lo.u32 %t, %wn, 32, %t;
+    mad.lo.u32 %t, %r, 8, %t;
+    bfe.u32 %r, %lane, 3, 1;
+    mul.lo.u32 %t, %t, 40;
+    mad.lo.u32 %t, %r, 8, %t;
+    shl.b32 %b_lane, %t, 1;
+
+    mov.f32 %c0, 0f00000000;
+    mov.f32 %c1, 0f00000000;
+    mov.f32 %c2, 0f00000000;
+    mov.f32 %c3, 0f00000000;
+    mov.f32 %c4, 0f00000000;
+    mov.f32 %c5, 0f00000000;
+    mov.f32 %c6, 0f00000000;
+    mov.f32 %c7, 0f00000000;
+    mov.f32 %c8, 0f00000000;
+    mov.f32 %c9, 0f00000000;
+    mov.f32 %c10, 0f00000000;
+    mov.f32 %c11, 0f00000000;
+    mov.f32 %c12, 0f00000000;
+    mov.f32 %c13, 0f00000000;
+    mov.f32 %c14, 0f00000000;
+    mov.f32 %c15, 0f00000000;
+    mov.f32 %c16, 0f00000000;
+    mov.f32 %c17, 0f00000000;
+    mov.f32 %c18, 0f00000000;
+    mov.f32 %c19, 0f00000000;
+    mov.f32 %c20, 0f00000000;
+    mov.f32 %c21, 0f00000000;
+    mov.f32 %c22, 0f00000000;
+    mov.f32 %c23, 0f00000000;
+    mov.f32 %c24, 0f00000000;
+    mov.f32 %c25, 0f00000000;
+    mov.f32 %c26, 0f00000000;
+    mov.f32 %c27, 0f00000000;
+    mov.f32 %c28, 0f00000000;
+    mov.f32 %c29, 0f00000000;
+    mov.f32 %c30, 0f00000000;
+    mov.f32 %c31, 0f00000000;
+
+    setp.eq.u32 %p, %nk, 0;
+    @%p bra MAIN_DONE;
+    // prologue: k-tile 0 -> buffer 0
+    mov.u32 %k0, 0;
+{{A_LOAD}}
+{{B_LOAD}}
+    mov.u32 %sa_st, %sm;
+    add.u32 %sb_st, %sm, 10240;
+{{A_STORE}}
+{{B_STORE}}
+    bar.sync 0;
+    mov.u32 %kt, 0;
+MAIN_LOOP:
+    // operands of k-tile kt live in buffer kt % 2
+    and.b32 %t, %kt, 1;
+    mad.lo.u32 %pa, %t, 5120, %sm;
+    add.u32 %pa, %pa, %a_lane;
+    mad.lo.u32 %pb, %t, 10240, %sm;
+    add.u32 %pb, %pb, 10240;
+    add.u32 %pb, %pb, %b_lane;
+    add.u32 %t, %kt, 1;
+    setp.lt.u32 %more, %t, %nk;
+    @!%more bra SKIP_LOAD;
+    shl.b32 %k0, %t, 5;
+{{A_LOAD}}
+{{B_LOAD}}
+SKIP_LOAD:
+{{MMA}}
+    @!%more bra SKIP_STORE;
+    xor.b32 %t, %kt, 1;
+    and.b32 %t, %t, 1;
+    mad.lo.u32 %sa_st, %t, 5120, %sm;
+    mad.lo.u32 %sb_st, %t, 10240, %sm;
+    add.u32 %sb_st, %sb_st, 10240;
+{{A_STORE}}
+{{B_STORE}}
+SKIP_STORE:
+    bar.sync 0;
+    add.u32 %kt, %kt, 1;
+    setp.lt.u32 %p, %kt, %nk;
+    @%p bra MAIN_LOOP;
+MAIN_DONE:
+    // accumulators -> Cs[64][132] (f32): row wm*32 + mi*16 + lane/4 (+8), col wn*32 + ni*8 + 2*(lane%4)
+    shr.u32 %t, %lane, 2;
+    mad.lo.u32 %t, %wm, 32, %t;
+    and.b32 %r, %lane, 3;
+    shl.b32 %r, %r, 1;
+    mad.lo.u32 %r, %wn, 32, %r;
+    mad.lo.u32 %t, %t, 132, %r;
+    mad.lo.u32 %c_lane, %t, 4, %sm;
+{{C_STORE}}
+    bar.sync 0;
+    mov.u32 %e, %tz;
+EPI_LOOP:
+    shr.u32 %r, %e, 7;
+    and.b32 %cc, %e, 127;
+    add.u32 %gi, %row0, %r;
+    add.u32 %gj, %col0, %cc;
+    setp.ge.u32 %p, %gi, %M;
+    setp.ge.or.u32 %p, %gj, %N, %p;
+    @%p bra EPI_NEXT;
+    mad.lo.u32 %t, %r, 132, %cc;
+    mad.lo.u32 %t, %t, 4, %sm;
+    ld.shared.f32 %acc, [%t];
+{{EPILOGUE}}
+EPI_NEXT:
+    add.u32 %e, %e, 256;
+    setp.lt.u32 %p, %e, 8192;
+    @%p bra EPI_LOOP;
+    ret;
+}

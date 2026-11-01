@@ -1,0 +1,162 @@
+The river begins as a thin stream of snowmelt high in the mountains, gathering water from hundreds of small tributaries as it descends through pine forests and narrow granite gorges. By the time it reaches the plains it is nearly a kilometre wide, slow and brown with silt, and it has carried that silt for so many thousands of years that the delta at its mouth now extends far into the sea. Farmers along its banks still plant according to the seasonal floods, which deposit a fresh layer of fertile soil each spring.
+
+Photosynthesis is the process by which green plants, algae and some bacteria convert light energy into chemical energy. Chlorophyll absorbs mostly blue and red light, which is why leaves look green. In the light-dependent reactions, water molecules are split, releasing oxygen as a by-product, while ATP and NADPH are produced. The Calvin cycle then uses those molecules to fix carbon dioxide into three-carbon sugars, which the plant uses to build glucose, starch and cellulose.
+
+In 1869, Dmitri Mendeleev arranged the known chemical elements by atomic weight and noticed that their properties repeated at regular intervals. He left gaps in his table for elements that had not yet been discovered and predicted their properties with remarkable accuracy. When gallium, scandium and germanium were found over the following two decades, they matched his predictions closely, and the periodic table became one of the central organizing ideas of chemistry.
+
+User: Can you help me plan a three-day trip to Lisbon? I like history, good food and walking.
+Assistant: Of course! Day 1: start in Alfama, the oldest neighbourhood, and climb up to São Jorge Castle for the views. Have lunch at a small tasca and try grilled sardines. In the evening, listen to fado in a local bar. Day 2: take the tram to Belém, visit the Jerónimos Monastery and the Tower of Belém, and don't miss the custard tarts. Day 3: explore Baixa and Chiado, then take a day trip to Sintra if you still have energy.
+User: What should I pack?
+Assistant: Comfortable shoes are essential because the streets are steep and paved with slippery stones. Bring a light jacket for the evenings, sunscreen, and a reusable water bottle.
+
+def merge_sorted(a, b):
+    """Merge two sorted lists into one sorted list in O(len(a) + len(b))."""
+    i, j, out = 0, 0, []
+    while i < len(a) and j < len(b):
+        if a[i] <= b[j]:
+            out.append(a[i])
+            i += 1
+        else:
+            out.append(b[j])
+            j += 1
+    out.extend(a[i:])
+    out.extend(b[j:])
+    return out
+
+
+if __name__ == "__main__":
+    print(merge_sorted([1, 4, 9], [2, 3, 10, 11]))
+
+use std::collections::HashMap;
+
+/// Counts how often each word occurs, ignoring case and punctuation.
+fn word_counts(text: &str) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for word in text.split_whitespace() {
+        let w: String = word.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+        if !w.is_empty() {
+            *counts.entry(w).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+SELECT c.name, COUNT(o.id) AS orders, SUM(o.total) AS revenue
+FROM customers AS c
+JOIN orders AS o ON o.customer_id = c.id
+WHERE o.created_at >= '2024-01-01'
+GROUP BY c.name
+HAVING COUNT(o.id) > 5
+ORDER BY revenue DESC
+LIMIT 20;
+
+const debounce = (fn, ms) => {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn.apply(this, args), ms);
+  };
+};
+window.addEventListener("resize", debounce(() => console.log(window.innerWidth), 200));
+
+{"id": 4821, "name": "Ada", "roles": ["admin", "editor"], "active": true, "last_login": "2025-03-14T09:26:53Z", "settings": {"theme": "dark", "language": "en-GB", "notifications": {"email": false, "push": true}}}
+
+To solve the quadratic equation x^2 - 5x + 6 = 0, look for two numbers whose product is 6 and whose sum is 5. Those numbers are 2 and 3, so the equation factors as (x - 2)(x - 3) = 0, and the solutions are x = 2 and x = 3. In general, the roots of ax^2 + bx + c = 0 are given by x = (-b ± sqrt(b^2 - 4ac)) / (2a). If the discriminant b^2 - 4ac is negative, the roots are complex conjugates.
+
+The derivative of f(x) = sin(x) · e^(2x) follows from the product rule: f'(x) = cos(x) · e^(2x) + 2 sin(x) · e^(2x). The integral of 1/x from 1 to e equals 1, and the sum of the infinite geometric series 1 + 1/2 + 1/4 + ... converges to 2. A matrix A is invertible if and only if its determinant is non-zero; for a 2×2 matrix [[a, b], [c, d]] the determinant is ad − bc.
+
+Recipe: lentil soup for four. Rinse 250 g of red lentils. In a large pot, soften one chopped onion, two carrots and two cloves of garlic in olive oil for eight minutes. Add a teaspoon of cumin, half a teaspoon of smoked paprika and a pinch of chili flakes, stir for one minute, then add the lentils and 1.2 litres of vegetable stock. Simmer for twenty-five minutes until the lentils fall apart. Blend half of the soup, season with salt, pepper and lemon juice, and serve with crusty bread.
+
+Breaking news: the city council voted 7 to 2 on Tuesday evening to approve the new public transport plan, which will add three bus rapid transit lines and extend the light rail by eleven kilometres. Construction is expected to begin next spring and to last about four years. Supporters said the plan would cut commuting times and emissions, while critics questioned the estimated cost of 1.4 billion dollars and the disruption to small businesses along the route.
+
+Terms of service, section 4.2: The user agrees not to reverse engineer, decompile or disassemble the software, except to the extent that such activity is expressly permitted by applicable law notwithstanding this limitation. The company may suspend or terminate access to the service at any time if it reasonably believes that the user has violated these terms. All notices must be given in writing and are deemed received three business days after sending.
+
+Shopping list:
+- 2 kg potatoes
+- 1 dozen eggs
+- whole milk (2 litres)
+- fresh basil, parsley and mint
+- 500 g pasta (penne or fusilli)
+- olive oil, sea salt, black pepper
+- apples, bananas, oranges
+
+The old lighthouse keeper climbed the spiral stairs every evening at dusk, one hundred and twelve steps, counting each one out of habit. From the top he could see the fishing boats returning, their lamps swaying like fireflies over the dark water. He had kept the light burning for thirty-one winters, and in all that time no ship had broken on the rocks below. When the automatic lamp was finally installed, he stayed on anyway, because he could not imagine falling asleep without first watching the beam sweep across the bay.
+
+La ville de Lyon est située au confluent du Rhône et de la Saône. Elle est connue pour sa gastronomie, ses traboules, ces passages couverts qui traversent les immeubles du Vieux Lyon, et pour la Fête des Lumières qui attire chaque année en décembre des millions de visiteurs. Au XVIe siècle, la ville était un grand centre de l'imprimerie et du commerce de la soie.
+
+Die Energiewende bezeichnet den Übergang von fossilen Brennstoffen und Kernenergie zu erneuerbaren Energien wie Wind, Sonne und Biomasse. Deutschland hat sich das Ziel gesetzt, bis 2045 klimaneutral zu sein. Dafür müssen nicht nur neue Windparks und Solaranlagen gebaut, sondern auch die Stromnetze ausgebaut und Speicher für Zeiten ohne Wind und Sonne geschaffen werden.
+
+El aprendizaje automático es una rama de la inteligencia artificial que permite a las computadoras aprender patrones a partir de datos sin ser programadas explícitamente para cada tarea. Los modelos se entrenan con ejemplos, se evalúan con datos que no han visto antes y se ajustan para mejorar su precisión. Hoy se utilizan en traducción automática, reconocimiento de voz y diagnóstico médico.
+
+Il Rinascimento nacque a Firenze nel Quattrocento, grazie a mecenati come la famiglia Medici, e si diffuse poi in tutta Europa. Artisti come Leonardo da Vinci, Michelangelo e Raffaello cambiarono per sempre la pittura, la scultura e l'architettura.
+
+O Brasil é o maior país da América do Sul e abriga a maior parte da floresta amazônica, que desempenha um papel fundamental na regulação do clima do planeta.
+
+Москва — столица России и крупнейший город страны. Город основан в двенадцатом веке и сегодня является важным политическим, экономическим и культурным центром. Московское метро известно своими красивыми станциями, украшенными мозаикой и скульптурами.
+
+人工智能正在改变我们的生活方式。从手机上的语音助手到自动驾驶汽车，机器学习模型已经被广泛应用于各个领域。然而，如何确保这些系统安全、公平、透明，仍然是研究人员和政策制定者面临的重要问题。
+
+東京は日本の首都で、世界でも有数の大都市です。伝統的な寺院や神社と、高層ビルや最新の技術が共存しており、毎年多くの観光客が訪れます。春には桜が咲き、公園は花見を楽しむ人々でにぎわいます。
+
+서울은 대한민국의 수도이며 한강을 중심으로 발전한 도시입니다. 오래된 궁궐과 현대적인 건물이 어우러져 있습니다.
+
+مرحبا بكم في مدينتنا. يسعدنا أن نقدم لكم دليلا قصيرا عن المتاحف والأسواق والمطاعم التقليدية.
+
+ירושלים היא אחת הערים העתיקות בעולם, ויש בה אתרים קדושים לשלוש דתות. ברחובות העיר העתיקה אפשר לשמוע שפות רבות ולהריח תבלינים מהשווקים.
+
+हिंदी भारत की सबसे अधिक बोली जाने वाली भाषाओं में से एक है। इसे देवनागरी लिपि में लिखा जाता है।
+
+Customer support transcript. Agent: Thank you for calling, how can I help you today? Customer: Hi, my internet keeps disconnecting every few minutes since yesterday. Agent: I'm sorry to hear that. Could you tell me which lights are on at the front of your router? Customer: The power light is green, but the one with the globe icon is blinking orange. Agent: That usually means the router cannot reach our network. Let's try restarting it: unplug the power cable, wait thirty seconds and plug it back in. Customer: Okay, done. The globe light is green now. Agent: Great, that should fix it. If it happens again, we can send a technician.
+
+Q: What is the capital of Australia?
+A: Canberra. Many people guess Sydney or Melbourne, but Canberra was chosen as a compromise between the two and purpose-built as the capital in the early twentieth century.
+Q: How many bones are in the adult human body?
+A: There are 206 bones in a typical adult skeleton; babies are born with around 270, and some fuse together as they grow.
+Q: Why is the sky blue?
+A: Sunlight is scattered by the molecules in the atmosphere, and shorter blue wavelengths are scattered much more strongly than longer red ones, a phenomenon called Rayleigh scattering.
+
+Write a haiku about autumn:
+Maple leaves let go,
+drifting on the cooling wind —
+the pond holds the sky.
+
+Instructions for assembling the bookshelf: 1. Lay out all the panels and check them against the parts list. 2. Attach the two side panels to the base using the eight short screws (type B). 3. Slide the back panel into the grooves, smooth side facing forward. 4. Fix the top panel with the remaining short screws. 5. Insert the shelf pins at the desired heights and place the shelves. 6. Secure the bookshelf to the wall with the anti-tip bracket before loading it.
+
+The quarterly report shows revenue of 48.3 million euros, up 12% year over year, driven mainly by subscription growth in Europe and Asia. Operating margin improved from 9.1% to 11.4% as cloud costs per user fell. The company expects full-year revenue between 190 and 200 million euros and plans to hire about 150 engineers, mostly in its Berlin and Singapore offices.
+
+Patient note: 54-year-old male presenting with intermittent chest tightness on exertion for two weeks, relieved by rest. No history of diabetes. Blood pressure 148/92, heart rate 78, oxygen saturation 98% on room air. ECG shows no acute changes. Plan: stress test, lipid panel, start low-dose aspirin pending results, advise to seek emergency care if pain occurs at rest.
+
+git checkout -b fix/login-timeout
+git add src/auth/session.rs tests/session_timeout.rs
+git commit -m "Extend session timeout and refresh tokens before expiry"
+git push origin fix/login-timeout
+
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Weather</title></head>
+<body>
+  <h1 id="city">Oslo</h1>
+  <p class="temp">-3 °C, light snow</p>
+  <ul><li>Wind: 12 km/h NE</li><li>Humidity: 81%</li></ul>
+</body>
+</html>
+
+Chess opening principles: control the centre with pawns and pieces, develop knights before bishops, castle early to protect the king, avoid moving the same piece twice in the opening without a good reason, and do not bring the queen out too soon. After 1. e4 e5 2. Nf3 Nc6 3. Bb5, the Ruy Lopez, White puts pressure on the knight that defends the e5 pawn.
+
+The football match ended 2–1 after a dramatic late goal. The visitors took the lead in the 23rd minute with a header from a corner, but the home side equalized just before half-time. In the 89th minute the young substitute curled a shot into the top corner from outside the box, and the stadium erupted.
+
+Dear Ms. Patel, thank you for your application for the position of data analyst. We were impressed by your experience with time-series forecasting and would like to invite you to an interview on Thursday, 14 November, at 10:30 at our office on Market Street. Please let us know if this time does not suit you. Kind regards, the recruitment team.
+
+A black hole forms when a massive star collapses under its own gravity at the end of its life. Its event horizon marks the boundary beyond which nothing, not even light, can escape. In 2019 the Event Horizon Telescope collaboration published the first image of the shadow of a black hole, in the galaxy M87, by combining observations from radio telescopes across the globe into a virtual instrument the size of the Earth.
+
+Tips for better sleep: keep a regular schedule, even at weekends; avoid caffeine after early afternoon; keep the bedroom cool, dark and quiet; limit screens for an hour before bed; and if you cannot fall asleep after twenty minutes, get up and do something calm until you feel tired.
+
+Once upon a time, in a village between two hills, there lived a girl who could talk to the wind. Every morning she asked it where it had been, and the wind told her about deserts, oceans and cities full of lights. One day the wind came back silent and cold, and the girl understood that something far away had gone wrong, so she packed some bread and set out to follow it.
+
+| Year | Population | Growth |
+|------|-----------:|-------:|
+| 2000 | 1,204,000 | 1.2% |
+| 2010 | 1,356,500 | 1.1% |
+| 2020 | 1,498,200 | 0.9% |
+
+Error: connection refused (os error 111) while connecting to 127.0.0.1:5432. Is the database server running and accepting TCP/IP connections on port 5432? Hint: check the service status with systemctl status postgresql and the listen_addresses setting in postgresql.conf.
