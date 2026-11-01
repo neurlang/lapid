@@ -32,6 +32,6 @@ println!("{:?}", Device::best().to_vec_f32(&y)?);  // compiles, fuses, runs
 
 <div align="center">
 
-[Examples](crates/lapid-hub/examples/) · [Docs](docs/) · Apache-2.0
+[Examples](crates/lapid-hub/examples/) · [Docs](docs/)
 
 </div>
