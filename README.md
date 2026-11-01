@@ -5,6 +5,7 @@
 **Fast ML inference on every device. Pure Rust.**
 
 [![CI](https://github.com/thewh1teagle/lapid/actions/workflows/ci.yml/badge.svg)](https://github.com/thewh1teagle/lapid/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/thewh1teagle/lapid)](https://github.com/thewh1teagle/lapid/releases)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
 </div>
@@ -24,7 +25,7 @@
 
 ## Command line
 
-Install the `lapid` binary (about 15 MB, every GPU backend and the web UI included):
+Install the `lapid` binary (about 17 MB, a 6 MB download, with every GPU backend and the web UI):
 
 ```sh
 cargo binstall --git https://github.com/thewh1teagle/lapid lapid-cli
