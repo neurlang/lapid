@@ -21,6 +21,8 @@ pub(crate) struct Exec {
     status: Option<wgpu::Buffer>,
     /// wasm: the error flag of submitted gathers is checked with the next download.
     status_pending: bool,
+    /// Storage binding limit below the adapter's (tests: forces split launches).
+    pub binding_limit: Option<u64>,
 }
 
 struct Item {
@@ -31,6 +33,8 @@ struct Item {
     params_len: u64,
     extra: Option<Extra>,
     scratch: Option<(u64, u64)>,
+    /// per input: bound byte range (`None` = whole buffer; split launches)
+    ranges: Vec<Option<(u64, u64)>>,
 }
 
 fn align_up(x: u64, a: u64) -> u64 {
@@ -69,53 +73,56 @@ impl Exec {
         let mut items: Vec<Item> = Vec::with_capacity(launches.len());
         let mut params: Vec<u8> = Vec::new();
         let mut scratch_bytes = 0u64;
+        let limit = self.binding_limit.unwrap_or(ctx.max_binding).min(ctx.max_binding);
         for (li, l) in launches.iter().enumerate() {
-            let plan = lapid_wgsl::plan(&l.kernel, &ctx.caps)
-                .map_err(|e| Error::new(e.code, format!("launch {li} ({}): {}", l.kernel.kind(), e.message)))?;
-            if plan.is_empty() {
-                continue;
-            }
-            if l.inputs.len() != plan.key.num_inputs() {
-                return Err(Error::new(
-                    "bad_launch",
-                    format!("launch {li} ({}): {} inputs, kernel expects {}", l.kernel.kind(), l.inputs.len(), plan.key.num_inputs()),
-                ));
-            }
+            let ectx = |e: Error| Error::new(e.code, format!("launch {li} ({}): {}", l.kernel.kind(), e.message));
+            let mut sizes = Vec::with_capacity(l.inputs.len());
             for &id in l.inputs.iter().chain(std::iter::once(&l.output)) {
                 let Some(b) = gbufs.get(id) else {
                     return Err(Error::new("bad_launch", format!("launch {li}: buffer id {id} out of range")));
                 };
-                if b.size > ctx.max_binding {
+                sizes.push(b.size);
+            }
+            let out_size = sizes.pop().unwrap_or(0);
+            if out_size > limit {
+                return Err(ectx(Error::new("too_large", format!("output of {out_size} bytes exceeds maxStorageBufferBindingSize ({limit})"))));
+            }
+            // launches binding a buffer above the limit run as several sub-range launches
+            let parts: Vec<(lapid_wgsl::Plan, Vec<Option<(u64, u64)>>)> = match lapid_wgsl::plan_split(&l.kernel, &sizes, limit, align, &ctx.caps).map_err(&ectx)? {
+                Some(subs) => subs.into_iter().map(|s| (s.plan, s.ranges)).collect(),
+                None => vec![(lapid_wgsl::plan(&l.kernel, &ctx.caps).map_err(&ectx)?, vec![None; l.inputs.len()])],
+            };
+            for (plan, ranges) in parts {
+                if plan.is_empty() {
+                    continue;
+                }
+                if l.inputs.len() != plan.key.num_inputs() {
                     return Err(Error::new(
-                        "too_large",
-                        format!(
-                            "launch {li} ({}): buffer of {} bytes exceeds this adapter's maxStorageBufferBindingSize ({})",
-                            l.kernel.kind(),
-                            b.size,
-                            ctx.max_binding
-                        ),
+                        "bad_launch",
+                        format!("launch {li} ({}): {} inputs, kernel expects {}", l.kernel.kind(), l.inputs.len(), plan.key.num_inputs()),
                     ));
                 }
-            }
-            let scratch = (plan.scratch > 0).then(|| {
-                let off = align_up(scratch_bytes, align);
-                let n = align_up(plan.scratch as u64, 4);
-                scratch_bytes = off + n;
-                (off, n)
-            });
-            let mut stage = Some(plan);
-            while let Some(p) = stage {
-                let pipe = pipelines.get(ctx, &p.key)?;
-                let off = align_up(params.len() as u64, align);
-                params.resize(off as usize, 0);
-                if p.params.is_empty() {
-                    params.extend_from_slice(&[0u8; 4]);
-                } else {
-                    params.extend(p.params.iter().flat_map(|w| w.to_le_bytes()));
+                let scratch = (plan.scratch > 0).then(|| {
+                    let off = align_up(scratch_bytes, align);
+                    let n = align_up(plan.scratch as u64, 4);
+                    scratch_bytes = off + n;
+                    (off, n)
+                });
+                let mut stage = Some(plan);
+                while let Some(p) = stage {
+                    let pipe = pipelines.get(ctx, &p.key)?;
+                    let off = align_up(params.len() as u64, align);
+                    params.resize(off as usize, 0);
+                    if p.params.is_empty() {
+                        params.extend_from_slice(&[0u8; 4]);
+                    } else {
+                        params.extend(p.params.iter().flat_map(|w| w.to_le_bytes()));
+                    }
+                    let params_len = params.len() as u64 - off;
+                    let ranges = ranges.clone();
+                    items.push(Item { pipe, li, groups: p.groups, params_off: off, params_len, extra: p.key.extra(), scratch, ranges });
+                    stage = p.next.map(|n| *n);
                 }
-                let params_len = params.len() as u64 - off;
-                items.push(Item { pipe, li, groups: p.groups, params_off: off, params_len, extra: p.key.extra(), scratch });
-                stage = p.next.map(|n| *n);
             }
         }
         if items.is_empty() {
@@ -126,7 +133,7 @@ impl Exec {
         let params_buf = ensure(ctx, &mut self.params, params.len() as u64, "lapid params")?.clone();
         ctx.queue.write_buffer(&params_buf, 0, &params);
         let scratch_buf = if scratch_bytes > 0 { Some(ensure(ctx, &mut self.scratch, scratch_bytes, "lapid scratch")?.clone()) } else { None };
-        let uses_status = items.iter().any(|it| it.extra == Some(Extra::Status));
+        let uses_status = items.iter().any(|it| matches!(it.extra, Some(Extra::Status | Extra::ScratchStatus)));
         let status_buf = if uses_status {
             if self.status.is_none() {
                 self.status = Some(storage_buffer(ctx, 16, "lapid status")?);
@@ -171,7 +178,11 @@ impl Exec {
                     Some(k) => &temps[k],
                     None => b,
                 };
-                entries.push(wgpu::BindGroupEntry { binding: 1 + i as u32, resource: buf.as_entire_binding() });
+                let resource = match it.ranges.get(i).copied().flatten() {
+                    Some((offset, size)) => wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: buf, offset, size: NonZeroU64::new(size) }),
+                    None => buf.as_entire_binding(),
+                };
+                entries.push(wgpu::BindGroupEntry { binding: 1 + i as u32, resource });
             }
             let nb = entries.len() as u32;
             entries.push(wgpu::BindGroupEntry { binding: nb, resource: out.buffer.as_entire_binding() });
@@ -187,6 +198,16 @@ impl Exec {
                 Some(Extra::Status) => {
                     let sb = status_buf.as_ref().ok_or_else(|| Error::new("webgpu", "status buffer missing"))?;
                     entries.push(wgpu::BindGroupEntry { binding: nb + 1, resource: sb.as_entire_binding() });
+                }
+                Some(Extra::ScratchStatus) => {
+                    let (off, n) = it.scratch.ok_or_else(|| Error::new("webgpu", "scratch range missing"))?;
+                    let sb = scratch_buf.as_ref().ok_or_else(|| Error::new("webgpu", "scratch buffer missing"))?;
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: nb + 1,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: sb, offset: off, size: NonZeroU64::new(n) }),
+                    });
+                    let st = status_buf.as_ref().ok_or_else(|| Error::new("webgpu", "status buffer missing"))?;
+                    entries.push(wgpu::BindGroupEntry { binding: nb + 2, resource: st.as_entire_binding() });
                 }
                 None => {}
             }

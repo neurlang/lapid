@@ -396,8 +396,8 @@ static inline float ld_q6k(device const uchar* q, uint e) {
 // staged through the same threadgroup memory so the fused epilogue runs per element with
 // coalesced stores.
 //
-// MATMUL_ID (MoE): threadgroup z = expert e; its rows are the (t, r) pairs routed to it by
-// the route stage (`route` = scratch: counts[E], then E lists of `cap` pair indices). Row i
+// MATMUL_ID (MoE): threadgroup z = expert e, its row tiles strided by the grid's y extent;
+// its rows are the (t, r) pairs routed to it by the route stage (`route` = scratch: counts[E], then E lists of `cap` pair indices). Row i
 // of the tile is pair p = list[row0 + i]: A row t = p / R, output row p, B = expert e.
 // K-quant B (k % 256 == 0): a 32-step lies in one super-block; each thread dequantizes 16
 // values of one row.
@@ -417,6 +417,7 @@ kernel void lapid_kernel(
     device const uchar* b [[buffer(2)]],
     device float* out [[buffer(3)]],
     uint3 tgp [[threadgroup_position_in_grid]],
+    uint3 ntg [[threadgroups_per_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]])
 {
@@ -428,13 +429,14 @@ kernel void lapid_kernel(
     const uint n = P[1];
     const uint k = P[2];
     const uint bt = tgp.z;
-    const uint row0 = tgp.y * BM;
     const uint col0 = tgp.x * BN;
     const uint m = P[0];
     const uint a_base = P[3] + bt * P[4];
     const uint a_rs = P[5];
     const uint b_base = P[6] + bt * P[7];
     const uint b_rs = P[8];
+    {
+    const uint row0 = tgp.y * BM;
 
     simdgroup_float8x8 acc[4][4];
     for (uint i = 0; i < 4; i++) {
@@ -444,6 +446,8 @@ kernel void lapid_kernel(
     }
     const uint sr = (sg >> 1) * 32;
     const uint sc = (sg & 1) * 32;
+    // Compile-time 4: full tiles (the dynamic skip costs ~10 % on dense GEMMs).
+    const uint nbi = 4u;
 
     for (uint k0 = 0; k0 < k; k0 += BK) {
         // A tile [BM][BK]: thread -> row tid / 2, 16 consecutive k (vector loads in bounds).
@@ -489,18 +493,22 @@ kernel void lapid_kernel(
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0; kk < BK; kk += 8) {
+        for (uint kk = 0; kk < BK && nbi > 0; kk += 8) {
             simdgroup_float8x8 ma[4];
             simdgroup_half8x8 mb[4];
             for (uint i = 0; i < 4; i++) {
-                simdgroup_load(ma[i], As + (sr + 8 * i) * BK + kk, BK);
+                if (i < nbi) {
+                    simdgroup_load(ma[i], As + (sr + 8 * i) * BK + kk, BK);
+                }
             }
             for (uint j = 0; j < 4; j++) {
                 simdgroup_load(mb[j], Bs + (sc + 8 * j) * BK + kk, BK, ulong2(0, 0), true);
             }
             for (uint i = 0; i < 4; i++) {
-                for (uint j = 0; j < 4; j++) {
-                    simdgroup_multiply_accumulate(acc[i][j], ma[i], mb[j], acc[i][j]);
+                if (i < nbi) {
+                    for (uint j = 0; j < 4; j++) {
+                        simdgroup_multiply_accumulate(acc[i][j], ma[i], mb[j], acc[i][j]);
+                    }
                 }
             }
         }
@@ -525,5 +533,6 @@ kernel void lapid_kernel(
                 stv(out, P[10] + bt * P[11] + gr * P[12] + gc, x0);
             }
         }
+    }
     }
 }

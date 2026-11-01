@@ -30,6 +30,9 @@ pub(super) fn plan(spec: &Arc<MatMulIdSpec>, d: &MatMulIdDims, caps: &Caps) -> R
     if d.e == 0 && d.t * d.r > 0 {
         return Err(Error::new("index_out_of_range", "matmul_id: no experts"));
     }
+    if grouped(spec, d, caps) {
+        return plan_grouped(spec, d, so, stride, caps);
+    }
     let ncb = d.n.div_ceil(gemv_cols(caps));
     let mut p = Params::default();
     p.u(d.t)?.u(d.r)?.u(d.n)?.u(d.k)?.u(so)?.u(stride)?.u(ncb)?.u(d.e)?;
@@ -37,6 +40,57 @@ pub(super) fn plan(spec: &Arc<MatMulIdSpec>, d: &MatMulIdDims, caps: &Caps) -> R
     p.u(d.e.checked_mul(stride).ok_or_else(|| bad("matmul_id: size overflow"))?)?;
     let items = (d.t * d.r * ncb) as u64;
     Ok(Plan { scratch: 0, next: None, key: Key::MatMulId(spec.clone()), params: p.0, groups: grid(items, caps) })
+}
+
+/// Largest expert count of the grouped (prefill) path (shared counters of `moe_route`).
+const ROUTE_EMAX: usize = 4096;
+
+/// Many tokens on a cooperative-matrix device: route pairs by expert, then one grouped GEMM
+/// (each expert's weights read once per 64-row tile instead of once per pair).
+fn grouped(spec: &MatMulIdSpec, d: &MatMulIdDims, caps: &Caps) -> bool {
+    let w = spec.w_dtype;
+    caps.coopmat
+        && d.t > 4
+        && d.e <= ROUTE_EMAX
+        && matches!(w, DType::F16 | DType::Int8 | DType::Int4 | DType::Q4K | DType::Q5K | DType::Q6K)
+        && spec.x_dtype != DType::BF16
+        && (w != DType::F16 || caps.f16 || (d.n * d.k).is_multiple_of(2))
+}
+
+fn plan_grouped(spec: &Arc<MatMulIdSpec>, d: &MatMulIdDims, so: usize, stride: usize, caps: &Caps) -> Result<Plan> {
+    use super::matmul::{COOP_BM, COOP_BN};
+    let tr = d.t * d.r;
+    let emax = d.e.next_power_of_two().max(64) as u32;
+    let mut rp = Params::default();
+    rp.u(tr)?.u(d.e)?.u(COOP_BM)?;
+    // b.bs: expert stride in elements of the `b` array (u32 words when quantized or packed f16)
+    let b_stride = match spec.w_dtype {
+        DType::F16 if !caps.f16 => stride / 2,
+        _ => stride,
+    };
+    let slots = tr.div_ceil(COOP_BM) + d.e.min(tr);
+    let tn = d.n.div_ceil(COOP_BN);
+    let mut p = Params::default();
+    p.u(1)?.u(tr)?.u(d.n)?.u(d.k)?;
+    p.u(0)?.u(0)?.u(d.k)?;
+    p.u(0)?.u(b_stride)?.u(d.k)?;
+    p.u(so)?.u(tn)?.u(slots)?;
+    p.u(0)?.u(0)?.u(d.n)?;
+    p.u(d.r)?.u(d.e)?;
+    let gemm = Plan { key: Key::GemmIdCoop(spec.clone()), params: p.0, groups: grid((slots * tn) as u64, caps), scratch: 0, next: None };
+    Ok(Plan {
+        key: Key::MoeRoute(emax),
+        params: rp.0,
+        groups: [1, 1, 1],
+        scratch: (2 * d.e + 2 + tr) * 4,
+        next: Some(Box::new(gemm)),
+    })
+}
+
+const ROUTE: &str = include_str!("kernels/moe_route.wgsl");
+
+pub(super) fn source_route(emax: u32, caps: &Caps) -> String {
+    template::module(caps, ROUTE, &[("EMAX", &emax.to_string())], &[], 256, false)
 }
 
 /// `fn wdeq(x, e)`: element `e` (row-major in the expert's [N, K]) of expert `x`.

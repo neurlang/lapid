@@ -74,6 +74,7 @@ fn golden_keys() -> Vec<(&'static str, Key)> {
         ("moe_route", Key::MoeRoute),
         ("gated_delta_net_dk128", Key::DeltaNet(Arc::new(GatedDeltaNetSpec { out_dtype: DType::F32 }), 4)),
         ("layer_norm", Key::LayerNorm(Arc::new(LayerNormSpec { in_dtype: DType::F32, param_dtype: DType::F32, out_dtype: DType::F32 }))),
+        ("rms_norm", Key::RmsNorm(Arc::new(LayerNormSpec { in_dtype: DType::F32, param_dtype: DType::F32, out_dtype: DType::F32 }))),
     ]
 }
 

@@ -85,12 +85,18 @@ pub(super) fn plan(spec: &Arc<MatMulSpec>, d: &MatMulDims, caps: &Caps) -> Resul
         };
         return Ok(Plan::new(Key::Gemv(spec.clone(), va, vb, w), p.0, grid, 256));
     }
-    p.u(0)?.u(0)?;
+    let use_mma = mma_ok(spec, caps);
+    // B larger than A (e.g. a logits projection): column-tile-major grid, B read once
+    let b_bytes = match spec.b_dtype.quant_format() {
+        Some(f) => lapid_quant::layout(f, d.n, d.k).total,
+        None => d.n * d.k * spec.b_dtype.size(),
+    };
+    let swap = use_mma && d.batch == 1 && d.m > mma::BM && b_bytes > d.m * d.k * spec.a_dtype.size();
+    p.u(swap as usize)?.u(0)?;
     out_view(&mut p, d)?;
     for v in &d.extra_views {
         p.view(v, 3)?;
     }
-    let use_mma = mma_ok(spec, caps);
     let (bm, bn) = if use_mma {
         (mma::BM, mma::BN)
     } else {
@@ -106,8 +112,13 @@ pub(super) fn plan(spec: &Arc<MatMulSpec>, d: &MatMulDims, caps: &Caps) -> Resul
             format!("matmul grid {tn}x{tm}x{} exceeds device limits", d.batch),
         ));
     }
+    if swap && (tn > caps.max_grid[1] as usize || tm > caps.max_grid[0] as usize) {
+        return Err(Error::new("too_large", format!("matmul grid {tm}x{tn} exceeds device limits")));
+    }
     let grid = if empty {
         [0, 0, 0]
+    } else if swap {
+        [tm as u32, tn as u32, 1]
     } else {
         [tn as u32, tm as u32, d.batch as u32]
     };

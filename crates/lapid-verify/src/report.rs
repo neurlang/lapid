@@ -91,9 +91,14 @@ pub fn tolerance(dtype: &str) -> Result<f32> {
         "fp32" | "f32" | "fp16" | "f16" => Ok(1e-2),
         "int8" | "i8" => Ok(5e-2),
         "int4" | "i4" => Ok(1.5e-1),
+        // ggml k-quants: q6_k is ~int8 quality, q5_k between, q4_k / the q4_k_m mix ~int4
+        // (imatrix-free GGUFs of a different export can sit near the int4 budget's edge).
+        "q6_k" => Ok(5e-2),
+        "q5_k" => Ok(1e-1),
+        "q4_k" | "q4_k_m" | "q4_k_s" => Ok(1.5e-1),
         other => Err(Error::new(
             "unsupported_dtype",
-            format!("unknown model dtype {other:?} (expected fp32, fp16, int8 or int4)"),
+            format!("unknown model dtype {other:?} (expected fp32, fp16, int8, int4, q4_k, q4_k_m, q5_k or q6_k)"),
         )),
     }
 }
@@ -152,6 +157,8 @@ mod tests {
     #[test]
     fn tolerances() {
         assert_eq!(tolerance("int8").unwrap(), 5e-2);
+        assert_eq!(tolerance("q4_k_m").unwrap(), 1.5e-1);
+        assert_eq!(tolerance("q6_k").unwrap(), 5e-2);
         assert!(tolerance("q3").is_err());
     }
 

@@ -7,8 +7,8 @@
 // Pipeline: the next k-tile is loaded from global memory into registers (A converted to
 // f16 / B dequantized only when stored) while the current one is multiplied; one barrier
 // per k-tile.
-// Grid: (tiles_n, tiles_m, batch).
-// Params: [batch, m, n, k, a.off, a.bs, a.rs, b.off, b.bs, b.rs, scales_off, -, r (ID),
+// Grid: (tiles_n, tiles_m, batch), or (tiles_m, tiles_n, batch) when P[11] = 1.
+// Params: [batch, m, n, k, a.off, a.bs, a.rs, b.off, b.bs, b.rs, scales_off, swap, r (ID),
 //          out.off, out.bs, out.rs, extra_e(off, s_batch, s_m, s_n)...]
 // ID (MatMulId, after the `moe_route` stage): grid y enumerates the (expert, 64-row tile)
 // pairs; scratch holds off[E+1] (row list offsets per expert), ts[E+1] (first tile of each
@@ -45,6 +45,16 @@
     shl.b32 %row0, %t, 6;
     mov.u32 %t, %ctaid.x;
     shl.b32 %col0, %t, 7;
+// #if !ID
+    // P[11] = 1: grid (tiles_m, tiles_n): the m tiles of one column tile run together, so a
+    // B larger than L2 is read once from DRAM
+    ld.param.u32 %t, [P+44];
+    setp.ne.u32 %p, %t, 0;
+    @%p mov.u32 %t, %ctaid.x;
+    @%p shl.b32 %row0, %t, 6;
+    @%p mov.u32 %t, %ctaid.y;
+    @%p shl.b32 %col0, %t, 7;
+// #endif
     ld.param.u32 %M, [P+4];
     ld.param.u32 %N, [P+8];
     ld.param.u32 %K, [P+12];

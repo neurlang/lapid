@@ -145,6 +145,16 @@ fn launch_line(l: &Launch) -> String {
             d.cols,
             fmt_ins(&l.inputs, None)
         ),
+        Kernel::RmsNorm(s, d) => format!(
+            "rms_norm {} params={} -> {} rows={} cols={} eps={} in={} out=b{out}",
+            s.in_dtype.name(),
+            s.param_dtype.name(),
+            s.out_dtype.name(),
+            d.rows,
+            d.cols,
+            f32::from_bits(d.eps),
+            fmt_ins(&l.inputs, None)
+        ),
         Kernel::LayerNorm(s, d) => format!(
             "layer_norm {} params={} -> {} rows={} cols={} eps={} in={} out=b{out}",
             s.in_dtype.name(),

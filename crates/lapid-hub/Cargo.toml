@@ -18,6 +18,8 @@ lapid-nn.workspace = true
 lapid-convert.workspace = true
 lapid-verify.workspace = true
 half.workspace = true
+# Pure-Rust codecs only (png: fdeflate/miniz_oxide, jpeg: zune-jpeg); no C.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 memmap2.workspace = true
 serde.workspace = true
 serde_json.workspace = true

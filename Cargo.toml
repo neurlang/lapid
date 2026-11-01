@@ -3,6 +3,8 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
+repository = "https://github.com/thewh1teagle/lapid"
+homepage = "https://github.com/thewh1teagle/lapid"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -25,6 +27,19 @@ lapid-format = { path = "crates/lapid-format" }
 # Downloads are opt-in per member (`features = ["download"]`); lapid-hub enables it by default.
 lapid-convert = { path = "crates/lapid-convert", default-features = false }
 lapid-verify = { path = "crates/lapid-verify" }
+
+# HTTP server (lapid-server; its `download` feature lists HF repos for `-hf`). Pure Rust: compression uses miniz_oxide (gzip) and brotli.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "multipart", "query", "tokio", "tracing"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-std", "io-util"] }
+tokio-stream = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tower-http = { version = "0.6", features = ["cors", "compression-gzip", "compression-br", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rust-embed = { version = "8", features = ["debug-embed"] }
+mime_guess = "2"
+base64 = "0.22"
+lapid-server = { path = "crates/lapid-server", default-features = false }
 
 # CUDA driver (libcuda / nvcuda.dll) is loaded at runtime; libloading is pure Rust.
 libloading = "0.8"
@@ -79,3 +94,10 @@ opt-level = 3
 
 [profile.dev.package.lapid-quant]
 opt-level = 3
+
+# The profile that 'dist' will build with: small, stripped release binaries.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+debug = 0
+strip = true

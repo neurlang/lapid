@@ -53,6 +53,8 @@ pub(crate) enum Key {
     Gather(Arc<GatherSpec>),
     Softmax(Arc<SoftmaxSpec>),
     LayerNorm(Arc<LayerNormSpec>),
+    /// RMS norm (layer_norm template, `RMS` flag).
+    RmsNorm(Arc<LayerNormSpec>),
     /// Flash attention on simdgroup matrices; head dim (compile-time, multiple of 8, <= 128).
     AttnTile(Arc<AttentionSpec>, u32),
     /// Attention for few queries split over 128-key chunks; head dim (compile-time) and
@@ -84,6 +86,7 @@ impl Key {
             Key::Gather(_) => "gather",
             Key::Softmax(_) => "softmax",
             Key::LayerNorm(_) => "layer_norm",
+            Key::RmsNorm(_) => "rms_norm",
             Key::AttnTile(..) => "attention_tile",
             Key::AttnVec(..) => "attention_vec",
             Key::AttnMerge(_) => "attention_merge",
@@ -163,6 +166,7 @@ pub(crate) fn plan(kernel: &Kernel) -> Result<Plan> {
         Kernel::TopK(s, d) => index::plan_topk(s, d).map(Plan::single),
         Kernel::MatMulId(s, d) => matmul_id::plan_matmul_id(s, d),
         Kernel::GatedDeltaNet(s, d) => matmul_id::plan_delta_net(s, d),
+        Kernel::RmsNorm(s, d) => rows::plan_rms_norm(s, d).map(Plan::single),
     }
 }
 
@@ -180,6 +184,7 @@ pub(crate) fn source(key: &Key) -> String {
         Key::Gather(s) => rows::source_gather(s),
         Key::Softmax(s) => rows::source_softmax(s),
         Key::LayerNorm(s) => rows::source_layer_norm(s),
+        Key::RmsNorm(s) => rows::source_rms_norm(s),
         Key::AttnTile(s, d) => attention::source_tile(s, *d),
         Key::AttnVec(s, d, direct) => attention::source_vec(s, *d, *direct),
         Key::AttnMerge(out) => attention::source_merge(*out),

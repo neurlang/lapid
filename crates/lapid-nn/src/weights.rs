@@ -10,7 +10,8 @@ use crate::layers::{Conv1d, Embedding, LayerNorm, Linear, RmsNorm};
 pub enum Precision {
     /// Weights as stored (quantized kernels for int8/int4 weights).
     Stored,
-    /// Fake-quant reference: int8/int4 weights dequantized to f32, f32 matmuls.
+    /// Fake-quant reference: quantized weights (int8/int4/k-quants, incl. 3-D expert stacks)
+    /// dequantized to f32, f32 matmuls.
     FakeQuantWeights,
     /// As `FakeQuantWeights`, plus every input of a quantized matmul quantized to int8 per
     /// 32-block (`d = max|x| / 127`, round to nearest even) — the arithmetic of kernels that
@@ -134,26 +135,32 @@ pub fn fake_quant_act(x: &Tensor) -> Result<Tensor> {
 }
 
 /// f32 copy of a quantized weight: exactly the values the quantized kernels multiply with.
+/// 2-D `[rows, cols]` matrices or 3-D `[E, rows, cols]` expert stacks (E matrices back to back),
+/// any quantized format (int8 / int4 / k-quants).
 fn dequantized(file: &LapidFile, name: &str, t: &Tensor) -> Result<Tensor> {
-    let format = match t.dtype() {
-        DType::Int8 => lapid::quant::Format::Int8,
-        DType::Int4 => lapid::quant::Format::Int4,
-        other => {
-            return Err(Error::new("internal", format!("{name}: {} is not a quantized dtype", other.name())));
+    let Some(format) = t.dtype().quant_format() else {
+        return Err(Error::new("internal", format!("{name}: {} is not a quantized dtype", t.dtype().name())));
+    };
+    let (experts, rows, cols) = match *t.shape() {
+        [rows, cols] => (1, rows, cols),
+        [e, rows, cols] => (e, rows, cols),
+        _ => {
+            return Err(Error::new(
+                "shape_mismatch",
+                format!("{name}: quantized weight must be 2-D or a 3-D expert stack, got {:?}", t.shape()),
+            ));
         }
     };
-    let &[rows, cols] = t.shape() else {
-        return Err(Error::new(
-            "shape_mismatch",
-            format!("{name}: quantized weight must be 2-D, got {:?}", t.shape()),
-        ));
-    };
     let bytes = file.bytes(name)?;
-    let expected = lapid::quant::layout(format, rows, cols).total;
-    if bytes.len() != expected {
-        return Err(Error::new("format", format!("{name}: {} bytes, layout needs {expected}", bytes.len())));
+    let per = lapid::quant::layout(format, rows, cols).total;
+    if bytes.len() != per * experts {
+        return Err(Error::new("format", format!("{name}: {} bytes, layout needs {}", bytes.len(), per * experts)));
     }
-    Tensor::from_f32(&lapid::quant::dequantize(format, bytes, rows, cols), &[rows, cols])
+    let mut out = Vec::with_capacity(experts * rows * cols);
+    for e in 0..experts {
+        out.extend(lapid::quant::dequantize(format, &bytes[e * per..(e + 1) * per], rows, cols));
+    }
+    Tensor::from_f32(&out, t.shape())
 }
 
 #[cfg(test)]

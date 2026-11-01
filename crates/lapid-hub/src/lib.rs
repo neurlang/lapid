@@ -49,22 +49,32 @@
 pub mod audio;
 pub mod cmd;
 pub mod convert;
+pub mod deepseek4;
 pub mod embeddinggemma;
 pub mod gemma4;
+pub mod gemma4moe;
+pub mod gemma4vl;
 pub mod lfm3;
+pub mod llama;
 pub mod model;
 pub mod parakeet;
 pub mod phonon;
 pub mod qwen35;
+pub mod qwen4exp;
+pub mod qwen3vl;
+pub mod vision;
 pub mod whisper;
 
+pub use deepseek4::Deepseek4;
 pub use embeddinggemma::{EmbedOptions, EmbeddingGemma};
 pub use gemma4::Gemma4;
 pub use lfm3::Lfm3;
+pub use llama::Llama;
 pub use model::{Bytes, Model, ModelInfo};
 pub use parakeet::Parakeet;
 pub use phonon::{Phonon, SpeakOptions};
 pub use qwen35::Qwen35;
+pub use qwen4exp::Qwen4Exp;
 pub use whisper::{Segment, Task, TranscribeOptions, Transcript, Whisper};
 
 pub(crate) fn debug_enabled() -> bool {

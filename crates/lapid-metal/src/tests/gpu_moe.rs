@@ -37,11 +37,15 @@ fn experts(w: DType, e: usize, n: usize, k: usize) -> (Vec<u8>, Vec<Vec<f32>>) {
 }
 
 fn moe_case(be: &MetalBackend, x_dt: DType, w: DType, dims: MatMulIdDims, tol: f32) {
+    // Ids: a deterministic mix with repeats (also the same expert twice for one token).
+    let ids: Vec<i32> = (0..dims.t * dims.r).map(|p| ((p * 7 + p / 3) % dims.e) as i32).collect();
+    moe_case_ids(be, x_dt, w, dims, tol, &ids);
+}
+
+fn moe_case_ids(be: &MetalBackend, x_dt: DType, w: DType, dims: MatMulIdDims, tol: f32, ids: &[i32]) {
     let MatMulIdDims { t, r, e, n, k } = dims;
     let (wb, wv) = experts(w, e, n, k);
     let x = round_to(x_dt, &rand(t * k, 3));
-    // Ids: a deterministic mix with repeats (also the same expert twice for one token).
-    let ids: Vec<i32> = (0..t * r).map(|p| ((p * 7 + p / 3) % e) as i32).collect();
     let spec = Arc::new(MatMulIdSpec { x_dtype: x_dt, w_dtype: w, out_dtype: DType::F32 });
     let ib: Vec<u8> = ids.iter().flat_map(|v| v.to_le_bytes()).collect();
     let got = decode(DType::F32, &run(be, Kernel::MatMulId(spec, dims), &[encode(x_dt, &x), wb, ib], t * r * n * 4), t * r * n);
@@ -69,6 +73,17 @@ fn matmul_id_every_w_dtype() {
     }
     moe_case(&be, DType::F16, DType::Q5K, MatMulIdDims { t: 2, r: 2, e: 3, n: 70, k: 512 }, 2e-5);
     moe_case(&be, DType::F16, DType::Q5K, MatMulIdDims { t: 129, r: 2, e: 3, n: 70, k: 512 }, 2e-3);
+}
+
+#[test]
+fn matmul_id_skewed_routing() {
+    // Many experts (one row-tile threadgroup per expert) with one hot expert holding several
+    // 64-row tiles: the threadgroups loop over the hot expert's tiles.
+    let Some(be) = backend() else { return };
+    let (t, r, e) = (300usize, 2usize, 64usize);
+    let ids: Vec<i32> = (0..t * r).map(|p| if p % r == 0 { 5 } else { ((p * 13 + 1) % e) as i32 }).collect();
+    moe_case_ids(&be, DType::F32, DType::Int8, MatMulIdDims { t, r, e, n: 72, k: 64 }, 2e-3, &ids);
+    moe_case_ids(&be, DType::F32, DType::Q4K, MatMulIdDims { t, r, e, n: 40, k: 256 }, 2e-3, &ids);
 }
 
 #[test]

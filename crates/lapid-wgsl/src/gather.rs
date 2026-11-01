@@ -20,6 +20,12 @@ pub fn scales_words(d: DType, rows: usize, cols: usize) -> usize {
 }
 
 pub(super) fn plan(spec: &Arc<GatherSpec>, d: &GatherDims, caps: &Caps) -> Result<Plan> {
+    plan_part(spec, d, 0, d.rows, caps)
+}
+
+/// Gather from rows `[base, base + d.rows)` of a table with `all_rows` rows (a split launch,
+/// see `split`): indices outside the part are skipped, outside the table flagged.
+pub(super) fn plan_part(spec: &Arc<GatherSpec>, d: &GatherDims, base: usize, all_rows: usize, caps: &Caps) -> Result<Plan> {
     check_plain(spec.out_dtype, "gather output")?;
     if let Some(f) = spec.table_dtype.quant_format()
         && !d.cols.is_multiple_of(f.block_elems())
@@ -29,8 +35,8 @@ pub(super) fn plan(spec: &Arc<GatherSpec>, d: &GatherDims, caps: &Caps) -> Resul
     let so = if spec.table_dtype.is_quant() { scales_words(spec.table_dtype, d.rows, d.cols) } else { 0 };
     let total = d.count.checked_mul(d.cols).ok_or_else(|| bad("gather: size overflow"))?;
     let mut p = Params::default();
-    p.u(d.rows)?.u(d.cols)?.u(d.count)?.u(so)?.u(total)?;
-    if d.rows == 0 && d.count > 0 {
+    p.u(d.rows)?.u(d.cols)?.u(d.count)?.u(so)?.u(total)?.u(base)?.u(all_rows)?;
+    if all_rows == 0 && d.count > 0 {
         return Err(Error::new("index_out_of_range", "gather: index into an empty table"));
     }
     let groups = grid_threads(total as u64, caps);

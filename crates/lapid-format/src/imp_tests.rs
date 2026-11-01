@@ -54,7 +54,7 @@ fn round_trip() {
         assert_eq!(t.dtype, *d);
         assert_eq!(&t.shape, s);
         assert_eq!(t.offset % 256, 0);
-        assert_eq!(t.block_size, d.is_quant().then_some(32));
+        assert_eq!(t.block_size, block_size_of(*d));
         assert_eq!(r.tensor_bytes(t), &b[..]);
     }
     r.verify_tensors().expect("verify");
@@ -179,6 +179,38 @@ fn block_size_checked() {
     assert!(j.contains("\"block_size\":32"));
     t.block_size = None;
     assert!(!serde_json::to_string(&t).expect("json").contains("block_size"));
+}
+
+#[test]
+fn kquant_expert_stack_round_trip() {
+    let p = tmp_path("kq3");
+    let mut w = Writer::create(&p, meta()).expect("create");
+    let shape = [3usize, 2, 512];
+    let n = DType::Q4K.storage_bytes(&shape);
+    let bytes: Vec<u8> = (0..n).map(|i| (i % 253) as u8).collect();
+    w.add("experts", DType::Q4K, &shape, &bytes).expect("3-D k-quant stack");
+    let n8 = DType::Int8.storage_bytes(&[2, 4, 64]);
+    w.add("experts8", DType::Int8, &[2, 4, 64], &vec![1u8; n8]).expect("3-D int8 stack");
+    assert!(w.add("bad", DType::Q6K, &[2, 32], &[0u8; 8]).is_err(), "k-quant cols must be % 256");
+    w.finish().expect("finish");
+    let r = Reader::open(&p).expect("open");
+    let t = r.tensor("experts").expect("tensor");
+    assert_eq!(t.block_size, Some(256));
+    assert_eq!(r.tensor_bytes(t), &bytes[..]);
+    assert_eq!(r.tensor("experts8").expect("int8").block_size, Some(32));
+    std::fs::remove_file(&p).ok();
+    // Older writers emitted 32 for k-quants: read as 256.
+    let mut info = TensorInfo {
+        name: "k".into(),
+        dtype: DType::Q5K,
+        shape: vec![1, 256],
+        offset: 0,
+        nbytes: 0,
+        hash: String::new(),
+        block_size: Some(32),
+    };
+    check_block_size(&mut info).expect("k-quant block_size ignored");
+    assert_eq!(info.block_size, Some(256));
 }
 
 #[test]

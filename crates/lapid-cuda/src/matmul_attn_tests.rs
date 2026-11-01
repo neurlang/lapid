@@ -11,7 +11,7 @@ use crate::CudaBackend;
 use crate::tests::{bytes, check, compare, cuda, floats, gelu_plus, mat_spec, quant, rnd, run_on};
 
 #[allow(clippy::too_many_arguments)]
-fn matmul_case(
+pub(crate) fn matmul_case(
     be: &CudaBackend,
     a_t: DType,
     b_t: DType,
@@ -142,17 +142,17 @@ fn matmul_gemv_variants() {
 
 /// Attention shape / layout of one test case.
 #[derive(Clone, Copy)]
-struct Att {
-    dt: DType,
-    mask: bool,
-    causal: bool,
-    b: usize,
-    h: usize,
-    sq: usize,
-    sk: usize,
-    d: usize,
+pub(crate) struct Att {
+    pub dt: DType,
+    pub mask: bool,
+    pub causal: bool,
+    pub b: usize,
+    pub h: usize,
+    pub sq: usize,
+    pub sk: usize,
+    pub d: usize,
     /// K/V read from a `[B, cap, H, D]` KV cache (first `sk` positions) instead of `[B, Sk, H, D]`.
-    cap: Option<usize>,
+    pub cap: Option<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -161,7 +161,7 @@ fn attention_case(be: &CudaBackend, dt: DType, mask: bool, causal: bool, h: usiz
 }
 
 /// Run one attention case against a naive f64 reference over the stored values.
-fn attention_run(be: &CudaBackend, c: Att, tol: f32) {
+pub(crate) fn attention_run(be: &CudaBackend, c: Att, tol: f32) {
     let Att { dt, mask, causal, b, h, sq, sk, d, cap } = c;
     let kv_s = cap.unwrap_or(sk);
     // q stored [B, Sq, H, D] (as projections are), viewed as [B, H, Sq, D]; k/v [B, kv_s, H, D]

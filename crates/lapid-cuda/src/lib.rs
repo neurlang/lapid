@@ -37,6 +37,8 @@ mod matmul_attn_tests;
 mod memory;
 mod module;
 #[cfg(test)]
+mod r5_tests;
+#[cfg(test)]
 mod tests;
 
 use std::sync::{Arc, Mutex, MutexGuard};

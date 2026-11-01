@@ -122,8 +122,54 @@ fn layer_norm_case(rows: usize) -> Case {
     }
 }
 
+fn matmul_id_case(t: usize, r: usize, e: usize, n: usize, k: usize, w: DType) -> Case {
+    let spec = Arc::new(MatMulIdSpec { x_dtype: DType::F32, w_dtype: w, out_dtype: DType::F32 });
+    let dims = MatMulIdDims { t, r, e, n, k };
+    let wbytes = e * w.storage_bytes(&[n, k]);
+    // ids: input index 2, filled by `ids_for` below (spread over all experts)
+    let sizes = vec![t * k * 4, wbytes, t * r * 4, t * r * n * 4];
+    // bytes touched: experts actually used (all, for t * r >= e)
+    let used = (t * r).min(e) as f64 / e as f64;
+    Case {
+        name: format!("matmul_id t{t} r{r} e{e} {n}x{k} {}", w.name()),
+        launch: Launch { kernel: Kernel::MatMulId(spec, dims), inputs: vec![0, 1, 2], output: 3 },
+        cold: vec![],
+        flops: 2.0 * (t * r * n * k) as f64,
+        bytes: wbytes as f64 * used,
+        sizes,
+    }
+}
+
+fn gdn_case(t: usize, h: usize, d: usize) -> Case {
+    let spec = Arc::new(GatedDeltaNetSpec { out_dtype: DType::F32 });
+    let dims = GatedDeltaNetDims { b: 1, t, h, dk: d, dv: d, scale: 0.088f32.to_bits() };
+    let sizes = vec![t * h * d * 4, t * h * d * 4, t * h * d * 4, t * h * 4, t * h * 4, h * d * d * 4, h * (t + d) * d * 4];
+    Case {
+        name: format!("gated_delta_net t{t} h{h} d{d}"),
+        launch: Launch { kernel: Kernel::GatedDeltaNet(spec, dims), inputs: vec![0, 1, 2, 3, 4, 5], output: 6 },
+        cold: vec![],
+        flops: 6.0 * (t * h * d * d) as f64,
+        bytes: sizes.iter().sum::<usize>() as f64,
+        sizes,
+    }
+}
+
 fn cases() -> Vec<Case> {
     let mut v = Vec::new();
+    // LLM prefill (Qwen3.5-0.8B: d 1024, ffn 3584, vocab 248320; Gemma 4 E2B: d 1536)
+    for b in [DType::Q4K, DType::Q6K, DType::Int8, DType::F16] {
+        v.push(matmul_case(512, 3584, 1024, b, None));
+        v.push(matmul_case(512, 1024, 3584, b, None));
+        v.push(matmul_case(512, 6144, 1536, b, None));
+    }
+    // MoE (Qwen3.5-35B-A3B: 256 experts top-8, d 2048, expert ffn 512)
+    for w in [DType::Q4K, DType::Q5K, DType::Q6K, DType::Int8] {
+        v.push(matmul_id_case(1, 8, 256, 512, 2048, w));
+        v.push(matmul_id_case(512, 8, 256, 512, 2048, w));
+        v.push(matmul_id_case(512, 8, 256, 2048, 512, w));
+    }
+    v.push(gdn_case(1, 32, 128));
+    v.push(gdn_case(512, 32, 128));
     for b in [DType::Int8, DType::F16] {
         // encoder
         v.push(matmul_case(1500, 768, 768, b, Some(add01())));
@@ -169,8 +215,13 @@ fn bench_kernels() {
         if !filter.is_empty() && !c.name.contains(&filter) {
             continue;
         }
-        let mut bufs: Vec<DeviceData> = c.sizes.iter().map(|&s| {
-            let data: Vec<u8> = (0..s).map(|i| ((i * 2654435761usize) >> 13) as u8 & 0x3f).collect();
+        let mut bufs: Vec<DeviceData> = c.sizes.iter().enumerate().map(|(bi, &s)| {
+            let data: Vec<u8> = match &c.launch.kernel {
+                // expert ids spread over all experts
+                Kernel::MatMulId(_, d) if bi == 2 => (0..s / 4).flat_map(|i| (((i * 7919 + i / d.r * 31) % d.e) as i32).to_le_bytes()).collect(),
+                Kernel::GatedDeltaNet(..) => (0..s / 4).flat_map(|i| ((((i * 2654435761usize) >> 13) % 1000) as f32 * 1e-4 - 0.05).to_le_bytes()).collect(),
+                _ => (0..s).map(|i| ((i * 2654435761usize) >> 13) as u8 & 0x3f).collect(),
+            };
             be.upload(&data).unwrap()
         }).collect();
         // cold inputs: enough copies that one pass touches >= 96 MiB (beyond L2)

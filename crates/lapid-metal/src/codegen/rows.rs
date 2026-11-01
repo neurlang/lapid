@@ -1,4 +1,4 @@
-//! Row kernels: softmax, layer norm (threadgroup per row) and gather (thread per element).
+//! Row kernels: softmax, layer / RMS norm (threadgroup per row) and gather (thread per element).
 //! Templates: `kernels/softmax.metal`, `kernels/layer_norm.metal`, `kernels/gather.metal`.
 
 use std::sync::Arc;
@@ -47,6 +47,21 @@ pub(super) fn source_layer_norm(s: &LayerNormSpec) -> String {
         &[],
     );
     template::module(LAYER_NORM, &[("BINDINGS", &binds)], &[])
+}
+
+pub(super) fn plan_rms_norm(s: &Arc<LayerNormSpec>, d: &LayerNormDims) -> Result<Stage> {
+    check_plain(s.in_dtype, "rms_norm input")?;
+    check_plain(s.param_dtype, "rms_norm weight")?;
+    check_plain(s.out_dtype, "rms_norm output")?;
+    let mut p = Params::default();
+    p.u(d.rows)?.u(d.cols)?.bits(d.eps);
+    let groups = if d.cols == 0 { [0; 3] } else { grid_items(d.rows) };
+    Ok(Stage { key: Key::RmsNorm(s.clone()), params: p.0, groups, threads: row_threads(d.cols), binds: io_binds(2) })
+}
+
+pub(super) fn source_rms_norm(s: &LayerNormSpec) -> String {
+    let binds = bindings(&[("x".into(), s.in_dtype), ("w".into(), s.param_dtype)], Some(s.out_dtype), &[]);
+    template::module(LAYER_NORM, &[("BINDINGS", &binds)], &["RMS"])
 }
 
 const GATHER_THREADS: u32 = 256;

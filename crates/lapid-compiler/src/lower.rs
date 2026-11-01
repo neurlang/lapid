@@ -156,6 +156,7 @@ fn materializes_operands(op: &Op) -> bool {
             | Op::MatMulId
             | Op::Softmax
             | Op::LayerNorm { .. }
+            | Op::RmsNorm { .. }
             | Op::Attention { .. }
             | Op::GatedDeltaNet { .. }
             | Op::Gather
@@ -186,6 +187,7 @@ pub(crate) fn op_name(op: &Op) -> &'static str {
         Op::Gather => "gather",
         Op::Softmax => "softmax",
         Op::LayerNorm { .. } => "layer_norm",
+        Op::RmsNorm { .. } => "rms_norm",
         Op::Attention { .. } => "attention",
         Op::GatherAxis { .. } => "gather_axis",
         Op::TopK { .. } => "topk",
@@ -272,7 +274,12 @@ impl Lowerer {
             Op::GatherAxis { axis } => self.lower_gather_axis(t, *axis)?,
             Op::TopK { k, axis } => self.lower_topk(t, *k, *axis)?,
             Op::WriteSlice { axis, start } => self.lower_write_slice(t, *axis, *start)?,
-            Op::Softmax | Op::LayerNorm { .. } | Op::Attention { .. } | Op::MatMulId | Op::GatedDeltaNet { .. } => {
+            Op::Softmax
+            | Op::LayerNorm { .. }
+            | Op::RmsNorm { .. }
+            | Op::Attention { .. }
+            | Op::MatMulId
+            | Op::GatedDeltaNet { .. } => {
                 self.lower_composite(t)?
             }
         };

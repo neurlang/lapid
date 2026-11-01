@@ -4,6 +4,7 @@ description = "The lapid command line (developer tooling)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "lapid"
@@ -15,11 +16,12 @@ vulkan = ["lapid/vulkan", "dep:lapid-vulkan"]
 cuda = ["lapid/cuda", "dep:lapid-cuda"]
 metal = ["lapid/metal", "dep:lapid-metal"]
 # Hugging Face downloads for `convert` / `verify` / `bench` (off: cached models only).
-download = ["lapid-hub/download"]
+download = ["lapid-hub/download", "lapid-server/download"]
 
 [dependencies]
 lapid.workspace = true
 lapid-hub = { workspace = true, default-features = false }
+lapid-server = { workspace = true, default-features = false }
 lapid-format.workspace = true
 lapid-cpu.workspace = true
 lapid-vulkan = { workspace = true, optional = true }

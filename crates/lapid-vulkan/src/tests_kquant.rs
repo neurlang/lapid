@@ -345,3 +345,33 @@ fn round3_kernels_compile_on_all_caps() {
         }
     }
 }
+
+#[test]
+fn matmul_id_grouped_prefill() {
+    // t > 4 on a cooperative-matrix device: moe_route + grouped GEMM (f16 tiles)
+    let Some(be) = backend() else { return };
+    let (t, r, e, n, k) = (70usize, 3usize, 7usize, 150usize, 512usize);
+    // expert 5 unused, expert 0 heavy (several 64-row tiles)
+    let ids: Vec<i32> = (0..t * r).map(|i| if i % 2 == 0 { 0 } else { [1, 2, 3, 4, 6][i % 5] }).collect();
+    let x = rnd(t * k, 77);
+    for d in [DType::F16, DType::Int8, DType::Int4, DType::Q4K, DType::Q5K, DType::Q6K] {
+        let (wb, w) = experts(d, e, n, k, 50);
+        let spec = Arc::new(MatMulIdSpec { x_dtype: DType::F32, w_dtype: d, out_dtype: DType::F32 });
+        let dims = MatMulIdDims { t, r, e, n, k };
+        let got = from_f32b(&run(&be, Kernel::MatMulId(spec.clone(), dims), &[f32b(&x), wb.clone(), ids_bytes(&ids)], t * r * n * 4));
+        let mut want = Vec::new();
+        for ti in 0..t {
+            for ri in 0..r {
+                let wx = &w[ids[ti * r + ri] as usize];
+                want.extend(matmul_ref(&x[ti * k..(ti + 1) * k], wx, 1, n, k));
+            }
+        }
+        assert_close(&got, &want, 3e-3, &format!("grouped matmul_id {}", d.name()));
+        let mut bad = ids.clone();
+        bad[100] = e as i32;
+        let bufs: Vec<DeviceData> =
+            vec![be.upload(&f32b(&x)).unwrap(), be.upload(&wb).unwrap(), be.upload(&ids_bytes(&bad)).unwrap(), be.alloc(t * r * n * 4).unwrap()];
+        let launch = Launch { kernel: Kernel::MatMulId(spec, MatMulIdDims { t, r, e, n, k }), inputs: vec![0, 1, 2], output: 3 };
+        assert_eq!(be.execute(std::slice::from_ref(&launch), &bufs).unwrap_err().code, "index_out_of_range");
+    }
+}

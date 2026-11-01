@@ -8,8 +8,8 @@
 // staged through the same threadgroup memory so the fused epilogue runs per element with
 // coalesced stores.
 //
-// MATMUL_ID (MoE): threadgroup z = expert e; its rows are the (t, r) pairs routed to it by
-// the route stage (`route` = scratch: counts[E], then E lists of `cap` pair indices). Row i
+// MATMUL_ID (MoE): threadgroup z = expert e, its row tiles strided by the grid's y extent;
+// its rows are the (t, r) pairs routed to it by the route stage (`route` = scratch: counts[E], then E lists of `cap` pair indices). Row i
 // of the tile is pair p = list[row0 + i]: A row t = p / R, output row p, B = expert e.
 // K-quant B (k % 256 == 0): a 32-step lies in one super-block; each thread dequantizes 16
 // values of one row.
@@ -26,6 +26,7 @@
 kernel void lapid_kernel(
     constant uint* P [[buffer(0)]],
 {{BINDINGS}}    uint3 tgp [[threadgroup_position_in_grid]],
+    uint3 ntg [[threadgroups_per_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]])
 {
@@ -37,7 +38,6 @@ kernel void lapid_kernel(
     const uint n = P[1];
     const uint k = P[2];
     const uint bt = tgp.z;
-    const uint row0 = tgp.y * BM;
     const uint col0 = tgp.x * BN;
 // #if !MATMUL_ID
     const uint m = P[0];
@@ -47,14 +47,19 @@ kernel void lapid_kernel(
 // #endif
 // #if MATMUL_ID
     const uint m = route[bt];
-    if (row0 >= m) {
-        return;
-    }
     device const uint* pairs = route + P[14] + bt * P[16];
     device const {{BTY}}* b = w + bt * P[15];
     const uint b_base = 0;
 // #endif
     const uint b_rs = P[8];
+// #if MATMUL_ID
+    // Row tiles of this expert, strided by the grid's y extent (sized for the average count).
+    for (uint row0 = tgp.y * BM; row0 < m; row0 += ntg.y * BM) {
+// #endif
+// #if !MATMUL_ID
+    {
+    const uint row0 = tgp.y * BM;
+// #endif
 
     simdgroup_float8x8 acc[4][4];
     for (uint i = 0; i < 4; i++) {
@@ -64,6 +69,16 @@ kernel void lapid_kernel(
     }
     const uint sr = (sg >> 1) * 32;
     const uint sc = (sg & 1) * 32;
+// #if MATMUL_ID
+    // 8-row blocks of this simdgroup's quadrant that hold routed rows (experts often get far
+    // fewer than BM rows: the empty blocks skip their multiplies; uniform per simdgroup).
+    const uint mrows = min(m - row0, uint(BM));
+    const uint nbi = mrows > sr ? min(4u, (mrows - sr + 7u) / 8u) : 0u;
+// #endif
+// #if !MATMUL_ID
+    // Compile-time 4: full tiles (the dynamic skip costs ~10 % on dense GEMMs).
+    const uint nbi = 4u;
+// #endif
 
     for (uint k0 = 0; k0 < k; k0 += BK) {
         // A tile [BM][BK]: thread -> row tid / 2, 16 consecutive k (vector loads in bounds).
@@ -180,18 +195,22 @@ kernel void lapid_kernel(
 // #endif
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0; kk < BK; kk += 8) {
+        for (uint kk = 0; kk < BK && nbi > 0; kk += 8) {
             simdgroup_float8x8 ma[4];
             simdgroup_{{TB}}8x8 mb[4];
             for (uint i = 0; i < 4; i++) {
-                simdgroup_load(ma[i], As + (sr + 8 * i) * BK + kk, BK);
+                if (i < nbi) {
+                    simdgroup_load(ma[i], As + (sr + 8 * i) * BK + kk, BK);
+                }
             }
             for (uint j = 0; j < 4; j++) {
                 simdgroup_load(mb[j], Bs + (sc + 8 * j) * BK + kk, BK, ulong2(0, 0), true);
             }
             for (uint i = 0; i < 4; i++) {
-                for (uint j = 0; j < 4; j++) {
-                    simdgroup_multiply_accumulate(acc[i][j], ma[i], mb[j], acc[i][j]);
+                if (i < nbi) {
+                    for (uint j = 0; j < 4; j++) {
+                        simdgroup_multiply_accumulate(acc[i][j], ma[i], mb[j], acc[i][j]);
+                    }
                 }
             }
         }
@@ -221,5 +240,10 @@ kernel void lapid_kernel(
 // #endif
             }
         }
+    }
+// #if MATMUL_ID
+    // smem (C tile) is reused by the next row tile's A / B tiles.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+// #endif
     }
 }

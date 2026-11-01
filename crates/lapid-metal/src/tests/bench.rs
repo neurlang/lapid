@@ -86,7 +86,11 @@ fn bench_matmul(be: &MetalBackend, a: DType, b: DType, m: usize, n: usize, k: us
 }
 
 fn bench_attention(be: &MetalBackend, h: usize, sq: usize, sk: usize, d: usize, bshd: bool) {
-    let spec = Arc::new(AttentionSpec { dtype: DType::F32, mask_dtype: None, causal: false, out_dtype: DType::F32 });
+    bench_attention_c(be, h, sq, sk, d, bshd, false);
+}
+
+fn bench_attention_c(be: &MetalBackend, h: usize, sq: usize, sk: usize, d: usize, bshd: bool, causal: bool) {
+    let spec = Arc::new(AttentionSpec { dtype: DType::F32, mask_dtype: None, causal, out_dtype: DType::F32 });
     let view = |s: usize| {
         if bshd {
             View { offset: 0, strides: vec![(s * h * d) as isize, d as isize, (h * d) as isize, 1] }
@@ -97,8 +101,8 @@ fn bench_attention(be: &MetalBackend, h: usize, sq: usize, sk: usize, d: usize, 
     let dims = AttentionDims { batch: 1, heads: h, sq, sk, d, scale: 0.125f32.to_bits(), q: view(sq), k: view(sk), v: view(sk), mask: None };
     let ins = [encode(DType::F32, &rand(h * sq * d, 3)), encode(DType::F32, &rand(h * sk * d, 4)), encode(DType::F32, &rand(h * sk * d, 5))];
     let ms = time(be, Kernel::Attention(spec, dims), &ins, h * sq * d * 4, 9);
-    let gflops = 4.0 * (h * sq * sk * d) as f64 / ms / 1e6;
-    eprintln!("attention h{h} sq{sq} sk{sk} d{d} bshd={bshd}: {ms:.3} ms  {gflops:.0} GFLOP/s");
+    let gflops = 4.0 * (h * sq * sk * d) as f64 / ms / 1e6 / if causal && sq > 1 { 2.0 } else { 1.0 };
+    eprintln!("attention h{h} sq{sq} sk{sk} d{d} bshd={bshd} causal={causal}: {ms:.3} ms  {gflops:.0} GFLOP/s");
 }
 
 fn bench_matmul_quiet(be: &MetalBackend) {
@@ -214,5 +218,63 @@ fn bench_gemv_dram() {
         for &(n, k) in &[(2048usize, 2048usize), (512, 2048), (7680, 2048), (2048, 7680)] {
             bench_gemv_stream(&be, b, n, k);
         }
+    }
+}
+
+/// MatMulId over the whole expert stack: `e / r` launches in one execute (t = 1: each launch
+/// selects r distinct experts, every expert read once from DRAM as in a decode step over
+/// several layers; t > 1: a single launch, routed GEMM).
+fn bench_matmul_id(be: &MetalBackend, w: DType, t: usize, r: usize, e: usize, n: usize, k: usize) {
+    let wb = weights(w, e * n, k);
+    let spec = Arc::new(MatMulIdSpec { x_dtype: DType::F32, w_dtype: w, out_dtype: DType::F32 });
+    let kern = Kernel::MatMulId(spec, MatMulIdDims { t, r, e, n, k });
+    let reps = if t == 1 { e / r } else { 1 };
+    let mut bufs: Vec<DeviceData> = vec![be.upload(&encode(DType::F32, &rand(t * k, 2))).unwrap(), be.upload(&wb).unwrap()];
+    for l in 0..reps {
+        let ids: Vec<i32> = (0..t * r).map(|i| ((l * r + i * 37 + i / r * 11) % e) as i32).collect();
+        bufs.push(be.upload(&ids.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap());
+    }
+    let out = bufs.len();
+    bufs.push(be.alloc(t * r * n * 4).unwrap());
+    let launches: Vec<Launch> = (0..reps).map(|l| Launch { kernel: kern.clone(), inputs: vec![0, 1, 2 + l], output: out }).collect();
+    let ms = (0..6)
+        .map(|_| {
+            let t0 = std::time::Instant::now();
+            be.execute(&launches, &bufs).unwrap();
+            t0.elapsed().as_secs_f64() * 1e3
+        })
+        .fold(f64::INFINITY, f64::min)
+        / reps as f64;
+    let used = (t * r).min(e) as f64;
+    let gbs = used * (w.storage_bytes(&[n, k]) as f64) / ms / 1e6;
+    let gflops = 2.0 * (t * r * n * k) as f64 / ms / 1e6;
+    eprintln!("matmul_id {w:?} t{t} r{r} e{e} n{n} k{k}: {:.1} us  {gbs:.0} GB/s(experts)  {gflops:.0} GFLOP/s", ms * 1e3);
+}
+
+/// Round-5 shapes: Gemma 4 head dim 512 attention, Qwen3.5-35B-A3B MoE, Qwen3.5-0.8B K-quant prefill.
+/// `cargo test -p lapid-metal --release bench_r5 -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_r5_shapes() {
+    let Some(be) = backend() else { return };
+    for _ in 0..20 {
+        bench_matmul_quiet(&be);
+    }
+    for d in [128usize, 256, 512] {
+        bench_attention_c(&be, 8, 512, 512, d, true, true);
+        bench_attention_c(&be, 8, 1, 4096, d, true, true);
+    }
+    for w in [DType::Q4K, DType::Q6K, DType::Int8] {
+        bench_gemv_stream(&be, w, 4096, 2048);
+        bench_gemv_stream(&be, w, 512, 2048);
+        bench_matmul_id(&be, w, 1, 1, 64, 4096, 2048);
+        bench_matmul_id(&be, w, 1, 8, 256, 512, 2048);
+        bench_matmul_id(&be, w, 1, 8, 256, 2048, 512);
+        bench_matmul_id(&be, w, 512, 8, 256, 512, 2048);
+    }
+    for b in [DType::Q4K, DType::Q6K, DType::Int8, DType::F16] {
+        bench_matmul(&be, DType::F32, b, 512, 3584, 1024);
+        bench_matmul(&be, DType::F32, b, 512, 1024, 3584);
+        bench_matmul(&be, DType::F32, b, 16, 3584, 1024);
     }
 }

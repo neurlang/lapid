@@ -4,7 +4,9 @@
 use lapid_compiler::Kernel;
 use lapid_tensor::Result;
 
-pub(crate) use lapid_wgsl::{Extra, IdxMode, Key, Plan};
+pub(crate) use lapid_wgsl::{Extra, Key, Plan, plan_split};
+#[cfg(test)]
+pub(crate) use lapid_wgsl::IdxMode;
 
 use crate::context::Caps;
 

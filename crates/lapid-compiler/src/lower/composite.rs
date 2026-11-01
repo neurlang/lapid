@@ -11,6 +11,17 @@ use crate::ir::{
     AttentionDims, AttentionSpec, BufId, Kernel, LayerNormDims, LayerNormSpec, RowDims, SoftmaxSpec, View,
 };
 
+/// Emit `Kernel::RmsNorm` (`LAPID_RMS_NORM=0|1` overrides; the decomposition is reduce + one
+/// fused elementwise).
+fn native_rms_norm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("LAPID_RMS_NORM").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => false,
+    })
+}
+
 impl Lowerer {
     pub(super) fn lower_composite(&mut self, t: &Tensor) -> Result<LExpr> {
         // Quantized expert stacks have no decomposition (they cannot be sliced in a graph).
@@ -19,6 +30,7 @@ impl Lowerer {
             let native = match t.op() {
                 Op::Softmax => self.native_softmax(t)?,
                 Op::LayerNorm { eps } => self.native_layer_norm(t, *eps)?,
+                Op::RmsNorm { eps } => self.native_rms_norm(t, *eps)?,
                 Op::Attention { scale, causal, has_mask } => self.native_attention(t, *scale, *causal, *has_mask)?,
                 Op::MatMulId => self.native_matmul_id(t)?,
                 Op::GatedDeltaNet { scale } => self.native_gated_delta_net(t, *scale)?,
@@ -77,6 +89,34 @@ impl Lowerer {
         if rows * cols > 0 {
             let spec = SoftmaxSpec { in_dtype: xdt, out_dtype: t.dtype() };
             self.push(Kernel::Softmax(Arc::new(spec), RowDims { rows, cols }), vec![xb], out);
+        }
+        Ok(Some(LExpr::buf(out, t.dtype(), View::contiguous(t.shape()))))
+    }
+
+    fn native_rms_norm(&mut self, t: &Tensor, eps: f32) -> Result<Option<LExpr>> {
+        if !native_rms_norm_enabled() {
+            return Ok(None);
+        }
+        let x = src_of(t, 0)?;
+        let w = src_of(t, 1)?;
+        let r = x.rank();
+        if r == 0 || t.shape() != x.shape() || w.numel() != x.shape()[r - 1] {
+            return Ok(None);
+        }
+        if x.dtype().is_quant() || w.dtype().is_quant() {
+            return Ok(None);
+        }
+        let cols = x.shape()[r - 1];
+        let rows = view::numel(&x.shape()[..r - 1]);
+        let xe = self.val(x)?;
+        let (xb, xdt) = self.float_contig(&xe, x.shape(), x.dtype())?;
+        let we = self.val(w)?;
+        let (wb, wdt) = self.float_contig(&we, w.shape(), w.dtype())?;
+        let out = self.alloc_node(t)?;
+        if rows * cols > 0 {
+            let spec = LayerNormSpec { in_dtype: xdt, param_dtype: wdt, out_dtype: t.dtype() };
+            let dims = LayerNormDims { rows, cols, eps: eps.to_bits() };
+            self.push(Kernel::RmsNorm(Arc::new(spec), dims), vec![xb, wb], out);
         }
         Ok(Some(LExpr::buf(out, t.dtype(), View::contiguous(t.shape()))))
     }

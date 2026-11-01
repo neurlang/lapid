@@ -37,6 +37,8 @@ pub(crate) struct Exec {
     pub profiling: bool,
     /// Recorded command buffers of repeated launch sequences.
     pub replay: Replay,
+    /// Storage binding limit below the device's (tests: forces split launches).
+    pub binding_limit: Option<u64>,
 }
 
 /// What to do with per-launch GPU timings of one `run`.
@@ -99,6 +101,7 @@ impl Exec {
                 prof: Profiler::new(shared),
                 profiling,
                 replay: Replay::new(shared),
+                binding_limit: None,
             })
         }
     }
@@ -264,11 +267,7 @@ impl Exec {
         let host_t0 = std::time::Instant::now();
         let caps = &shared.caps;
         let vbufs: Vec<&VkBuffer> = buffers.iter().map(|d| as_vk(d, shared)).collect::<Result<_>>()?;
-        for b in &vbufs {
-            if b.size > caps.max_storage_range {
-                return Err(Error::new("too_large", format!("buffer of {} bytes exceeds maxStorageBufferRange", b.size)));
-            }
-        }
+        let limit = self.binding_limit.unwrap_or(caps.max_storage_range).min(caps.max_storage_range);
 
         // plan + pipelines; every stage of a launch becomes one dispatch item
         let mut items: Vec<Item> = Vec::with_capacity(launches.len());
@@ -276,45 +275,57 @@ impl Exec {
         let mut params_bytes = 0usize;
         let mut scratch_bytes = 0usize;
         for (li, l) in launches.iter().enumerate() {
-            let mut plan = codegen::plan(&l.kernel, caps).map_err(|e| Error::new(e.code, format!("launch {li} ({}): {}", l.kernel.kind(), e.message)))?;
-            if plan.is_empty() {
-                continue;
-            }
-            if l.inputs.len() != plan.key.num_inputs() {
-                return Err(Error::new(
-                    "bad_launch",
-                    format!("launch {li} ({}): {} inputs, kernel expects {}", l.kernel.kind(), l.inputs.len(), plan.key.num_inputs()),
-                ));
-            }
             for &id in l.inputs.iter().chain(std::iter::once(&l.output)) {
                 if id >= vbufs.len() {
                     return Err(Error::new("bad_launch", format!("launch {li}: buffer id {id} out of range")));
                 }
             }
-            let scratch = if plan.scratch > 0 {
-                let off = scratch_bytes.div_ceil(align) * align;
-                scratch_bytes = off + plan.scratch;
-                Some((off, plan.scratch))
-            } else {
-                None
+            let ctx = |e: Error| Error::new(e.code, format!("launch {li} ({}): {}", l.kernel.kind(), e.message));
+            if vbufs[l.output].size > limit {
+                return Err(ctx(Error::new("too_large", format!("output of {} bytes exceeds maxStorageBufferRange", vbufs[l.output].size))));
+            }
+            let sizes: Vec<u64> = l.inputs.iter().map(|&i| vbufs[i].size).collect();
+            // launches binding a buffer above the limit run as several sub-range launches
+            let parts: Vec<(Plan, Vec<Option<(u64, u64)>>)> = match codegen::plan_split(&l.kernel, &sizes, limit, caps.storage_align, &caps.wgsl()).map_err(&ctx)? {
+                Some(subs) => subs.into_iter().map(|s| (s.plan, s.ranges)).collect(),
+                None => vec![(codegen::plan(&l.kernel, caps).map_err(&ctx)?, vec![None; l.inputs.len()])],
             };
-            let mut follow = false;
-            loop {
-                let next = plan.next.take();
-                let pipe = pipelines.get(shared, &plan.key)?;
-                let off = params_bytes.div_ceil(align) * align;
-                params_bytes = off + plan.params.len().max(1) * 4;
-                let mut bufs: Vec<vk::Buffer> = l.inputs.iter().map(|&i| vbufs[i].buffer).collect();
-                bufs.push(vbufs[l.output].buffer);
-                let mut ids: Vec<u64> = l.inputs.iter().map(|&i| vbufs[i].id).collect();
-                ids.push(vbufs[l.output].id);
-                items.push(Item { plan, pipe, li, params_off: off, scratch, follow, barrier: false, bufs, ids });
-                match next {
-                    Some(n) => {
-                        plan = *n;
-                        follow = true;
+            for (mut plan, ranges) in parts {
+                if plan.is_empty() {
+                    continue;
+                }
+                if l.inputs.len() != plan.key.num_inputs() {
+                    return Err(Error::new(
+                        "bad_launch",
+                        format!("launch {li} ({}): {} inputs, kernel expects {}", l.kernel.kind(), l.inputs.len(), plan.key.num_inputs()),
+                    ));
+                }
+                let scratch = if plan.scratch > 0 {
+                    let off = scratch_bytes.div_ceil(align) * align;
+                    scratch_bytes = off + plan.scratch;
+                    Some((off, plan.scratch))
+                } else {
+                    None
+                };
+                let mut follow = false;
+                loop {
+                    let next = plan.next.take();
+                    let pipe = pipelines.get(shared, &plan.key)?;
+                    let off = params_bytes.div_ceil(align) * align;
+                    params_bytes = off + plan.params.len().max(1) * 4;
+                    let mut bufs: Vec<vk::Buffer> = l.inputs.iter().map(|&i| vbufs[i].buffer).collect();
+                    bufs.push(vbufs[l.output].buffer);
+                    let mut ids: Vec<u64> = l.inputs.iter().map(|&i| vbufs[i].id).collect();
+                    ids.push(vbufs[l.output].id);
+                    let ranges = ranges.clone();
+                    items.push(Item { plan, pipe, li, params_off: off, scratch, follow, barrier: false, bufs, ids, ranges });
+                    match next {
+                        Some(n) => {
+                            plan = *n;
+                            follow = true;
+                        }
+                        None => break,
                     }
-                    None => break,
                 }
             }
         }
@@ -357,7 +368,7 @@ impl Exec {
         } else {
             vk::Buffer::null()
         };
-        let uses_status = items.iter().any(|it| it.plan.key.extra() == Some(codegen::Extra::Status));
+        let uses_status = items.iter().any(|it| matches!(it.plan.key.extra(), Some(codegen::Extra::Status | codegen::Extra::ScratchStatus)));
         let status_handle = if uses_status { self.ensure_status(shared)? } else { vk::Buffer::null() };
         let base_ids = [
             params_id,
@@ -508,6 +519,8 @@ pub(crate) struct Item {
     pub bufs: Vec<vk::Buffer>,
     /// their `VkBuffer::id` serials
     pub ids: Vec<u64>,
+    /// per input: bound byte range (`None` = whole buffer; split launches)
+    pub ranges: Vec<Option<(u64, u64)>>,
 }
 
 /// What recording a dispatch needs besides the item.
@@ -536,8 +549,9 @@ impl Rec<'_> {
                 .offset(it.params_off as u64)
                 .range((it.plan.params.len().max(1) * 4) as u64),
         );
-        for &b in &it.bufs {
-            infos.push(vk::DescriptorBufferInfo::default().buffer(b).offset(0).range(vk::WHOLE_SIZE));
+        for (i, &b) in it.bufs.iter().enumerate() {
+            let (off, len) = it.ranges.get(i).copied().flatten().unwrap_or((0, vk::WHOLE_SIZE));
+            infos.push(vk::DescriptorBufferInfo::default().buffer(b).offset(off).range(len));
         }
         match it.plan.key.extra() {
             Some(codegen::Extra::Scratch) => {
@@ -545,6 +559,11 @@ impl Rec<'_> {
                 infos.push(vk::DescriptorBufferInfo::default().buffer(self.scratch).offset(off as u64).range(bytes as u64));
             }
             Some(codegen::Extra::Status) => {
+                infos.push(vk::DescriptorBufferInfo::default().buffer(self.status).offset(0).range(vk::WHOLE_SIZE));
+            }
+            Some(codegen::Extra::ScratchStatus) => {
+                let (off, bytes) = it.scratch.ok_or_else(|| Error::new("vulkan", "scratch range missing"))?;
+                infos.push(vk::DescriptorBufferInfo::default().buffer(self.scratch).offset(off as u64).range(bytes as u64));
                 infos.push(vk::DescriptorBufferInfo::default().buffer(self.status).offset(0).range(vk::WHOLE_SIZE));
             }
             None => {}

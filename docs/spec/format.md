@@ -180,8 +180,8 @@ A UTF-8 JSON array (≤ 64 MiB, ≤ 1 000 000 entries) of:
   dtypes `shape` must be `[rows, cols]` with `cols % block_elems == 0` (32 for int8/int4,
   256 for the k-quants) and `nbytes` must equal `lapid_quant::layout(..).total`; a 3-D
   `[E, rows, cols]` quantized tensor is an expert stack, `E` such layouts back to back.
-- k-quant dtypes have their block structure fixed by the dtype; lapid/1.1 writers still
-  emit `block_size: 32` for them and readers ignore `block_size` for k-quant dtypes.
+- k-quant dtypes have their block structure fixed by the dtype; writers emit `block_size: 256`
+  for them (lapid/1.1 writers emitted 32) and readers ignore `block_size` for k-quant dtypes.
 - `offset` is absolute, a multiple of 256, and `[offset, offset+nbytes)` lies inside
   TENSOR_DATA. Non-empty tensors do not overlap. Names are unique, 1..=1024 bytes.
 - Element data is little endian, row-major (C order).

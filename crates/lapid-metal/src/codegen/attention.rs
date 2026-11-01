@@ -133,12 +133,16 @@ pub(super) fn source_vec(s: &AttentionSpec, d: u32, direct: bool) -> String {
     };
     let g = if (d as usize) <= KS { KS / d as usize } else { 1 };
     let lk = if d.is_multiple_of(32) { 8 } else { 1 };
-    let (ds, gs, lks) = (d.to_string(), g.to_string(), lk.to_string());
+    let wide = if (d as usize) >= KS && (d as usize).is_multiple_of(KS) { d as usize / KS } else { 0 };
+    let (ds, gs, lks, ws) = (d.to_string(), g.to_string(), lk.to_string(), wide.to_string());
     let mut f = flags(s);
     if direct {
         f.push("DIRECT");
     }
-    template::module(ATTN_VEC, &[("BINDINGS", &binds), ("D", &ds), ("G", &gs), ("LK", &lks)], &f)
+    if wide > 0 {
+        f.push("WIDE");
+    }
+    template::module(ATTN_VEC, &[("BINDINGS", &binds), ("D", &ds), ("G", &gs), ("LK", &lks), ("WIDE", &ws)], &f)
 }
 
 pub(super) fn source_merge(out: DType) -> String {

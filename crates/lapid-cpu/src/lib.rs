@@ -409,6 +409,12 @@ fn run_launch(ctx: &Ctx, ws: &mut Workspace, l: &Launch, bufs: &[&CpuBuffer]) ->
             let b = src(2, spec.param_dtype)?;
             rows::layer_norm(ctx, spec, dims, &x, &w, &b, &out_buf.dst(spec.out_dtype)?)
         }
+        Kernel::RmsNorm(spec, dims) => {
+            expect(2)?;
+            let x = src(0, spec.in_dtype)?;
+            let w = src(1, spec.param_dtype)?;
+            rows::rms_norm(ctx, dims, &x, &w, &out_buf.dst(spec.out_dtype)?)
+        }
         Kernel::GatherAxis(spec, dims) => {
             expect(2)?;
             index::gather_axis(ctx, dims, &src(0, spec.dtype)?, &src(1, DType::I32)?, &out_buf.dst(spec.dtype)?)

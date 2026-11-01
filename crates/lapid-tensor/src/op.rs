@@ -1,6 +1,6 @@
 //! The operation set. CONTRACT FILE — owned by the coordinator.
 //!
-//! ~25 primitives plus 3 composites. Composites (`Softmax`, `LayerNorm`, `Attention`) have
+//! ~25 primitives plus 3 composites. Composites (`Softmax`, `LayerNorm`, `RmsNorm`, `Attention`) have
 //! a reference decomposition into primitives (see `lapid_tensor::decompose`) and backends
 //! may run them natively. Semantics are defined in docs/spec/ops.md.
 
@@ -140,6 +140,11 @@ pub enum Op {
     ///   S = exp(g_t) * S ;  S = S + k_t ⊗ (beta_t * (v_t - Sᵀ k_t)) ;  o_t = Sᵀ (q_t * scale)
     /// Output [B, H, T + Dk, Dv]: rows [0, T) are o_t, rows [T, T + Dk) the final state.
     GatedDeltaNet { scale: f32 },
+
+    // ---- round 5 ----
+    /// RMS norm over the last axis: srcs = [x, weight [D]];
+    /// out = x * rsqrt(mean(x^2) + eps) * weight (f32 math, x's dtype).
+    RmsNorm { eps: f32 },
 }
 
 impl Op {

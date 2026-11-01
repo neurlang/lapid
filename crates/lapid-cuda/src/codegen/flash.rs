@@ -18,7 +18,7 @@ const KERNEL: &str = include_str!("../kernels/attn_mma.ptx");
 
 /// Queries per block (16 per warp).
 pub(crate) const BQ: usize = 64;
-/// Keys per tile.
+/// Keys per tile (32 in the precise variant with D > 64, to fit the lo tiles in shared memory).
 const BK: usize = 64;
 pub(crate) const THREADS: u32 = 128;
 pub(crate) const MAX_D: usize = 128;
@@ -27,6 +27,11 @@ const LOG2E: f32 = std::f32::consts::LOG2_E;
 
 struct Dims {
     d: usize,
+    /// keys per tile
+    bk: usize,
+    /// f32 inputs: every operand is split into f16 hi + lo parts and each product is
+    /// computed as hi*hi + hi*lo + lo*hi (~f32 accuracy; lo tiles live at `2 * kv`).
+    precise: bool,
     /// shared row stride in halves / bytes
     ld: usize,
     rb: usize,
@@ -34,23 +39,50 @@ struct Dims {
     kv: usize,
 }
 
-fn dims(d: u32) -> Dims {
+fn dims(d: u32, precise: bool) -> Dims {
     let d = (d as usize).clamp(16, MAX_D) / 16 * 16;
     let ld = d + 8;
+    let bk = if precise && d > 64 { 32 } else { BK };
     Dims {
         d,
+        bk,
+        precise,
         ld,
         rb: 2 * ld,
-        kv: BK * 2 * ld,
+        kv: bk * 2 * ld,
     }
 }
 
+/// Byte offset of the lo copy of the K / V tiles and of the staged Q tile.
+fn lo_off(dm: &Dims) -> usize {
+    2 * dm.kv.max(BQ * dm.ld)
+}
+
+/// Split f32 `v` into f16 `hi` (b16) and `lo` = f16(v - hi).
+fn split_hl(g: &mut Gen, v: &str, hi: &str, lo: &str) {
+    let (f, r) = (g.reg("f32"), g.reg("f32"));
+    g.op(format!("cvt.rn.f16.f32 {hi}, {v}"));
+    g.op(format!("cvt.f32.f16 {f}, {hi}"));
+    g.op(format!("sub.f32 {r}, {v}, {f}"));
+    g.op(format!("cvt.rn.f16.f32 {lo}, {r}"));
+}
+
 fn regs(dm: &Dims) -> String {
-    format!(
-        "    .reg .f32 %s<32>;\n    .reg .f32 %o<{}>;\n    .reg .b32 %qf<{}>;\n    .reg .b32 %pa<16>;\n    .reg .b32 %kb<4>;\n",
+    let mut s = format!(
+        "    .reg .f32 %s<{}>;\n    .reg .f32 %o<{}>;\n    .reg .b32 %qf<{}>;\n    .reg .b32 %pa<{}>;\n    .reg .b32 %kb<4>;\n",
+        dm.bk / 2,
         dm.d / 2,
-        dm.d / 4
-    )
+        dm.d / 4,
+        dm.bk / 4
+    );
+    if dm.precise {
+        s.push_str(&format!(
+            "    .reg .b32 %ql<{}>;\n    .reg .b32 %pl<{}>;\n    .reg .b32 %kx<4>;\n",
+            dm.d / 4,
+            dm.bk / 4
+        ));
+    }
+    s
 }
 
 /// One Q element per thread-iteration `%e`: Q[q0 + e / D, e % D] → f16 smem[e / D][e % D].
@@ -76,9 +108,15 @@ fn load_q(spec: &AttentionSpec, dm: &Dims) -> String {
     g.op(format!("selp.b32 {idx}, {idx}, 0, {valid}"));
     ptx::load(&mut g, spec.dtype, "%g_q", &idx, &v, true);
     g.op(format!("selp.f32 {v}, {v}, 0f00000000, {valid}"));
-    g.op(format!("cvt.rn.f16.f32 {h}, {v}"));
     g.op(format!("mad.lo.u32 {a}, {qq}, {}, {dd}", dm.ld));
     g.op(format!("mad.lo.u32 {a}, {a}, 2, %sm"));
+    if dm.precise {
+        let lo = g.reg("b16");
+        split_hl(&mut g, &v, &h, &lo);
+        g.op(format!("st.shared.b16 [{a}+{}], {lo}", lo_off(dm)));
+    } else {
+        g.op(format!("cvt.rn.f16.f32 {h}, {v}"));
+    }
     g.op(format!("st.shared.b16 [{a}], {h}"));
     g.finish()
 }
@@ -145,6 +183,27 @@ fn load_kv(spec: &AttentionSpec, dm: &Dims, vec: bool) -> String {
                         f[2 * i]
                     ));
                 }
+                if dm.precise {
+                    let lw: Vec<String> = (0..4).map(|_| g.reg("b32")).collect();
+                    let (h0, h1, f0, f1) = (g.reg("b16"), g.reg("b16"), g.reg("f32"), g.reg("f32"));
+                    for i in 0..4 {
+                        g.op(format!("mov.b32 {{{h0}, {h1}}}, {}", w[i]));
+                        g.op(format!("cvt.f32.f16 {f0}, {h0}"));
+                        g.op(format!("cvt.f32.f16 {f1}, {h1}"));
+                        g.op(format!("sub.f32 {f0}, {}, {f0}", f[2 * i]));
+                        g.op(format!("sub.f32 {f1}, {}, {f1}", f[2 * i + 1]));
+                        g.op(format!("cvt.rn.f16x2.f32 {}, {f1}, {f0}", lw[i]));
+                        g.op(format!("selp.b32 {}, {}, 0, {valid}", lw[i], lw[i]));
+                    }
+                    g.op(format!(
+                        "st.shared.v4.b32 [{a}+{}], {{{}, {}, {}, {}}}",
+                        off + lo_off(dm),
+                        lw[0],
+                        lw[1],
+                        lw[2],
+                        lw[3]
+                    ));
+                }
             }
             for wi in &w {
                 g.op(format!("selp.b32 {wi}, {wi}, 0, {valid}"));
@@ -162,7 +221,13 @@ fn load_kv(spec: &AttentionSpec, dm: &Dims, vec: bool) -> String {
             let h = g.reg("b16");
             ptx::load(&mut g, spec.dtype, &format!("%g_{name}"), idx, &v, true);
             g.op(format!("selp.f32 {v}, {v}, 0f00000000, {valid}"));
-            g.op(format!("cvt.rn.f16.f32 {h}, {v}"));
+            if dm.precise {
+                let lo = g.reg("b16");
+                split_hl(&mut g, &v, &h, &lo);
+                g.op(format!("st.shared.b16 [{a}+{}], {lo}", off + lo_off(dm)));
+            } else {
+                g.op(format!("cvt.rn.f16.f32 {h}, {v}"));
+            }
             g.op(format!("st.shared.b16 [{a}+{off}], {h}"));
         }
     }
@@ -171,15 +236,18 @@ fn load_kv(spec: &AttentionSpec, dm: &Dims, vec: bool) -> String {
 
 fn q_frags(dm: &Dims) -> String {
     let mut s = String::new();
-    for ks in 0..dm.d / 16 {
-        let r = 4 * ks;
-        s.push_str(&format!(
-            "    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%qf{r}, %qf{}, %qf{}, %qf{}}}, [%q_lane+{}];\n",
-            r + 1,
-            r + 2,
-            r + 3,
-            32 * ks
-        ));
+    let parts: &[(&str, usize)] = if dm.precise { &[("qf", 0), ("ql", lo_off(dm))] } else { &[("qf", 0)] };
+    for &(name, off) in parts {
+        for ks in 0..dm.d / 16 {
+            let r = 4 * ks;
+            s.push_str(&format!(
+                "    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%{name}{r}, %{name}{}, %{name}{}, %{name}{}}}, [%q_lane+{}];\n",
+                r + 1,
+                r + 2,
+                r + 3,
+                off + 32 * ks
+            ));
+        }
     }
     s
 }
@@ -214,15 +282,25 @@ fn mma_acc(acc: &str, c: usize, a: &str, a0: usize, b: [&str; 2]) -> String {
 
 fn qk(dm: &Dims) -> String {
     let mut s = String::new();
-    for i in 0..32 {
+    for i in 0..dm.bk / 2 {
         s.push_str(&format!("    mov.f32 %s{i}, 0f00000000;\n"));
     }
-    for p in 0..BK / 16 {
+    for p in 0..dm.bk / 16 {
         for ks in 0..dm.d / 16 {
+            let off = p * 16 * dm.rb + 32 * ks;
             s.push_str(&format!(
-                "    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%kb0, %kb1, %kb2, %kb3}}, [%k_lane+{}];\n",
-                p * 16 * dm.rb + 32 * ks
+                "    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%kb0, %kb1, %kb2, %kb3}}, [%k_lane+{off}];\n"
             ));
+            if dm.precise {
+                s.push_str(&format!(
+                    "    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%kx0, %kx1, %kx2, %kx3}}, [%k_lane+{}];\n",
+                    off + lo_off(dm)
+                ));
+                s.push_str(&mma_acc("s", 8 * p, "ql", 4 * ks, ["%kb0", "%kb1"]));
+                s.push_str(&mma_acc("s", 8 * p + 4, "ql", 4 * ks, ["%kb2", "%kb3"]));
+                s.push_str(&mma_acc("s", 8 * p, "qf", 4 * ks, ["%kx0", "%kx1"]));
+                s.push_str(&mma_acc("s", 8 * p + 4, "qf", 4 * ks, ["%kx2", "%kx3"]));
+            }
             s.push_str(&mma_acc("s", 8 * p, "qf", 4 * ks, ["%kb0", "%kb1"]));
             s.push_str(&mma_acc("s", 8 * p + 4, "qf", 4 * ks, ["%kb2", "%kb3"]));
         }
@@ -240,7 +318,7 @@ fn softmax(spec: &AttentionSpec, dm: &Dims) -> String {
     g.op(format!("add.u32 {kb}, %kt0, %kl2"));
     g.op(format!("sub.u32 {skm1}, %SK, 1"));
     let (kc, mv) = (g.reg("u32"), g.reg("f32"));
-    for nt in 0..BK / 8 {
+    for nt in 0..dm.bk / 8 {
         for r in 0..4 {
             let s = format!("%s{}", nt * 4 + r);
             let row = r / 2;
@@ -261,7 +339,7 @@ fn softmax(spec: &AttentionSpec, dm: &Dims) -> String {
     for row in 0..2 {
         let mx = g.reg("f32");
         g.op(format!("mov.f32 {mx}, {ninf}"));
-        for nt in 0..BK / 8 {
+        for nt in 0..dm.bk / 8 {
             for c in 0..2 {
                 g.op(format!("max.f32 {mx}, {mx}, %s{}", nt * 4 + 2 * row + c));
             }
@@ -279,7 +357,7 @@ fn softmax(spec: &AttentionSpec, dm: &Dims) -> String {
         g.op(format!("ex2.approx.f32 {corr}, {corr}"));
         g.op(format!("mov.f32 %m{row}, {mn}"));
         g.op(format!("mov.f32 {sum}, 0f00000000"));
-        for nt in 0..BK / 8 {
+        for nt in 0..dm.bk / 8 {
             for c in 0..2 {
                 let s = format!("%s{}", nt * 4 + 2 * row + c);
                 g.op(format!("sub.f32 {s}, {s}, {mu}"));
@@ -296,7 +374,7 @@ fn softmax(spec: &AttentionSpec, dm: &Dims) -> String {
         }
     }
     // P (f32 accumulators) → f16 A fragments, one k16 step per pair of key n-tiles
-    for j in 0..BK / 16 {
+    for j in 0..dm.bk / 16 {
         let (s0, s1) = (8 * j, 8 * j + 4);
         g.op(format!(
             "cvt.rn.f16x2.f32 %pa{}, %s{}, %s{}",
@@ -323,17 +401,43 @@ fn softmax(spec: &AttentionSpec, dm: &Dims) -> String {
             s1 + 2
         ));
     }
+    if dm.precise {
+        // lo parts: P - f32(hi), per packed pair
+        let (h0, h1, f0, f1) = (g.reg("b16"), g.reg("b16"), g.reg("f32"), g.reg("f32"));
+        for j in 0..dm.bk / 16 {
+            let (s0, s1) = (8 * j, 8 * j + 4);
+            for (i, base) in [(0, s0), (1, s0 + 2), (2, s1), (3, s1 + 2)] {
+                let r = 4 * j + i;
+                g.op(format!("mov.b32 {{{h0}, {h1}}}, %pa{r}"));
+                g.op(format!("cvt.f32.f16 {f0}, {h0}"));
+                g.op(format!("cvt.f32.f16 {f1}, {h1}"));
+                g.op(format!("sub.f32 {f0}, %s{base}, {f0}"));
+                g.op(format!("sub.f32 {f1}, %s{}, {f1}", base + 1));
+                g.op(format!("cvt.rn.f16x2.f32 %pl{r}, {f1}, {f0}"));
+            }
+        }
+    }
     g.finish()
 }
 
 fn pv(dm: &Dims) -> String {
     let mut s = String::new();
     for dp in 0..dm.d / 16 {
-        for j in 0..BK / 16 {
+        for j in 0..dm.bk / 16 {
+            let off = j * 16 * dm.rb + 32 * dp;
             s.push_str(&format!(
-                "    ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {{%kb0, %kb1, %kb2, %kb3}}, [%v_lane+{}];\n",
-                j * 16 * dm.rb + 32 * dp
+                "    ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {{%kb0, %kb1, %kb2, %kb3}}, [%v_lane+{off}];\n"
             ));
+            if dm.precise {
+                s.push_str(&format!(
+                    "    ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {{%kx0, %kx1, %kx2, %kx3}}, [%v_lane+{}];\n",
+                    off + lo_off(dm)
+                ));
+                s.push_str(&mma_acc("o", 8 * dp, "pl", 4 * j, ["%kb0", "%kb1"]));
+                s.push_str(&mma_acc("o", 8 * dp + 4, "pl", 4 * j, ["%kb2", "%kb3"]));
+                s.push_str(&mma_acc("o", 8 * dp, "pa", 4 * j, ["%kx0", "%kx1"]));
+                s.push_str(&mma_acc("o", 8 * dp + 4, "pa", 4 * j, ["%kx2", "%kx3"]));
+            }
             s.push_str(&mma_acc("o", 8 * dp, "pa", 4 * j, ["%kb0", "%kb1"]));
             s.push_str(&mma_acc("o", 8 * dp + 4, "pa", 4 * j, ["%kb2", "%kb3"]));
         }
@@ -376,17 +480,19 @@ fn finish(spec: &AttentionSpec, dm: &Dims) -> String {
 }
 
 pub(super) fn source(spec: &AttentionSpec, d: u32, vec: bool) -> String {
-    let dm = dims(d);
+    let dm = dims(d, spec.dtype != DType::F16);
     let (args, ptrs) = ptx::args(&names(spec, false));
     let vec = vec && matches!(spec.dtype, DType::F16 | DType::F32);
-    let kv_items = if vec { BK * dm.d / 8 } else { BK * dm.d };
+    let kv_items = if vec { dm.bk * dm.d / 8 } else { dm.bk * dm.d };
+    let smem = if dm.precise { 2 * lo_off(&dm) } else { 2 * dm.kv };
     let s = |x: usize| x.to_string();
     template::fill(
         KERNEL,
         &[
             ("ARGS", &args),
             ("PTRS", &ptrs),
-            ("SMEM", &s(2 * dm.kv)),
+            ("SMEM", &s(smem)),
+            ("BK", &s(dm.bk)),
             ("REGS", &regs(&dm)),
             ("D", &s(dm.d)),
             ("LD", &s(dm.ld)),

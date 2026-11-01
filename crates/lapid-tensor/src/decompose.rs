@@ -11,7 +11,7 @@ use crate::error::Result;
 use crate::op::{Op, UnaryOp};
 use crate::tensor::Tensor;
 
-/// Decompose a composite node (Softmax / LayerNorm / Attention / MatMulId with float experts /
+/// Decompose a composite node (Softmax / LayerNorm / RmsNorm / Attention / MatMulId with float experts /
 /// GatedDeltaNet) into an equivalent
 /// subgraph of primitives. Returns `None` for non-composite nodes.
 pub fn decompose(node: &Tensor) -> Result<Option<Tensor>> {
@@ -24,6 +24,10 @@ pub fn decompose(node: &Tensor) -> Result<Option<Tensor>> {
         Op::LayerNorm { eps } => {
             expect_srcs(node, 3)?;
             layer_norm(&src[0], &src[1], &src[2], *eps)?
+        }
+        Op::RmsNorm { eps } => {
+            expect_srcs(node, 2)?;
+            rms_norm(&src[0], &src[1], *eps)?
         }
         Op::Attention { scale, causal, has_mask } => {
             expect_srcs(node, if *has_mask { 4 } else { 3 })?;
@@ -70,6 +74,13 @@ fn layer_norm(x: &Tensor, w: &Tensor, b: &Tensor, eps: f32) -> Result<Tensor> {
     let var = xc.mul(&xc)?.mean(-1, true)?;
     let inv = var.add_scalar(f64::from(eps))?.unary(UnaryOp::Rsqrt)?;
     xc.mul(&inv)?.mul(&w.cast(DType::F32)?)?.add(&b.cast(DType::F32)?)
+}
+
+fn rms_norm(x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
+    let x = x.cast(DType::F32)?;
+    let ms = x.mul(&x)?.mean(-1, true)?;
+    let inv = ms.add_scalar(f64::from(eps))?.unary(UnaryOp::Rsqrt)?;
+    x.mul(&inv)?.mul(&w.cast(DType::F32)?)
 }
 
 /// softmax(q @ k^T * scale + mask [+ causal]) @ v.

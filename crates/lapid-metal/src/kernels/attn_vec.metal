@@ -7,13 +7,15 @@
 // writes (m, l, o[D]) to scratch and `attn_merge` combines the splits.
 //
 // D (head dim), LK (lanes per key: 8 when D % 32 == 0, else 1) and G (key groups of the
-// P V reduction) are compile-time constants.
+// P V reduction) are compile-time constants; WIDE (D / KS, only when D % KS == 0) selects
+// the multi-column P V loop for large head dims (256, 512).
 // P: [0] sq, [1] sk, [2] scale (f32 bits), [3] heads, then rank-4 views over [B, H, S, D]
 //    (offset, s0, s1, s2, s3): [4] q, [9] k, [14] v, [19] mask (over [B, H, Sq, Sk]);
 //    [24] splits.
 #define D {{D}}
 #define G {{G}}
 #define LK {{LK}}
+#define WIDE {{WIDE}}
 #define DL (D / LK)
 #define KPS (32 / LK)
 #define KS 128
@@ -96,6 +98,27 @@ kernel void lapid_kernel(
     const float l = tg_sum(p, red, lane, sg, 4);
 
     const uint nk = min(uint(KS), sk - min(sk, k0));
+// #if WIDE
+    // D a multiple of KS (G = 1): WIDE = D / KS independent columns per thread, keys outer
+    // (independent accumulator chains instead of one long dependent chain per column).
+    {
+        float o[WIDE];
+        for (uint i = 0; i < WIDE; i++) {
+            o[i] = 0.0f;
+        }
+        for (uint j = 0; j < nk; j++) {
+            const float pj = ps[j];
+            const uint vr = vb + (k0 + j) * P[17];
+            for (uint i = 0; i < WIDE; i++) {
+                o[i] = fma(pj, ldv(v, vr + (tid + i * KS) * P[18]), o[i]);
+            }
+        }
+        for (uint i = 0; i < WIDE; i++) {
+            part[tid + i * KS] = o[i];
+        }
+    }
+// #endif
+// #if !WIDE
     for (uint e = tid; e < G * D; e += KS) {
         const uint g = e / D;
         const uint c = e - g * D;
@@ -105,6 +128,7 @@ kernel void lapid_kernel(
         }
         part[e] = o;
     }
+// #endif
     threadgroup_barrier(mem_flags::mem_threadgroup);
 // #if DIRECT
     const float inv = l > 0.0f ? 1.0f / l : 0.0f;

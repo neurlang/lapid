@@ -170,6 +170,7 @@ static inline void argmax_simd(thread uint& bk, thread uint& bi) {
 
 // Layer norm over contiguous [rows, cols] with weight / bias [cols]; one threadgroup per row.
 // Two-pass (mean, then centered variance). P: [0] rows, [1] cols, [2] eps (f32 bits).
+// RMS: x * rsqrt(mean(x^2) + eps) * w (no mean, no bias).
 kernel void lapid_kernel(
     constant uint* P [[buffer(0)]],
     device const float* x [[buffer(1)]],

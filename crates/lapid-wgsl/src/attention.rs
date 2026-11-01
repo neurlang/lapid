@@ -19,7 +19,8 @@ use super::{Key, Params, Plan, bad, check_plain, grid, grid_threads, template};
 use crate::Caps;
 
 const TILE_Q: usize = 64;
-const ROW_MAX_D: usize = 256;
+/// Head dims above 256 run DC = ceil(D / 256) passes per thread in the split kernel.
+const ROW_MAX_D: usize = 1024;
 
 pub(super) fn plan(spec: &Arc<AttentionSpec>, d: &AttentionDims, caps: &Caps) -> Result<Plan> {
     check_plain(spec.dtype, "attention q/k/v")?;

@@ -121,10 +121,10 @@ fn matmul_case(m: usize, n: usize, k: usize, b: DType, epi: Option<Expr>) -> Cas
     }
 }
 
-fn attention_case(sq: usize, sk: usize, encoder: bool) -> Case {
-    let (h, d) = (12usize, 64usize);
+fn attention_case(sq: usize, sk: usize, encoder: bool, dt: DType, d: usize) -> Case {
+    let h = 12usize;
     let spec = Arc::new(AttentionSpec {
-        dtype: DType::F32,
+        dtype: dt,
         mask_dtype: None,
         causal: false,
         out_dtype: DType::F32,
@@ -133,18 +133,18 @@ fn attention_case(sq: usize, sk: usize, encoder: bool) -> Case {
         // [1500, 12, 64] activations viewed as [B, H, S, D]
         let v = View {
             offset: 0,
-            strides: vec![0, 64, 768, 1],
+            strides: vec![0, d as isize, (h * d) as isize, 1],
         };
         (v.clone(), v)
     } else {
         (
             View {
                 offset: 0,
-                strides: vec![0, 64, 0, 1],
+                strides: vec![0, d as isize, 0, 1],
             },
             View {
                 offset: 0,
-                strides: vec![(h * sk * d) as isize, (sk * d) as isize, 64, 1],
+                strides: vec![(h * sk * d) as isize, (sk * d) as isize, d as isize, 1],
             },
         )
     };
@@ -154,20 +154,21 @@ fn attention_case(sq: usize, sk: usize, encoder: bool) -> Case {
         sq,
         sk,
         d,
-        scale: 0.125f32.to_bits(),
+        scale: (1.0 / (d as f32).sqrt()).to_bits(),
         q: qv,
         k: kv.clone(),
         v: kv,
         mask: None,
     };
+    let es = dt.size();
     let sizes = vec![
-        h * sq * d * 4,
-        h * sk * d * 4,
-        h * sk * d * 4,
+        h * sq * d * es,
+        h * sk * d * es,
+        h * sk * d * es,
         h * sq * d * 4,
     ];
     Case {
-        name: format!("attention sq={sq} sk={sk}"),
+        name: format!("attention sq={sq} sk={sk} d={d} {}", dt.name()),
         launch: Launch {
             kernel: Kernel::Attention(spec, dims),
             inputs: vec![0, 1, 2],
@@ -287,11 +288,32 @@ fn cases() -> Vec<Case> {
         v.push(moe_case(1, 8, 128, 768, 2048, w));
         v.push(moe_case(512, 8, 128, 768, 2048, w));
     }
+    // Qwen3.5-35B-A3B MoE (256 experts, top-8, hidden 2048, expert ffn 512)
+    for w in [DType::Q4K, DType::Q5K, DType::Q6K, DType::Int8] {
+        v.push(moe_case(1, 8, 256, 512, 2048, w));
+        v.push(moe_case(1, 8, 256, 2048, 512, w));
+        v.push(moe_case(512, 8, 256, 512, 2048, w));
+    }
+    // Qwen3.5-0.8B prefill GEMMs (m = 512)
+    for b in [DType::Q4K, DType::Q6K, DType::Int8, DType::F16] {
+        for (n, k) in [(3584, 1024), (1024, 3584), (6144, 1024), (248320, 1024)] {
+            let mut c = matmul_case(512, n, k, b, None);
+            c.name = format!("q35 {}", c.name);
+            v.push(c);
+        }
+    }
     v.push(gdn_case(1, 32, 128));
     v.push(gdn_case(512, 32, 128));
-    v.push(attention_case(1500, 1500, true));
-    v.push(attention_case(1, 1500, false));
-    v.push(attention_case(1, 24, false));
+    for dt in [DType::F32, DType::F16] {
+        v.push(attention_case(1500, 1500, true, dt, 64));
+        v.push(attention_case(512, 512, true, dt, 128));
+    }
+    v.push(attention_case(1, 1500, false, DType::F32, 64));
+    v.push(attention_case(1, 24, false, DType::F32, 64));
+    v.push(attention_case(1, 1024, false, DType::F32, 512));
+    v.push(attention_case(512, 512, true, DType::F32, 512));
+    v.push(attention_case(512, 512, true, DType::F32, 256));
+    v.push(attention_case(1, 1024, false, DType::F32, 256));
     v.push(layer_norm_case(1));
     v.push(layer_norm_case(1500));
     v

@@ -1,6 +1,6 @@
 // Layer norm over rows, one 256-thread block per row (two-pass mean / variance; the row
 // is re-read per pass, which hits L1 for model-sized rows).
-// Params: [rows, cols, eps_bits]
+// Params: [rows, cols, eps_bits]. Flag RMS: RMS norm (no mean, no bias): x * rsqrt(mean(x^2) + eps) * w.
 .shared .align 16 .f32 red[8];
 
 .visible .entry lapid_main(
@@ -22,6 +22,10 @@
 
     mov.f32 %sum, 0f00000000;
     mov.u32 %j, %tx;
+// #if RMS
+    mov.f32 %mean, 0f00000000;
+    bra MEAN_SKIP;
+// #endif
 MEAN_LOOP:
     setp.ge.u32 %p, %j, %cols;
     @%p bra MEAN_DONE;
@@ -33,6 +37,7 @@ MEAN_LOOP:
 MEAN_DONE:
 {{REDUCE_SUM}}
     div.rn.f32 %mean, %sum, %fcols;
+MEAN_SKIP:
     mov.f32 %sq, 0f00000000;
     mov.u32 %j, %tx;
 VAR_LOOP:
@@ -57,9 +62,15 @@ OUT_LOOP:
     add.u32 %idx, %base, %j;
 {{LOAD_X}}
 {{LOAD_WB}}
+// #if RMS
+    mul.f32 %d, %x, %rstd;
+    mul.f32 %y, %d, %w;
+// #endif
+// #if !RMS
     sub.f32 %d, %x, %mean;
     mul.f32 %d, %d, %rstd;
     fma.rn.f32 %y, %d, %w, %b;
+// #endif
 {{STORE}}
     add.u32 %j, %j, 256;
     bra OUT_LOOP;

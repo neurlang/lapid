@@ -4,7 +4,8 @@
 // conflict-free for ldmatrix). Per tile: S = Q K^T (mma.sync m16n8k16, f32), online
 // softmax on the S fragments (base-2 exponent, scale * log2 e folded in), P re-packed
 // as f16 A fragments in registers, O += P V (V fragments via ldmatrix.trans).
-// Head dim D is baked in (multiple of 16, <= 128).
+// Head dim D is baked in (multiple of 16, <= 128). f32 inputs use the precise variant
+// (flash.rs: hi/lo f16 splits of Q, K, V and P, three mmas per product, BK keys per tile).
 // Grid: (q_blocks, B * H).
 // Params: [B, H, sq, sk, d, scale_bits, q_blocks, q(off, s0..s3), k(..), v(..), mask(..)?]
 .shared .align 16 .b8 smem[{{SMEM}}];
@@ -172,7 +173,7 @@ KV_LD_DONE:
 {{SOFTMAX}}
 {{PV}}
     bar.sync 0;
-    add.u32 %kt0, %kt0, 64;
+    add.u32 %kt0, %kt0, {{BK}};
     bra KV_LOOP;
 KV_DONE:
 {{FINAL}}

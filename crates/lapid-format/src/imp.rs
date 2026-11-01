@@ -94,9 +94,15 @@ pub(crate) fn expected_nbytes(dtype: DType, shape: &[usize]) -> Result<u64> {
     for &d in shape {
         n = n.checked_mul(d as u64).ok_or_else(|| fmt_err(format!("shape {shape:?} overflows")))?;
     }
-    if dtype.is_quant() {
-        if shape.len() != 2 || shape[1] == 0 || shape[1] % 32 != 0 {
-            bail!("format", "quantized tensor ({}) must be 2-D with cols % 32 == 0, got {shape:?}", dtype.name());
+    if let Some(q) = dtype.quant_format() {
+        let block = q.block_elems();
+        let cols = shape.last().copied().unwrap_or(0);
+        if !(shape.len() == 2 || shape.len() == 3) || cols == 0 || cols % block != 0 {
+            bail!(
+                "format",
+                "quantized tensor ({}) must be 2-D (or a 3-D expert stack) with cols % {block} == 0, got {shape:?}",
+                dtype.name()
+            );
         }
         if n > (1u64 << 48) {
             bail!("format", "quantized tensor shape {shape:?} too large");
@@ -250,13 +256,24 @@ pub(crate) fn check_disjoint(ranges: &mut Vec<(u64, u64, String)>) -> Result<()>
     Ok(())
 }
 
-/// Block size of quantized tensors written by this version (and the only one supported).
+/// Block size of int8/int4 tensors written by this version (and the only one supported).
 pub(crate) const QUANT_BLOCK_SIZE: u32 = 32;
+
+/// `block_size` written for a quantized dtype: 32 for int8/int4, the super-block (256) for
+/// the k-quants.
+pub(crate) fn block_size_of(dtype: DType) -> Option<u32> {
+    dtype.quant_format().map(|q| if q.is_aos() { q.block_elems() as u32 } else { QUANT_BLOCK_SIZE })
+}
 
 /// Quantized tensors carry `block_size` 32 (other sizes: "unsupported"; files written
 /// before the attribute existed omit it and mean 32 — normalized here); non-quantized
-/// tensors must not carry one.
+/// tensors must not carry one. K-quant dtypes fix their block structure: any value (older
+/// writers emitted 32) is read as 256.
 fn check_block_size(t: &mut TensorInfo) -> Result<()> {
+    if t.dtype.quant_format().is_some_and(|q| q.is_aos()) {
+        t.block_size = block_size_of(t.dtype);
+        return Ok(());
+    }
     match (t.dtype.is_quant(), t.block_size) {
         (true, Some(QUANT_BLOCK_SIZE)) | (false, None) => Ok(()),
         (true, None) => {
@@ -448,7 +465,7 @@ impl WriterState {
             offset,
             nbytes: want,
             hash: blake3::hash(bytes).to_hex().to_string(),
-            block_size: dtype.is_quant().then_some(QUANT_BLOCK_SIZE),
+            block_size: block_size_of(dtype),
         });
         self.names.insert(name.to_string());
         Ok(())

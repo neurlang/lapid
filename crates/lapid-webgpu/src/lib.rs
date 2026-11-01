@@ -115,6 +115,13 @@ impl WebGpuBackend {
         self.pipelines.len()
     }
 
+    /// Lower the storage binding limit below the adapter's (tests: forces split launches).
+    #[doc(hidden)]
+    pub fn set_binding_limit(&self, limit: Option<u64>) -> Result<()> {
+        self.lock_exec()?.binding_limit = limit;
+        Ok(())
+    }
+
     fn lock_exec(&self) -> Result<std::sync::MutexGuard<'_, Exec>> {
         self.exec.lock().map_err(|_| Error::new("webgpu", "execution state poisoned"))
     }

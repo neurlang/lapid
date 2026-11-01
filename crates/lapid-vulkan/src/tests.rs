@@ -126,6 +126,7 @@ fn all_keys() -> Vec<Key> {
     }
     keys.push(Key::Softmax(Arc::new(SoftmaxSpec { in_dtype: DType::F16, out_dtype: DType::F32 })));
     keys.push(Key::LayerNorm(Arc::new(LayerNormSpec { in_dtype: DType::F32, param_dtype: DType::F32, out_dtype: DType::F16 })));
+    keys.push(Key::RmsNorm(Arc::new(LayerNormSpec { in_dtype: DType::F16, param_dtype: DType::F32, out_dtype: DType::F16 })));
     for causal in [false, true] {
         for mask in [None, Some(DType::F32)] {
             let s = Arc::new(AttentionSpec { dtype: DType::F16, mask_dtype: mask, causal, out_dtype: DType::F32 });
@@ -439,6 +440,10 @@ fn gather_plain_and_quantized() {
     }
 }
 
+fn dims_rms(rows: usize, cols: usize, eps: f32) -> LayerNormDims {
+    LayerNormDims { rows, cols, eps: eps.to_bits() }
+}
+
 #[test]
 fn softmax_and_layer_norm() {
     let Some(be) = backend() else { return };
@@ -473,6 +478,15 @@ fn softmax_and_layer_norm() {
         want.extend(row.iter().enumerate().map(|(j, v)| (v - mean) * rstd * w[j] + bias[j]));
     }
     assert_close(&out, &want, 1e-5, "layer_norm");
+    let spec = Arc::new(LayerNormSpec { in_dtype: DType::F32, param_dtype: DType::F32, out_dtype: DType::F32 });
+    let out = from_f32b(&run(&be, Kernel::RmsNorm(spec, dims_rms(rows, cols, eps)), &[f32b(&x), f32b(&w)], rows * cols * 4));
+    let mut want = Vec::new();
+    for r in 0..rows {
+        let row = &x[r * cols..(r + 1) * cols];
+        let rstd = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / cols as f32 + eps).sqrt();
+        want.extend(row.iter().enumerate().map(|(j, v)| v * rstd * w[j]));
+    }
+    assert_close(&out, &want, 1e-5, "rms_norm");
     }
 }
 

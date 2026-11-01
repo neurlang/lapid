@@ -243,6 +243,18 @@ fn softmax_and_layer_norm() {
             let want: Vec<f32> = (0..cols).map(|c| ((row[c] as f64 - mean) * rstd * wr[c] as f64 + br[c] as f64) as f32).collect();
             close(&got[r * cols..(r + 1) * cols], &want, 1e-4);
         }
+
+        let spec = Arc::new(LayerNormSpec { in_dtype: DType::F32, param_dtype: DType::F16, out_dtype: DType::F32 });
+        let dims = LayerNormDims { rows, cols, eps: 1e-6f32.to_bits() };
+        let out = run(&be, Kernel::RmsNorm(spec, dims), vec![up(&be, &xs, DType::F32), up(&be, &w, DType::F16)], rows * cols * 4);
+        let got = down(&be, &out, DType::F32);
+        for r in 0..rows {
+            let row = &xs[r * cols..(r + 1) * cols];
+            let ms = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / cols as f64;
+            let rstd = 1.0 / (ms + 1e-6).sqrt();
+            let want: Vec<f32> = (0..cols).map(|c| (row[c] as f64 * rstd * wr[c] as f64) as f32).collect();
+            close(&got[r * cols..(r + 1) * cols], &want, 1e-4);
+        }
     }
 }
 

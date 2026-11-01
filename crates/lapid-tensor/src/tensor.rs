@@ -413,6 +413,12 @@ impl Tensor {
     pub fn layer_norm(&self, weight: &Tensor, bias: &Tensor, eps: f32) -> Result<Tensor> {
         self.layer_norm_impl(weight, bias, eps)
     }
+
+    /// RMS norm over the last axis: `x * rsqrt(mean(x^2) + eps) * weight` (f32 math, result in
+    /// x's dtype). `weight` is `[D]`, float.
+    pub fn rms_norm(&self, weight: &Tensor, eps: f32) -> Result<Tensor> {
+        self.rms_norm_impl(weight, eps)
+    }
     /// q [B,H,Sq,D], k/v [B,H,Sk,D]; mask optional additive.
     pub fn attention(
         q: &Tensor,

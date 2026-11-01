@@ -177,6 +177,7 @@ pub(crate) fn all_keys() -> Vec<Key> {
     }
     keys.push(Key::Softmax(Arc::new(SoftmaxSpec { in_dtype: DType::F16, out_dtype: DType::F32 })));
     keys.push(Key::LayerNorm(Arc::new(LayerNormSpec { in_dtype: DType::F32, param_dtype: DType::F32, out_dtype: DType::F16 })));
+    keys.push(Key::RmsNorm(Arc::new(LayerNormSpec { in_dtype: DType::F16, param_dtype: DType::F32, out_dtype: DType::F16 })));
     for causal in [false, true] {
         for mask in [None, Some(DType::F32)] {
             let s = Arc::new(AttentionSpec { dtype: DType::F16, mask_dtype: mask, causal, out_dtype: DType::F32 });

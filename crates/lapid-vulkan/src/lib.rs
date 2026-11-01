@@ -39,6 +39,8 @@ mod tests_ops;
 mod tests_attn;
 #[cfg(test)]
 mod tests_kquant;
+#[cfg(test)]
+mod tests_split;
 
 use std::sync::{Arc, Mutex};
 
@@ -80,6 +82,13 @@ pub struct VulkanBackend {
 }
 
 impl VulkanBackend {
+    /// Lower the storage binding limit below the device's (tests: forces split launches).
+    #[doc(hidden)]
+    pub fn set_binding_limit(&self, limit: Option<u64>) -> Result<()> {
+        self.lock_exec()?.binding_limit = limit;
+        Ok(())
+    }
+
     /// Open adapter `index` (index into `adapters()`).
     pub fn new(index: usize) -> Result<VulkanBackend> {
         let shared = context::shared_device(index)?;

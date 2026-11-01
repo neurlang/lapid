@@ -212,6 +212,31 @@ fn layer_norm_rows() {
 }
 
 #[test]
+fn rms_norm_rows() {
+    let Some(be) = backend() else { return };
+    let cases = [(7usize, 2048usize, DType::F32, DType::F16), (3, 50, DType::F32, DType::F32), (5, 256, DType::F16, DType::F32), (1, 3000, DType::F32, DType::F32)];
+    for &(rows, cols, xdt, out) in &cases {
+        let x = round_to(xdt, &rand(rows * cols, 16).iter().map(|v| v * 3.0 + 0.5).collect::<Vec<_>>());
+        let w = rand(cols, 17);
+        let eps = 1e-6f32;
+        let spec = Arc::new(LayerNormSpec { in_dtype: xdt, param_dtype: DType::F32, out_dtype: out });
+        let dims = LayerNormDims { rows, cols, eps: eps.to_bits() };
+        let ins = [encode(xdt, &x), encode(DType::F32, &w)];
+        let got = decode(out, &run(&be, Kernel::RmsNorm(spec, dims), &ins, rows * cols * out.size()), rows * cols);
+        let mut want = vec![0f32; rows * cols];
+        for r in 0..rows {
+            let row = &x[r * cols..(r + 1) * cols];
+            let ms = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / cols as f64;
+            for c in 0..cols {
+                want[r * cols + c] = (row[c] as f64 / (ms + eps as f64).sqrt() * w[c] as f64) as f32;
+            }
+        }
+        let tol = if out == DType::F32 { 1e-5 } else { 2e-3 };
+        assert_close(&format!("rms_norm {rows}x{cols}"), &got, &round_to(out, &want), tol);
+    }
+}
+
+#[test]
 fn gather_all_tables() {
     let Some(be) = backend() else { return };
     let (rows, cols) = (50usize, 96usize);

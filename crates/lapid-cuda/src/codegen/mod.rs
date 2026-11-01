@@ -56,7 +56,8 @@ pub(crate) enum Key {
     Gemv(Arc<MatMulSpec>, bool, bool, u32),
     Gather(Arc<GatherSpec>),
     Softmax(Arc<SoftmaxSpec>),
-    LayerNorm(Arc<LayerNormSpec>),
+    /// Layer norm; `true` = RMS norm (inputs [x, w]).
+    LayerNorm(Arc<LayerNormSpec>, bool),
     /// Few queries, split over key chunks; `true` = one chunk, writes the output directly
     /// (no merge stage); head dim baked in (<= 256).
     AttnSplit(Arc<AttentionSpec>, bool, u32),
@@ -92,7 +93,7 @@ impl Key {
             Key::GemvId(..) | Key::MoeRoute | Key::GemmMmaId(..) => 3,
             Key::Gdn(..) => 6,
             Key::Softmax(_) => 1,
-            Key::LayerNorm(_) => 3,
+            Key::LayerNorm(_, rms) => 3 - *rms as usize,
             Key::AttnSplit(s, ..) | Key::AttnMerge(s) | Key::AttnMma(s, ..) => {
                 3 + s.mask_dtype.is_some() as usize
             }
@@ -153,7 +154,8 @@ impl Key {
             Key::Gemv(..) => "gemv",
             Key::Gather(_) => "gather",
             Key::Softmax(_) => "softmax",
-            Key::LayerNorm(_) => "layer_norm",
+            Key::LayerNorm(_, false) => "layer_norm",
+            Key::LayerNorm(_, true) => "rms_norm",
             Key::AttnSplit(..) => "attention_split",
             Key::AttnMerge(_) => "attention_merge",
             Key::AttnMma(..) => "attention_mma",
@@ -209,7 +211,8 @@ pub(crate) fn plan(kernel: &Kernel, caps: &Caps) -> Result<Plan> {
         Kernel::MatMul(s, d) => matmul::plan(s, d, caps),
         Kernel::Gather(s, d) => rows::plan_gather(s, d, caps),
         Kernel::Softmax(s, d) => rows::plan_softmax(s, d, caps),
-        Kernel::LayerNorm(s, d) => rows::plan_layer_norm(s, d, caps),
+        Kernel::LayerNorm(s, d) => rows::plan_layer_norm(s, d, caps, false),
+        Kernel::RmsNorm(s, d) => rows::plan_layer_norm(s, d, caps, true),
         Kernel::Attention(s, d) => attention::plan(s, d, caps),
         Kernel::GatherAxis(s, d) => index::plan_gather_axis(s, d, caps),
         Kernel::TopK(s, d) => index::plan_topk(s, d, caps),
@@ -247,7 +250,7 @@ pub(crate) fn source(key: &Key, _caps: &Caps) -> String {
         Key::Gdn(s, dk) => gdn::source(s, *dk as usize),
         Key::Gather(s) => rows::source_gather(s),
         Key::Softmax(s) => rows::source_softmax(s),
-        Key::LayerNorm(s) => rows::source_layer_norm(s),
+        Key::LayerNorm(s, rms) => rows::source_layer_norm(s, *rms),
         Key::AttnSplit(s, direct, d) => attention::source_split(s, *direct, *d),
         Key::AttnMerge(s) => attention::source_merge(s),
         Key::AttnMma(s, d, vec) => flash::source(s, *d, *vec),

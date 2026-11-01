@@ -1,5 +1,6 @@
 // Layer norm over contiguous [rows, cols] with weight / bias [cols]; one threadgroup per row.
 // Two-pass (mean, then centered variance). P: [0] rows, [1] cols, [2] eps (f32 bits).
+// RMS: x * rsqrt(mean(x^2) + eps) * w (no mean, no bias).
 kernel void lapid_kernel(
     constant uint* P [[buffer(0)]],
 {{BINDINGS}}    uint tg [[threadgroup_position_in_grid]],
@@ -17,6 +18,18 @@ kernel void lapid_kernel(
     const float inv_n = 1.0f / float(cols);
     for (uint r = tg; r < rows; r += ntg) {
         const uint base = r * cols;
+// #if RMS
+        float s2 = 0.0f;
+        for (uint j = tid; j < cols; j += tgsize) {
+            const float d = ldv(x, base + j);
+            s2 = fma(d, d, s2);
+        }
+        const float rstd = rsqrt(tg_sum(s2, red, lane, sg, nsg) * inv_n + eps);
+        for (uint j = tid; j < cols; j += tgsize) {
+            stv(out, base + j, ldv(x, base + j) * rstd * ldv(w, j));
+        }
+// #endif
+// #if !RMS
         float s = 0.0f;
         for (uint j = tid; j < cols; j += tgsize) {
             s += ldv(x, base + j);
@@ -32,5 +45,6 @@ kernel void lapid_kernel(
             const float y = (ldv(x, base + j) - mean) * rstd;
             stv(out, base + j, fma(y, ldv(w, j), ldv(b, j)));
         }
+// #endif
     }
 }

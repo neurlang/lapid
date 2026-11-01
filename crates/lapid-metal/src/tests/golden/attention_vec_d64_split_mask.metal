@@ -177,13 +177,15 @@ static inline void argmax_simd(thread uint& bk, thread uint& bi) {
 // writes (m, l, o[D]) to scratch and `attn_merge` combines the splits.
 //
 // D (head dim), LK (lanes per key: 8 when D % 32 == 0, else 1) and G (key groups of the
-// P V reduction) are compile-time constants.
+// P V reduction) are compile-time constants; WIDE (D / KS, only when D % KS == 0) selects
+// the multi-column P V loop for large head dims (256, 512).
 // P: [0] sq, [1] sk, [2] scale (f32 bits), [3] heads, then rank-4 views over [B, H, S, D]
 //    (offset, s0, s1, s2, s3): [4] q, [9] k, [14] v, [19] mask (over [B, H, Sq, Sk]);
 //    [24] splits.
 #define D 64
 #define G 2
 #define LK 8
+#define WIDE 0
 #define DL (D / LK)
 #define KPS (32 / LK)
 #define KS 128

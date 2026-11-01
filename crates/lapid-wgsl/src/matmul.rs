@@ -374,6 +374,43 @@ fn b_coop_slots(spec: &MatMulSpec) -> (String, String, String) {
     }
 }
 
+/// Grouped MoE GEMM (`Key::GemmIdCoop`): the coopmat GEMM with the `ID` flag; quantized
+/// weights are addressed from the expert's base word `g_eb`.
+pub(super) fn source_coop_id(spec: &lapid_compiler::MatMulIdSpec, caps: &Caps) -> String {
+    let ms = MatMulSpec { a_dtype: spec.x_dtype, b_dtype: spec.w_dtype, b_transposed: true, extra_dtypes: vec![], out_dtype: spec.out_dtype, epilogue: None };
+    let mut bindings = common::input(1, "a", ms.a_dtype, caps);
+    bindings.push_str(&b_binding(&ms, caps));
+    bindings.push_str(&common::output(4, ms.out_dtype, caps));
+    let (bm, bn) = (COOP_BM.to_string(), COOP_BN.to_string());
+    let (as_size, bs_size) = ((COOP_BM * (COOP_BK + 8)).to_string(), (COOP_BN * (COOP_BK + 8)).to_string());
+    let bk = COOP_BK.to_string();
+    let (b_regs, b_load, b_store) = b_coop_slots(&ms);
+    let b_load = if ms.b_dtype.is_quant() {
+        b_load.replace("let bb = (", "let bb = g_eb * 4u + (").replace("b_scale(P[10]", "b_scale(g_eb + P[10]").replace("b[(gj * K", "b[g_eb + (gj * K")
+    } else {
+        b_load
+    };
+    template::module(
+        caps,
+        GEMM_COOP,
+        &[
+            ("BINDINGS", &bindings),
+            ("BM", &bm),
+            ("BN", &bn),
+            ("AS_SIZE", &as_size),
+            ("BS_SIZE", &bs_size),
+            ("BK", &bk),
+            ("B_REGS", &b_regs),
+            ("B_LOAD", &b_load),
+            ("B_STORE", &b_store),
+            ("EPILOGUE", ""),
+        ],
+        &["COOPMAT", "ID"],
+        256,
+        true,
+    )
+}
+
 /// Workgroup tile (BM, BN) of the coopmat GEMM; (BM / 32) * (BN / 32) == 8 subgroups.
 pub(super) const COOP_BM: usize = 64;
 pub(super) const COOP_BN: usize = 128;

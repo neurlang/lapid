@@ -115,6 +115,46 @@ pub(crate) fn layer_norm(
     Ok(())
 }
 
+/// x * rsqrt(mean(x^2) + eps) * w per row.
+pub(crate) fn rms_norm(ctx: &Ctx, dims: &LayerNormDims, x: &Src, w: &Src, out: &Dst) -> Result<()> {
+    let (rows, cols) = (dims.rows, dims.cols);
+    let n = rows * cols;
+    if n == 0 {
+        return Ok(());
+    }
+    need("rms_norm input", x.len(), n)?;
+    need("rms_norm weight", w.len(), cols)?;
+    need("rms_norm output", out.len(), n)?;
+    let eps = f32::from_bits(dims.eps);
+    let mut wf = vec![0f32; cols];
+    w.load_contig(0, &mut wf);
+    let inv_n = 1.0 / cols as f32;
+    let (per, tasks) = row_tasks(rows, cols);
+    par::for_each(n >= PAR_MIN_ELEMS && ctx.threads > 1, tasks, || vec![0f32; cols], |buf, t| {
+        for r in t * per..((t + 1) * per).min(rows) {
+            x.load_contig(r * cols, buf);
+            let mut acc = [0f32; 8];
+            let mut chunks = buf.chunks_exact(8);
+            for c in &mut chunks {
+                for l in 0..8 {
+                    acc[l] = math::fmadd(c[l], c[l], acc[l]);
+                }
+            }
+            for (l, &v) in chunks.remainder().iter().enumerate() {
+                acc[l] += v * v;
+            }
+            let ms = acc.iter().sum::<f32>() * inv_n;
+            let rstd = 1.0 / (ms + eps).sqrt();
+            for (v, &g) in buf.iter_mut().zip(&wf) {
+                *v = *v * rstd * g;
+            }
+            // SAFETY: each task writes its own rows.
+            unsafe { out.store(r * cols, 1, buf) };
+        }
+    });
+    Ok(())
+}
+
 /// Gather table: plain typed rows or a quantized matrix.
 pub(crate) enum Table<'a> {
     Plain(Src<'a>),

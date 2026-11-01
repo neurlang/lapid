@@ -75,6 +75,7 @@ fn op_code(op: &Op) -> u64 {
         Op::WriteSlice { .. } => 23,
         Op::MatMulId => 24,
         Op::GatedDeltaNet { .. } => 25,
+        Op::RmsNorm { .. } => 26,
     }
 }
 
@@ -150,7 +151,7 @@ impl GraphKey {
                 }
                 Op::Cat { axis } => w.push(*axis as u64),
                 Op::MatMul { b_transposed } => w.push(*b_transposed as u64),
-                Op::LayerNorm { eps } => w.push(eps.to_bits() as u64),
+                Op::LayerNorm { eps } | Op::RmsNorm { eps } => w.push(eps.to_bits() as u64),
                 Op::Attention { scale, causal, has_mask } => {
                     w.extend([scale.to_bits() as u64, *causal as u64, *has_mask as u64])
                 }

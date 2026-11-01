@@ -174,3 +174,19 @@ fn attention_kv_cache_layout() {
         }
     }
 }
+
+#[test]
+fn attention_large_head_dims() {
+    // Gemma 4 full-attention layers: head dim 512 (plus 256 and an odd 320)
+    let Some(be) = backend() else { return };
+    let mut n = 300;
+    for &d in &[256usize, 320, 512] {
+        for &(sq, sk) in &[(1usize, 1usize), (1, 700), (37, 37), (20, 90)] {
+            for &(causal, mask) in &[(true, false), (false, true)] {
+                let f16 = n % 2 == 0;
+                run_case(&be, Case { b: 1, h: 2, sq, sk, d, causal, mask, f16, cache: sq == 1 }, n);
+                n += 1;
+            }
+        }
+    }
+}

@@ -5,7 +5,7 @@
 //!   (`Key::GemvId`), out-of-range ids raise the status flag;
 //! - otherwise two stages: `kernels/moe_route.metal` buckets the pairs by expert into scratch,
 //!   then a grouped GEMM (`Key::GemmId`, grid z = expert) reads each expert's weights once per
-//!   64 routed rows.
+//!   64 routed rows (grid y sized for 4x the average rows per expert; threadgroups loop).
 //!
 //! GatedDeltaNet: `kernels/gated_delta_net.metal`, one simdgroup per state column.
 
@@ -91,12 +91,20 @@ pub(super) fn plan_matmul_id(s: &Arc<MatMulIdSpec>, d: &MatMulIdDims) -> Result<
     let gemm = Stage {
         key: Key::GemmId(ms),
         params: p.0,
-        groups: [dim(d.n.div_ceil(TILE))?, dim(pairs.div_ceil(TILE))?, dim(d.e)?],
+        groups: [dim(d.n.div_ceil(TILE))?, dim(id_row_groups(pairs, d.e))?, dim(d.e)?],
         threads: 128,
         binds: vec![Bind::Input(0), Bind::Input(1), Bind::Output, Bind::Scratch],
     };
     let scratch = (d.e + d.e * pairs) * 4;
     Ok(Plan { stages: vec![route, gemm], scratch })
+}
+
+/// Row-tile threadgroups per expert of the routed GEMM: 4x the average tile count (each
+/// threadgroup loops over the expert's tiles with this stride), so few empty threadgroups
+/// launch when the pairs spread over many experts; an expert with more rows loops.
+fn id_row_groups(pairs: usize, e: usize) -> usize {
+    let avg = pairs.div_ceil(e.max(1));
+    (4 * avg).div_ceil(TILE).clamp(1, pairs.div_ceil(TILE).max(1))
 }
 
 pub(super) fn source_route() -> String {

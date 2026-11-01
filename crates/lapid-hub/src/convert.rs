@@ -33,7 +33,12 @@ enum Architecture {
     Lfm3,
     Phonon,
     Qwen35,
+    Deepseek4,
+    Qwen4Exp,
     Gemma4,
+    Llama,
+    Gemma4Moe,
+    Qwen3Vl,
 }
 
 fn classify(src: &str) -> Result<Source> {
@@ -67,12 +72,23 @@ fn hf_architecture(config: &Path) -> Result<Architecture> {
         Some("gemma3_text") => Ok(Architecture::EmbeddingGemma),
         Some("parakeet_tdt") => Ok(Architecture::Parakeet),
         Some("lfm3") => Ok(Architecture::Lfm3),
+        Some("llama" | "mistral" | "qwen2" | "qwen3" | "qwen3_moe") => Ok(Architecture::Llama),
+        Some("gemma4" | "gemma4_text") if gemma4_is_moe(&cfg) => Ok(Architecture::Gemma4Moe),
         Some("gemma4" | "gemma4_text") => Ok(Architecture::Gemma4),
+        Some("qwen3_vl") => Ok(Architecture::Qwen3Vl),
         Some("gradium_phonon_tts") => Ok(Architecture::Phonon),
         Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text") => Ok(Architecture::Qwen35),
+        Some("deepseek_v4") => Ok(Architecture::Deepseek4),
+        Some("qwen4_exp" | "qwen4_exp_text") => Ok(Architecture::Qwen4Exp),
         Some(other) => bail!("unsupported_model", "{}: model_type {other:?} has no converter", config.display()),
         None => bail!("unsupported_model", "{}: no model_type", config.display()),
     }
+}
+
+/// Gemma 4 MoE variants (`enable_moe_block`) go to `gemma4moe`.
+fn gemma4_is_moe(cfg: &serde_json::Value) -> bool {
+    let text = cfg.get("text_config").unwrap_or(cfg);
+    text.get("enable_moe_block").and_then(serde_json::Value::as_bool) == Some(true)
 }
 
 /// Architecture of a ggml file. The legacy (unversioned) ggml container was only ever
@@ -92,11 +108,26 @@ fn gguf_architecture(path: &Path) -> Result<Architecture> {
     if crate::lfm3::convert::is_lfm3_gguf(&f) {
         return Ok(Architecture::Lfm3);
     }
+    if crate::llama::convert::is_llama_gguf(&f) {
+        return Ok(Architecture::Llama);
+    }
+    if crate::gemma4moe::convert::is_gemma4moe_gguf(&f) {
+        return Ok(Architecture::Gemma4Moe);
+    }
+    if crate::qwen3vl::convert::is_qwen3vl_gguf(&f) {
+        return Ok(Architecture::Qwen3Vl);
+    }
     if crate::gemma4::convert::is_gemma4_gguf(&f) {
         return Ok(Architecture::Gemma4);
     }
     if crate::qwen35::convert::is_qwen35_gguf(&f) {
         return Ok(Architecture::Qwen35);
+    }
+    if crate::deepseek4::convert::is_deepseek4_gguf(&f) {
+        return Ok(Architecture::Deepseek4);
+    }
+    if crate::qwen4exp::convert::is_qwen4exp_gguf(&f) {
+        return Ok(Architecture::Qwen4Exp);
     }
     match f.architecture() {
         Some(arch) => bail!("unsupported_model", "{}: GGUF architecture {arch:?} has no converter", path.display()),
@@ -250,6 +281,15 @@ pub fn convert_with(src: &str, dtype: &str, out: Option<&Path>, calibrate: Optio
         (Architecture::Phonon, Source::Ggml(f) | Source::Gguf(f)) => {
             bail!("unsupported_model", "{}: Phonon converts from its Hugging Face package only", f.display())
         }
+        (Architecture::Deepseek4, Source::HfRepo(r)) => crate::deepseek4::convert::convert_hf(r, dtype, &out)?,
+        (Architecture::Deepseek4, Source::HfDir(d)) => {
+            let s = d.to_str().ok_or_else(|| Error::new("invalid_argument", "model directory path is not UTF-8"))?;
+            crate::deepseek4::convert::convert_hf(s, dtype, &out)?
+        }
+        (Architecture::Deepseek4, Source::Gguf(f)) => crate::deepseek4::convert::convert_gguf(f, dtype, &out)?,
+        (Architecture::Deepseek4, Source::Ggml(f)) => {
+            bail!("unsupported_model", "{}: DeepSeek V4 has no ggml converter", f.display())
+        }
         (Architecture::Qwen35, Source::HfRepo(r)) => crate::qwen35::convert::convert_hf(r, dtype, &out)?,
         (Architecture::Qwen35, Source::HfDir(d)) => {
             let s = d.to_str().ok_or_else(|| Error::new("invalid_argument", "model directory path is not UTF-8"))?;
@@ -259,6 +299,15 @@ pub fn convert_with(src: &str, dtype: &str, out: Option<&Path>, calibrate: Optio
         (Architecture::Qwen35, Source::Ggml(f)) => {
             bail!("unsupported_model", "{}: Qwen3.5 has no ggml converter", f.display())
         }
+        (Architecture::Qwen4Exp, Source::HfRepo(r)) => crate::qwen4exp::convert::convert_hf(r, dtype, &out)?,
+        (Architecture::Qwen4Exp, Source::HfDir(d)) => {
+            let s = d.to_str().ok_or_else(|| Error::new("invalid_argument", "model directory path is not UTF-8"))?;
+            crate::qwen4exp::convert::convert_hf(s, dtype, &out)?
+        }
+        (Architecture::Qwen4Exp, Source::Gguf(f)) => crate::qwen4exp::convert::convert_gguf(f, dtype, &out)?,
+        (Architecture::Qwen4Exp, Source::Ggml(f)) => {
+            bail!("unsupported_model", "{}: Qwen4-Exp has no ggml converter", f.display())
+        }
         (Architecture::Gemma4, Source::HfRepo(r)) => crate::gemma4::convert::convert_hf(r, dtype, &out)?,
         (Architecture::Gemma4, Source::HfDir(d)) => {
             let s = d.to_str().ok_or_else(|| Error::new("invalid_argument", "model directory path is not UTF-8"))?;
@@ -267,6 +316,30 @@ pub fn convert_with(src: &str, dtype: &str, out: Option<&Path>, calibrate: Optio
         (Architecture::Gemma4, Source::Gguf(f)) => crate::gemma4::convert::convert_gguf(f, dtype, &out)?,
         (Architecture::Gemma4, Source::Ggml(f)) => {
             bail!("unsupported_model", "{}: Gemma 4 has no ggml converter", f.display())
+        }
+        (Architecture::Gemma4Moe, Source::HfRepo(r)) => crate::gemma4moe::convert::convert_hf(r, dtype, &out)?,
+        (Architecture::Gemma4Moe, Source::HfDir(d)) => {
+            let s = d.to_str().ok_or_else(|| Error::new("invalid_argument", "model directory path is not UTF-8"))?;
+            crate::gemma4moe::convert::convert_hf(s, dtype, &out)?
+        }
+        (Architecture::Gemma4Moe, Source::Gguf(f)) => crate::gemma4moe::convert::convert_gguf(f, dtype, &out)?,
+        (Architecture::Qwen3Vl, Source::HfRepo(r)) => crate::qwen3vl::convert::convert_hf(r, dtype, &out)?,
+        (Architecture::Qwen3Vl, Source::HfDir(d)) => {
+            let s = d.to_str().ok_or_else(|| Error::new("invalid_argument", "model directory path is not UTF-8"))?;
+            crate::qwen3vl::convert::convert_hf(s, dtype, &out)?
+        }
+        (Architecture::Qwen3Vl, Source::Gguf(f)) => crate::qwen3vl::convert::convert_gguf(f, dtype, &out)?,
+        (Architecture::Gemma4Moe | Architecture::Qwen3Vl, Source::Ggml(f)) => {
+            bail!("unsupported_model", "{}: no ggml converter for this model", f.display())
+        }
+        (Architecture::Llama, Source::HfRepo(r)) => crate::llama::convert::convert_hf(r, dtype, &out)?,
+        (Architecture::Llama, Source::HfDir(d)) => {
+            let s = d.to_str().ok_or_else(|| Error::new("invalid_argument", "model directory path is not UTF-8"))?;
+            crate::llama::convert::convert_hf(s, dtype, &out)?
+        }
+        (Architecture::Llama, Source::Gguf(f)) => crate::llama::convert::convert_gguf(f, dtype, &out)?,
+        (Architecture::Llama, Source::Ggml(f)) => {
+            bail!("unsupported_model", "{}: Llama-family models have no ggml converter", f.display())
         }
         (Architecture::Whisper, Source::Gguf(f)) => {
             bail!("unsupported_model", "{}: no GGUF converter for whisper", f.display())
@@ -291,7 +364,7 @@ mod tests {
         let p = tmp("x.bin");
         std::fs::write(&p, 0x6767_6d6cu32.to_le_bytes()).expect("write");
         assert!(matches!(classify(p.to_str().expect("utf8")), Ok(Source::Ggml(_))));
-        // GGUF v3, no tensors, general.architecture = "llama": routed, then unsupported.
+        // GGUF v3, no tensors, general.architecture = "mamba": routed, then unsupported.
         let mut g = b"GGUF".to_vec();
         g.extend(3u32.to_le_bytes());
         g.extend(0u64.to_le_bytes());
@@ -302,12 +375,12 @@ mod tests {
         }
         g.extend(8u32.to_le_bytes());
         g.extend(5u64.to_le_bytes());
-        g.extend(b"llama");
+        g.extend(b"mamba");
         std::fs::write(&p, &g).expect("write");
         assert!(matches!(classify(p.to_str().expect("utf8")), Ok(Source::Gguf(_))));
         let e = convert(p.to_str().expect("utf8"), "int8", Some(&tmp("o.lapid"))).err().expect("unsupported");
         assert_eq!(e.code, "unsupported_model");
-        assert!(e.message.contains("llama"), "{}", e.message);
+        assert!(e.message.contains("mamba"), "{}", e.message);
         std::fs::write(&p, b"nope").expect("write");
         assert_eq!(classify(p.to_str().expect("utf8")).err().map(|e| e.code), Some("unsupported_model"));
         std::fs::remove_file(&p).ok();
@@ -320,7 +393,7 @@ mod tests {
         let cfg = dir.join("config.json");
         std::fs::write(&cfg, br#"{"model_type": "whisper"}"#).expect("write");
         assert_eq!(hf_architecture(&cfg).ok(), Some(Architecture::Whisper));
-        std::fs::write(&cfg, br#"{"model_type": "llama"}"#).expect("write");
+        std::fs::write(&cfg, br#"{"model_type": "mamba"}"#).expect("write");
         assert_eq!(hf_architecture(&cfg).err().map(|e| e.code), Some("unsupported_model"));
         let r = convert(dir.to_str().expect("utf8"), "int8", Some(&dir.join("o.lapid")));
         assert_eq!(r.err().map(|e| e.code), Some("unsupported_model"));

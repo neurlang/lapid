@@ -18,8 +18,8 @@ use crate::context::Caps;
 
 /// Keys per block of the split variant.
 const SPLIT_KEYS: usize = 64;
-/// Largest head dim of the split variant (one thread per dim).
-const SPLIT_MAX_D: usize = 256;
+/// Largest head dim of the split variant (one thread per dim, blocks of up to 1024 threads).
+const SPLIT_MAX_D: usize = 1024;
 /// Fewest queries for the tensor-core kernel (64-query tiles).
 const MMA_MIN_Q: usize = 16;
 
@@ -84,12 +84,13 @@ pub(super) fn plan(spec: &Arc<AttentionSpec>, d: &AttentionDims, caps: &Caps) ->
     let nsplit = d.sk.div_ceil(SPLIT_KEYS).max(1);
     p.0[6] = u32::try_from(nsplit).map_err(|_| bad("attention: too many keys"))?;
     let grid = grid1((rows * nsplit) as u64, caps)?;
+    let threads = split_threads(d.d as u32);
     if nsplit == 1 {
         return Ok(Plan::new(
             Key::AttnSplit(spec.clone(), true, d.d as u32),
             p.0,
             grid,
-            256,
+            threads,
         ));
     }
     let mut mp = Params::default();
@@ -104,11 +105,16 @@ pub(super) fn plan(spec: &Arc<AttentionSpec>, d: &AttentionDims, caps: &Caps) ->
         Key::AttnSplit(spec.clone(), false, d.d as u32),
         p.0,
         grid,
-        256,
+        threads,
     );
     plan.scratch = rows * nsplit * (d.d + 2) * 4;
     plan.next = Some(Box::new(merge));
     Ok(plan)
+}
+
+/// Threads per block of the split variant: 256, or one per head dim rounded to warps.
+fn split_threads(d: u32) -> u32 {
+    d.clamp(1, SPLIT_MAX_D as u32).div_ceil(32).max(8) * 32
 }
 
 /// K / V rows can be read as 16-byte vectors: contiguous head dim, 16-byte aligned rows.
@@ -169,7 +175,9 @@ pub(super) fn source_split(spec: &AttentionSpec, direct: bool, d: u32) -> String
     };
     let store = snippet(|g| ptx::store(g, spec.out_dtype, "%g_out", "%t", "%x"));
     let d = d.clamp(1, SPLIT_MAX_D as u32);
-    let g = 256 / d;
+    let threads = split_threads(d);
+    let nw = threads / 32;
+    let g = threads / d;
     let (ds, gs, dc, vt, d2) = (
         d.to_string(),
         g.to_string(),
@@ -177,6 +185,7 @@ pub(super) fn source_split(spec: &AttentionSpec, direct: bool, d: u32) -> String
         (SPLIT_KEYS as u32).div_ceil(g).to_string(),
         (d + 2).to_string(),
     );
+    let (ts, nws, scu) = (threads.to_string(), nw.to_string(), (SPLIT_KEYS as u32).div_ceil(nw).to_string());
     let mut fl = flags(spec);
     if direct {
         fl.push("DIRECT");
@@ -196,6 +205,10 @@ pub(super) fn source_split(spec: &AttentionSpec, direct: bool, d: u32) -> String
             ("DC", &dc),
             ("VT", &vt),
             ("D2", &d2),
+            ("T", &ts),
+            ("NW", &nws),
+            ("SCU", &scu),
+            ("DOTS", &(nw * (SPLIT_KEYS as u32).div_ceil(nw)).to_string()),
         ],
         &fl,
     )

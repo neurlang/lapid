@@ -7,7 +7,17 @@
 // The epilogue stages each accumulator through shared memory.
 // Params: [batch, m, n, k, a.off, a.bs, a.rs, b.off, b.bs, b.rs, scales_words, tiles_n,
 //          tiles_m, out(off, bs, rs), extra_e(off, s_batch, s_m, s_n)...]
+// ID (grouped MoE GEMM after `moe_route`): tiles_m = tile slots, b.bs = expert stride
+// (b array elements / words), P[16] = R, P[17] = E; scratch S = [row offsets (E + 1),
+// tile offsets (E + 1), pair list]; A rows are gathered (token = pair / R), output rows
+// scattered (pair), the expert's weights start at g_eb (quantized) / b_base (float).
 {{BINDINGS}}
+// #if ID
+@group(0) @binding(5) var<storage, read_write> S: array<u32>;
+var<private> g_eb: u32;
+// A element offset of the row of each A_PER element (0xffffffff = padding row)
+var<private> arow: array<u32, A_PER>;
+// #endif
 const BM: u32 = {{BM}}u;
 const BN: u32 = {{BN}}u;
 const BK: u32 = {{BK}}u;
@@ -25,9 +35,16 @@ fn load_tiles(row0: u32, col0: u32, a_base: u32, b_base: u32, k0: u32, M: u32, N
         let gi = row0 + e / BK;
         let gk = k0 + e % BK;
         var v: f32 = 0.0;
+// #if ID
+        if (arow[t] != 0xffffffffu && gk < K) {
+            v = ld_a(arow[t] + gk);
+        }
+// #endif
+// #if !ID
         if (gi < M && gk < K) {
             v = ld_a(a_base + gi * P[6] + gk);
         }
+// #endif
         ra[t] = v;
     }
 {{B_LOAD}}}
@@ -46,7 +63,9 @@ var<workgroup> Cs: array<f32, 2048>;
 
 fn kernel(wg_lin: u32, wg_total: u32) {
     let batch = P[0];
+// #if !ID
     let M = P[1];
+// #endif
     let N = P[2];
     let K = P[3];
     let tiles_n = P[11];
@@ -59,10 +78,44 @@ fn kernel(wg_lin: u32, wg_total: u32) {
         let rest = item / tiles_n;
         let tm = rest % tiles_m;
         let bt = rest / tiles_m;
-        let row0 = tm * BM;
         let col0 = tn * BN;
+// #if ID
+        // tile slot `tm` -> expert (binary search over the tile offsets)
+        let E = P[17];
+        if (tm >= S[2u * E + 1u]) {
+            continue;
+        }
+        var lo = 0u;
+        var hi = E;
+        while (hi - lo > 1u) {
+            let mid = (lo + hi) / 2u;
+            if (S[E + 1u + mid] <= tm) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let ex = lo;
+        let rb = S[ex];
+        let M = S[ex + 1u] - rb;
+        let row0 = (tm - S[E + 1u + ex]) * BM;
+        let lb = 2u * E + 2u + rb;
+        let a_base = 0u;
+        let b_base = ex * P[8];
+        g_eb = b_base;
+        for (var t = 0u; t < A_PER; t += 1u) {
+            let gi = row0 + (g_lid + t * 256u) / BK;
+            arow[t] = 0xffffffffu;
+            if (gi < M) {
+                arow[t] = (S[lb + gi] / P[16]) * K;
+            }
+        }
+// #endif
+// #if !ID
+        let row0 = tm * BM;
         let a_base = P[4] + bt * P[5];
         let b_base = P[7] + bt * P[8];
+// #endif
         var c00 = coop_mat16x16<f32, C>();
         var c01 = coop_mat16x16<f32, C>();
         var c10 = coop_mat16x16<f32, C>();
@@ -107,7 +160,12 @@ fn kernel(wg_lin: u32, wg_total: u32) {
                 let j = jb + e % 16u;
                 if (i < M && j < N) {
                     let acc = Cs[cs + e];
-{{EPILOGUE}}                }
+// #if ID
+                    st(S[lb + i] * N + j, acc);
+// #endif
+// #if !ID
+{{EPILOGUE}}// #endif
+                }
             }
         }
     }

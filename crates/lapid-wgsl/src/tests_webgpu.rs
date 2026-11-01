@@ -53,6 +53,7 @@ fn keys() -> Vec<Key> {
     k.push(Key::GatherAxis(Arc::new(GatherAxisSpec { dtype: DType::F16 })));
     k.push(Key::Softmax(Arc::new(SoftmaxSpec { in_dtype: DType::F16, out_dtype: DType::F32 })));
     k.push(Key::LayerNorm(Arc::new(LayerNormSpec { in_dtype: DType::F32, param_dtype: DType::F32, out_dtype: DType::F16 })));
+    k.push(Key::RmsNorm(Arc::new(LayerNormSpec { in_dtype: DType::F16, param_dtype: DType::F32, out_dtype: DType::F16 })));
     k.push(Key::TopK(Arc::new(TopKSpec { in_dtype: DType::F32 }), true));
     k.push(Key::TopK(Arc::new(TopKSpec { in_dtype: DType::F32 }), false));
     for causal in [false, true] {
@@ -61,6 +62,7 @@ fn keys() -> Vec<Key> {
             k.push(Key::AttnTile(s.clone(), 64));
             k.push(Key::AttnSplit(s.clone(), true, 64));
             k.push(Key::AttnSplit(s.clone(), false, 50));
+            k.push(Key::AttnSplit(s.clone(), false, 512));
             k.push(Key::AttnMerge(s));
         }
     }

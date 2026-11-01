@@ -167,6 +167,9 @@ fn reduce_softmax_layer_norm() {
         let spec = Arc::new(LayerNormSpec { in_dtype: DType::F32, param_dtype: DType::F32, out_dtype: DType::F32 });
         let dims = LayerNormDims { rows, cols, eps: 1e-5f32.to_bits() };
         check(&be, Kernel::LayerNorm(spec, dims), &[f32b(&x), f32b(&rnd(cols, 14)), f32b(&rnd(cols, 15))], DType::F32, rows * cols, 1e-5, "layer_norm");
+        let spec = Arc::new(LayerNormSpec { in_dtype: DType::F32, param_dtype: DType::F32, out_dtype: DType::F32 });
+        let dims = LayerNormDims { rows, cols, eps: 1e-6f32.to_bits() };
+        check(&be, Kernel::RmsNorm(spec, dims), &[f32b(&x), f32b(&rnd(cols, 14))], DType::F32, rows * cols, 1e-5, "rms_norm");
     }
 }
 
@@ -267,6 +270,9 @@ fn attention_variants() {
         (3, 50, 50, false, true),
         (2, 300, 64, true, true),
         (1, 1500, 64, false, false),
+        (1, 700, 512, true, false),
+        (24, 24, 512, true, false),
+        (5, 90, 320, false, true),
     ] {
         let spec = Arc::new(AttentionSpec { dtype: DType::F32, mask_dtype: with_mask.then_some(DType::F32), causal, out_dtype: DType::F32 });
         let view = |s: usize| View { offset: 0, strides: vec![(h * s * d) as isize, (s * d) as isize, d as isize, 1] };
@@ -312,4 +318,39 @@ fn chained_launches_and_aliasing() {
     // empty and odd-sized buffers round-trip
     assert_eq!(be.download(&be.upload(&[]).unwrap()).unwrap(), Vec::<u8>::new());
     assert_eq!(be.download(&be.upload(&[1, 2, 3, 4, 5]).unwrap()).unwrap(), vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn split_large_bindings() {
+    // a forced small binding limit splits weights and tables into sub-range launches;
+    // results must equal the unsplit run bit for bit
+    let Some(be) = backend() else { return };
+    let run = |kernel: &Kernel, inputs: &[Vec<u8>], out: usize, limit: Option<u64>| {
+        be.set_binding_limit(limit).unwrap();
+        let r = exec(&*be, kernel, inputs, &vec![0u8; out]);
+        be.set_binding_limit(None).unwrap();
+        r
+    };
+    let (n, k) = (300usize, 512usize);
+    for d in [DType::F32, DType::F16, DType::Q4K, DType::Q6K] {
+        let w = rnd(n * k, 5);
+        let wb = match d {
+            DType::F32 => f32b(&w),
+            DType::F16 => f16b(&w),
+            d => lapid_quant::quantize(d.quant_format().unwrap(), &w, n, k),
+        };
+        for m in [1usize, 40] {
+            let spec = Arc::new(MatMulSpec { a_dtype: DType::F32, b_dtype: d, b_transposed: true, extra_dtypes: vec![DType::F32], out_dtype: DType::F32, epilogue: Some(Expr::Binary(BinaryOp::Add, ld(0), ld(1))) });
+            let kern = Kernel::MatMul(spec, mm_dims(m, n, k, true, vec![View { offset: 0, strides: vec![0, 0, 1] }]));
+            let ins = [f32b(&rnd(m * k, 6)), wb.clone(), f32b(&rnd(n, 7))];
+            let want = run(&kern, &ins, m * n * 4, None).unwrap();
+            let got = run(&kern, &ins, m * n * 4, Some((wb.len() as u64 / 5).max(ins[0].len() as u64).max(4096))).unwrap();
+            assert!(got == want, "split matmul {d:?} m={m}");
+        }
+        let idx = i32b(&[0, 299, 1, 150, 75, 225, 3, 299]);
+        let kern = Kernel::Gather(Arc::new(GatherSpec { table_dtype: d, out_dtype: DType::F32 }), GatherDims { rows: n, cols: k, count: 8 });
+        let want = run(&kern, &[wb.clone(), idx.clone()], 8 * k * 4, None).unwrap();
+        let got = run(&kern, &[wb.clone(), idx], 8 * k * 4, Some((wb.len() as u64 / 7).max(8 * k as u64 * 4))).unwrap();
+        assert!(got == want, "split gather {d:?}");
+    }
 }

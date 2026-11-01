@@ -72,6 +72,11 @@ enum Command {
         #[arg(long)]
         filter: Option<String>,
     },
+    /// Serve models over an OpenAI-compatible HTTP API with a web UI (llama-server flags work too).
+    Serve(lapid_server::cli::ServeArgs),
+    /// Chat with a model in the terminal, or run it on inputs: WAV files to transcribe,
+    /// text to speak or embed (llama-cli flags work too).
+    Run(lapid_server::cli::RunArgs),
     /// Kernel tooling.
     Kernels {
         #[command(subcommand)]
@@ -156,6 +161,14 @@ fn run(cli: Cli) -> Result<bool> {
             println!("{}", pretty(&v)?);
             Ok(true)
         }
+        Command::Serve(args) => {
+            lapid_server::cli::serve(args)?;
+            Ok(true)
+        }
+        Command::Run(args) => {
+            lapid_server::cli::run(args)?;
+            Ok(true)
+        }
         Command::Kernels { action: KernelsAction::Dump { dir, device, filter } } => {
             let v = kernels::dump(&dir, device.as_deref(), filter.as_deref())?;
             println!("{}", pretty(&v)?);
@@ -165,7 +178,7 @@ fn run(cli: Cli) -> Result<bool> {
 }
 
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let cli = match Cli::try_parse_from(lapid_server::cli::normalize_args(std::env::args())) {
         Ok(cli) => cli,
         Err(e) => {
             // --help / --version are not errors.

@@ -1,6 +1,7 @@
 // Attention for few queries (decoder), split over keys ("flash decoding").
-// One 256-thread block per (batch, head, query, chunk of 64 keys):
-//   scores: warp w takes keys w, w + 8, ...; lanes stride the head dim (coalesced rows),
+// One T-thread block (T = max(256, D) rounded to warps, NW warps) per (batch, head, query,
+// chunk of 64 keys):
+//   scores: warp w takes keys w, w + NW, ...; lanes stride the head dim (coalesced rows),
 //           warp butterfly sum;
 //   softmax of the chunk: every warp computes max / exp / sum redundantly from shared
 //           memory (lane owns keys lane and lane + 32), so no extra barrier is needed;
@@ -10,14 +11,15 @@
 // Head dim D is baked in (constant trip counts, predicated loads, unrolled by ptxas).
 // "No score" is the lowest finite f32; real -inf mask values compare below it.
 // Params: [B, H, sq, sk, d, scale_bits, nsplit, q(off, s0..s3), k(..), v(..), mask(..)?]
-.shared .align 16 .f32 qsh[256];
-.shared .align 16 .f32 dots[64];
+.shared .align 16 .f32 qsh[{{T}}];
+.shared .align 16 .f32 dots[{{DOTS}}];
 .shared .align 16 .f32 pp[64];
-.shared .align 16 .f32 part[256];
+.shared .align 16 .f32 part[{{T}}];
 
 .visible .entry lapid_main(
 {{ARGS}}
 )
+.maxntid {{T}}, 1, 1
 {
     .reg .pred %p, %pv;
     .reg .b32 %tx, %lane, %warp, %item, %NS, %split, %bhq, %qi, %bh, %h, %b, %H, %SQ, %SK;
@@ -113,7 +115,7 @@ Q_DONE:
     // scores of keys warp + 8u
     mov.u32 %u, 0;
 SC_LOOP:
-    mad.lo.u32 %kj, %u, 8, %warp;
+    mad.lo.u32 %kj, %u, {{NW}}, %warp;
     setp.lt.u32 %pv, %kj, %kn;
     selp.b32 %kc, %kj, 0, %pv;
     add.u32 %kr, %k0, %kc;
@@ -149,7 +151,7 @@ SC_D:
     mad.lo.u32 %a, %kj, 4, %a;
     @%p st.shared.f32 [%a], %x;
     add.u32 %u, %u, 1;
-    setp.lt.u32 %p, %u, 8;
+    setp.lt.u32 %p, %u, {{SCU}};
     @%p bra SC_LOOP;
     bar.sync 0;
 

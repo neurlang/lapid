@@ -142,6 +142,20 @@ fn attention_vec() {
 }
 
 #[test]
+fn attention_large_head_dim() {
+    // Gemma 4: head dim 256 (sliding layers) and 512 (full layers); prefill and decode.
+    let Some(be) = backend() else { return };
+    for &(sq, sk, d) in &[(1usize, 4096usize, 512usize), (1, 100, 512), (3, 700, 512), (160, 160, 512), (1, 1000, 256), (70, 90, 256)] {
+        for causal in [false, true] {
+            let c = Case { b: 1, h: 2, sq, sk, d, causal, mask: sq == 3, dtype: DType::F32, bshd: true, cap: 0 };
+            check(&be, &c);
+        }
+    }
+    let c = Case { b: 1, h: 2, sq: 33, sk: 300, d: 512, causal: true, mask: false, dtype: DType::F16, bshd: false, cap: 0 };
+    check(&be, &c);
+}
+
+#[test]
 fn attention_decode_sequence_shares_scratch() {
     // Several split attentions in one execute (scratch reuse needs barriers between them).
     let Some(be) = backend() else { return };

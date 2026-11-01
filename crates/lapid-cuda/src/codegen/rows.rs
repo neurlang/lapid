@@ -30,6 +30,7 @@ pub(super) fn plan_layer_norm(
     spec: &Arc<LayerNormSpec>,
     d: &LayerNormDims,
     caps: &Caps,
+    rms: bool,
 ) -> Result<Plan> {
     check_plain(spec.in_dtype, "layer_norm input")?;
     check_plain(spec.param_dtype, "layer_norm params")?;
@@ -41,7 +42,7 @@ pub(super) fn plan_layer_norm(
     } else {
         grid1(d.rows as u64, caps)?
     };
-    Ok(Plan::new(Key::LayerNorm(spec.clone()), p.0, grid, 256))
+    Ok(Plan::new(Key::LayerNorm(spec.clone(), rms), p.0, grid, 256))
 }
 
 pub(super) fn plan_gather(spec: &Arc<GatherSpec>, d: &GatherDims, caps: &Caps) -> Result<Plan> {
@@ -93,12 +94,15 @@ pub(super) fn source_softmax(spec: &SoftmaxSpec) -> String {
     )
 }
 
-pub(super) fn source_layer_norm(spec: &LayerNormSpec) -> String {
-    let (args, ptrs) = ptx::args(&["x", "w", "b", "out"]);
+pub(super) fn source_layer_norm(spec: &LayerNormSpec, rms: bool) -> String {
+    let names: &[&str] = if rms { &["x", "w", "out"] } else { &["x", "w", "b", "out"] };
+    let (args, ptrs) = ptx::args(names);
     let load = snippet(|g| ptx::load(g, spec.in_dtype, "%g_x", "%idx", "%x", true));
     let load_wb = snippet(|g| {
         ptx::load(g, spec.param_dtype, "%g_w", "%j", "%w", true);
-        ptx::load(g, spec.param_dtype, "%g_b", "%j", "%b", true);
+        if !rms {
+            ptx::load(g, spec.param_dtype, "%g_b", "%j", "%b", true);
+        }
     });
     let store = snippet(|g| ptx::store(g, spec.out_dtype, "%g_out", "%idx", "%y"));
     template::fill(
@@ -112,7 +116,7 @@ pub(super) fn source_layer_norm(spec: &LayerNormSpec) -> String {
             ("REDUCE_SQ", &block_reduce(Red::Sum, "%sq")),
             ("STORE", &store),
         ],
-        &[],
+        if rms { &["RMS"] } else { &[] },
     )
 }
 

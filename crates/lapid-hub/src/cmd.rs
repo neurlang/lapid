@@ -10,7 +10,7 @@ use serde_json::Value;
 pub use crate::convert::{convert, convert_with};
 
 /// Model families `verify` / `bench` route to.
-pub const MODELS: &[&str] = &["whisper", "embeddinggemma", "parakeet", "lfm3", "phonon", "qwen35", "gemma4"];
+pub const MODELS: &[&str] = &["whisper", "embeddinggemma", "parakeet", "lfm3", "phonon", "qwen35", "deepseek4", "qwen4exp", "gemma4", "gemma4moe", "gemma4vl", "qwen3vl", "llama"];
 
 /// Common model selection of `lapid verify` / `lapid bench`; `None` = the model's default.
 #[derive(Clone, Debug, Default)]
@@ -36,7 +36,13 @@ pub fn verify(model: &str, reference: Option<&Path>, args: &ModelArgs) -> Result
         "lfm3" => crate::lfm3::cmd::verify(reference, args),
         "phonon" => crate::phonon::cmd::verify(reference, args),
         "qwen35" => crate::qwen35::cmd::verify(reference, args),
+        "deepseek4" => crate::deepseek4::cmd::verify(reference, args),
+        "qwen4exp" => crate::qwen4exp::cmd::verify(reference, args),
         "gemma4" => crate::gemma4::cmd::verify(reference, args),
+        "llama" => crate::llama::cmd::verify(reference, args),
+        "gemma4moe" => crate::gemma4moe::cmd::verify(reference, args),
+        "gemma4vl" => crate::gemma4vl::cmd::verify(reference, args),
+        "qwen3vl" => crate::qwen3vl::cmd::verify(reference, args),
         _ => Err(unknown(model)),
     }
 }
@@ -53,7 +59,13 @@ pub fn bench(model: &str, input: Option<&Path>, args: &ModelArgs, runs: usize) -
         "lfm3" => crate::lfm3::cmd::bench(input, args, runs),
         "phonon" => crate::phonon::cmd::bench(input, args, runs),
         "qwen35" => crate::qwen35::cmd::bench(input, args, runs),
+        "deepseek4" => crate::deepseek4::cmd::bench(input, args, runs),
+        "qwen4exp" => crate::qwen4exp::cmd::bench(input, args, runs),
         "gemma4" => crate::gemma4::cmd::bench(input, args, runs),
+        "llama" => crate::llama::cmd::bench(input, args, runs),
+        "gemma4moe" => crate::gemma4moe::cmd::bench(input, args, runs),
+        "gemma4vl" => crate::gemma4vl::cmd::bench(input, args, runs),
+        "qwen3vl" => crate::qwen3vl::cmd::bench(input, args, runs),
         _ => Err(unknown(model)),
     }
 }

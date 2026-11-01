@@ -61,7 +61,7 @@ fn walk(plan: &mut Plan, f: &mut dyn FnMut(&mut i64)) {
             }
             Kernel::Gather(_, d) => [&mut d.rows, &mut d.cols, &mut d.count].into_iter().for_each(|x| u(x, f)),
             Kernel::Softmax(_, d) => [&mut d.rows, &mut d.cols].into_iter().for_each(|x| u(x, f)),
-            Kernel::LayerNorm(_, d) => [&mut d.rows, &mut d.cols].into_iter().for_each(|x| u(x, f)),
+            Kernel::LayerNorm(_, d) | Kernel::RmsNorm(_, d) => [&mut d.rows, &mut d.cols].into_iter().for_each(|x| u(x, f)),
             Kernel::Attention(_, d) => {
                 for x in [&mut d.batch, &mut d.heads, &mut d.sq, &mut d.sk, &mut d.d] {
                     u(x, f);

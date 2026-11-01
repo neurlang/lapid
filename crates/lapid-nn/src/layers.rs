@@ -117,7 +117,7 @@ impl LayerNorm {
 /// x / sqrt(mean(x^2) + eps) * (w + weight_offset) over the last dim, computed in f32 and
 /// returned in x's dtype. `weight_offset` is 1.0 for Gemma-style norms (`x * (1 + w)`).
 ///
-/// Built from primitives today; switches to a fused composite when the core op lands.
+/// One `Tensor::rms_norm` composite (a native kernel on every backend).
 #[derive(Clone)]
 pub struct RmsNorm {
     pub weight: Tensor,
@@ -140,14 +140,11 @@ impl RmsNorm {
         if self.weight.shape() != [d] {
             bail!("shape_mismatch", "RmsNorm over last dim {d}: weight {:?} must be [{d}]", self.weight.shape());
         }
-        let xf = x.cast(DType::F32)?;
-        let ms = xf.mul(&xf)?.mean(-1, true)?;
-        let inv = ms.add_scalar(f64::from(self.eps))?.unary(UnaryOp::Rsqrt)?;
-        let mut w = self.weight.cast(DType::F32)?;
+        let mut w = self.weight.clone();
         if self.weight_offset != 0.0 {
-            w = w.add_scalar(f64::from(self.weight_offset))?;
+            w = w.cast(DType::F32)?.add_scalar(f64::from(self.weight_offset))?;
         }
-        xf.mul(&inv)?.mul(&w)?.cast(x.dtype())
+        x.rms_norm(&w, self.eps)
     }
 }
 

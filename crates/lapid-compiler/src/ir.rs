@@ -405,6 +405,9 @@ pub enum Kernel {
     TopK(Arc<TopKSpec>, TopKDims),
     MatMulId(Arc<MatMulIdSpec>, MatMulIdDims),
     GatedDeltaNet(Arc<GatedDeltaNetSpec>, GatedDeltaNetDims),
+    /// Round 5. inputs=[x [rows, cols], weight [cols]] contiguous → out [rows, cols] =
+    /// x * rsqrt(mean(x^2) + eps) * weight (f32 math). Spec/dims as LayerNorm.
+    RmsNorm(Arc<LayerNormSpec>, LayerNormDims),
 }
 
 // ---------------------------------------------------------------- round 3
@@ -454,6 +457,7 @@ impl Kernel {
             Kernel::Gather(..) => "gather",
             Kernel::Softmax(..) => "softmax",
             Kernel::LayerNorm(..) => "layer_norm",
+            Kernel::RmsNorm(..) => "rms_norm",
             Kernel::MatMulId(..) => "matmul_id",
             Kernel::GatedDeltaNet(..) => "gated_delta_net",
             Kernel::Attention(..) => "attention",

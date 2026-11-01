@@ -81,6 +81,23 @@ impl Tensor {
         Ok(Tensor::from_op(Op::Softmax, vec![self.clone()], self.shape().to_vec(), self.dtype()))
     }
 
+    pub(super) fn rms_norm_impl(&self, weight: &Tensor, eps: f32) -> Result<Tensor> {
+        check::float_dtype(self, "rms_norm")?;
+        check::float_dtype(weight, "rms_norm weight")?;
+        if self.rank() == 0 {
+            bail!("invalid_argument", "rms_norm of a rank-0 tensor");
+        }
+        let d = self.shape()[self.rank() - 1];
+        if weight.shape() != [d] {
+            bail!("shape_mismatch", "rms_norm over last dim {d}: weight {:?} must be [{d}]", weight.shape());
+        }
+        if !eps.is_finite() || eps < 0.0 {
+            bail!("invalid_argument", "rms_norm eps must be finite and >= 0, got {eps}");
+        }
+        let srcs = vec![self.clone(), weight.clone()];
+        Ok(Tensor::from_op(Op::RmsNorm { eps }, srcs, self.shape().to_vec(), self.dtype()))
+    }
+
     pub(super) fn layer_norm_impl(&self, weight: &Tensor, bias: &Tensor, eps: f32) -> Result<Tensor> {
         check::float_dtype(self, "layer_norm")?;
         check::float_dtype(weight, "layer_norm weight")?;

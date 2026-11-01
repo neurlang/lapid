@@ -69,6 +69,9 @@ fn signature(items: &[Item]) -> Vec<u64> {
         s.push(so as u64);
         s.push(sl as u64);
         s.push(it.barrier as u64 | (it.follow as u64) << 1 | (it.bufs.len() as u64) << 2);
+        for &(o, l) in it.ranges.iter().flatten() {
+            s.extend([o, l]);
+        }
     }
     s
 }

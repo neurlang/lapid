@@ -24,6 +24,7 @@ mod delta;
 mod matmul;
 mod reduce;
 mod rows;
+mod split;
 mod template;
 mod topk;
 #[cfg(test)]
@@ -38,6 +39,7 @@ use lapid_compiler::{
 use lapid_tensor::{DType, Error, Result};
 
 pub use elementwise::IdxMode;
+pub use split::{SubLaunch, plan_split};
 pub use template::fill;
 
 /// What the target device can do, as far as code generation is concerned.
@@ -120,6 +122,8 @@ pub enum Key {
     Gather(Arc<GatherSpec>),
     Softmax(Arc<SoftmaxSpec>),
     LayerNorm(Arc<LayerNormSpec>),
+    /// RMS norm (layer norm without centering and bias).
+    RmsNorm(Arc<LayerNormSpec>),
     /// Flash attention, one thread per query, head dim baked in (multiple of 4, <= 128).
     AttnTile(Arc<AttentionSpec>, u32),
     /// Attention for few queries, split over key chunks; `true` = one chunk, writes the
@@ -135,6 +139,11 @@ pub enum Key {
     TopK(Arc<TopKSpec>, bool),
     /// Mixture-of-experts matmul (one lane group per output column).
     MatMulId(Arc<MatMulIdSpec>),
+    /// MoE prefill stage 1: bucket (token, slot) pairs by expert (one workgroup; experts
+    /// rounded up to a power of two for the shared counters).
+    MoeRoute(u32),
+    /// MoE prefill stage 2: grouped cooperative-matrix GEMM over the routed pairs.
+    GemmIdCoop(Arc<MatMulIdSpec>),
     /// Gated delta rule (one lane group per state column).
     GatedDeltaNet(Arc<GatedDeltaNetSpec>),
 }
@@ -146,6 +155,8 @@ pub enum Extra {
     Scratch,
     /// The device error flag (`status[0] = 1` on an out-of-range index).
     Status,
+    /// Scratch, then the error flag (two bindings).
+    ScratchStatus,
 }
 
 impl Key {
@@ -157,17 +168,24 @@ impl Key {
             Key::Gemm(s) | Key::GemmCoop(s) | Key::Gemv(s, ..) => 2 + s.extra_dtypes.len(),
             Key::Gather(_) | Key::GatherAxis(_) => 2,
             Key::TopK(..) => 1,
-            Key::MatMulId(_) => 3,
+            Key::MatMulId(_) | Key::MoeRoute(_) | Key::GemmIdCoop(_) => 3,
             Key::GatedDeltaNet(_) => 6,
             Key::Softmax(_) => 1,
             Key::LayerNorm(_) => 3,
+            Key::RmsNorm(_) => 2,
             Key::AttnTile(s, _) | Key::AttnCoop(s) | Key::AttnSplit(s, ..) | Key::AttnMerge(s) => 3 + s.mask_dtype.is_some() as usize,
         }
     }
 
     /// Total descriptor bindings (params + inputs + output [+ extra]).
     pub fn num_bindings(&self) -> usize {
-        self.num_inputs() + 2 + self.extra().is_some() as usize
+        self.num_inputs()
+            + 2
+            + match self.extra() {
+                None => 0,
+                Some(Extra::ScratchStatus) => 2,
+                Some(_) => 1,
+            }
     }
 
     /// Backend buffer bound after the output, if any.
@@ -175,6 +193,7 @@ impl Key {
         match self {
             Key::AttnSplit(_, false, _) | Key::AttnMerge(_) => Some(Extra::Scratch),
             Key::Gather(_) | Key::GatherAxis(_) | Key::MatMulId(_) => Some(Extra::Status),
+            Key::MoeRoute(_) | Key::GemmIdCoop(_) => Some(Extra::ScratchStatus),
             _ => None,
         }
     }
@@ -185,7 +204,7 @@ impl Key {
             && match self {
                 Key::Reduce(_, row) => *row,
                 Key::TopK(_, argmax) => *argmax,
-                Key::Gemv(..) | Key::MatMulId(_) | Key::GatedDeltaNet(_) | Key::GemmCoop(_) | Key::Softmax(_) | Key::LayerNorm(_) | Key::AttnSplit(..) | Key::AttnCoop(_) => true,
+                Key::Gemv(..) | Key::MatMulId(_) | Key::GatedDeltaNet(_) | Key::GemmCoop(_) | Key::GemmIdCoop(_) | Key::Softmax(_) | Key::LayerNorm(_) | Key::RmsNorm(_) | Key::AttnSplit(..) | Key::AttnCoop(_) => true,
                 _ => false,
             }
     }
@@ -197,6 +216,7 @@ impl Key {
             Key::GemmCoop(s) => format!("gemm_coop {}x{}", s.a_dtype.name(), s.b_dtype.name()),
             Key::Gemv(s, ..) => format!("gemv {}x{}", s.a_dtype.name(), s.b_dtype.name()),
             Key::MatMulId(s) => format!("matmul_id {}x{}", s.x_dtype.name(), s.w_dtype.name()),
+            Key::GemmIdCoop(s) => format!("gemm_id_coop {}x{}", s.x_dtype.name(), s.w_dtype.name()),
             Key::AttnTile(s, d) => format!("attention_tile d{d} {}", s.dtype.name()),
             Key::AttnSplit(s, direct, _) => format!("attention_split{} {}", if *direct { " direct" } else { "" }, s.dtype.name()),
             k => k.label().to_string(),
@@ -213,6 +233,7 @@ impl Key {
             Key::Gather(_) => "gather",
             Key::Softmax(_) => "softmax",
             Key::LayerNorm(_) => "layer_norm",
+            Key::RmsNorm(_) => "rms_norm",
             Key::AttnTile(..) => "attention_tile",
             Key::AttnSplit(..) => "attention_split",
             Key::AttnMerge(_) => "attention_merge",
@@ -220,6 +241,8 @@ impl Key {
             Key::GatherAxis(_) => "gather_axis",
             Key::TopK(..) => "topk",
             Key::MatMulId(_) => "matmul_id",
+            Key::MoeRoute(_) => "moe_route",
+            Key::GemmIdCoop(_) => "gemm_id_coop",
             Key::GatedDeltaNet(_) => "gated_delta_net",
         }
     }
@@ -258,6 +281,7 @@ pub fn plan(kernel: &Kernel, caps: &Caps) -> Result<Plan> {
         Kernel::TopK(s, d) => topk::plan(s, d, caps),
         Kernel::MatMulId(s, d) => moe::plan(s, d, caps),
         Kernel::GatedDeltaNet(s, d) => delta::plan(s, d, caps),
+        Kernel::RmsNorm(s, d) => rows::plan_rms_norm(s, d, caps),
     }
 }
 
@@ -272,6 +296,7 @@ pub fn source(key: &Key, caps: &Caps) -> String {
         Key::Gather(s) => gather::source(s, caps),
         Key::Softmax(s) => rows::source_softmax(s, caps),
         Key::LayerNorm(s) => rows::source_layer_norm(s, caps),
+        Key::RmsNorm(s) => rows::source_rms_norm(s, caps),
         Key::AttnTile(s, d) => attention::source_tile(s, *d, caps),
         Key::AttnSplit(s, direct, d) => attention::source_split(s, *direct, *d, caps),
         Key::AttnMerge(s) => attention::source_merge(s, caps),
@@ -279,6 +304,8 @@ pub fn source(key: &Key, caps: &Caps) -> String {
         Key::GatherAxis(s) => gather::source_axis(s, caps),
         Key::TopK(s, argmax) => topk::source(s, *argmax, caps),
         Key::MatMulId(s) => moe::source(s, caps),
+        Key::MoeRoute(emax) => moe::source_route(*emax, caps),
+        Key::GemmIdCoop(s) => matmul::source_coop_id(s, caps),
         Key::GatedDeltaNet(s) => delta::source(s, caps),
     }
 }
