@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🔥 lapid
+# 🔥 Lapid
 
 **Fast ML inference on every device. Pure Rust.**
 
