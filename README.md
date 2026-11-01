@@ -7,15 +7,14 @@
 [![CI](https://github.com/thewh1teagle/lapid/actions/workflows/ci.yml/badge.svg)](https://github.com/thewh1teagle/lapid/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue)](#license)
 
-CUDA · Vulkan · Metal · WebGPU · CPU: one build, nothing to install.
-
 </div>
 
 ## Highlights
 
 - 📦 **No SDKs**: no CUDA toolkit, Vulkan SDK or C++ compiler. Drivers load at runtime.
 - 🪶 **Small models**: runs quantized weights (`fp16`, `int8`, `int4`, GGUF) to use less memory.
-- 📄 **One file per model**: weights + tokenizer in a single `.lapid`. Imports safetensors and GGUF.
+- 🖥️ **Every GPU**: CUDA, Vulkan, Metal and WebGPU, with a fast CPU fallback. The best one is picked at runtime.
+- 🌐 **Runs in the browser**: the same code builds for WebAssembly and WebGPU.
 
 ## Quick start
 
