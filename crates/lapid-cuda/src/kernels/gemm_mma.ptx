@@ -14,6 +14,8 @@
 // pairs; scratch holds off[E+1] (row list offsets per expert), ts[E+1] (first tile of each
 // expert) and the row-id list. Rows of a tile are row ids (t * r + j) of one expert: A row
 // = id / r, output row = id. P[16] = E, P[17] = expert stride in bytes.
+// Small-tile variant (WM = 16, MatMulId with few rows per expert): 32x128 tiles, each warp
+// 16x32 (one m16 tile); only the first 32 rows of As / Cs are used.
 .shared .align 16 .b8 smem[33792];
 
 .visible .entry lapid_main(
@@ -101,7 +103,7 @@ BS_DONE:
     add.s64 %ad, %ad, %g_ts;
     ld.global.u32 %tv, [%ad];
     sub.u32 %tv, %y, %tv;
-    shl.b32 %row0, %tv, 6;
+    shl.b32 %row0, %tv, {{TSH}};
     mul.wide.u32 %ad, %lo, 4;
     add.s64 %ad, %ad, %g_scratch;
     ld.global.u32 %lbase, [%ad];
@@ -120,7 +122,7 @@ BS_DONE:
     // ldmatrix lane addresses (bytes, relative to a buffer):
     // A: row wm*32 + lane%16, k (lane/16)*8 ; B: n wn*32 + lane%8 + (lane/16)*8, k ((lane/8)%2)*8
     and.b32 %t, %lane, 15;
-    mad.lo.u32 %t, %wm, 32, %t;
+    mad.lo.u32 %t, %wm, {{WM}}, %t;
     shr.u32 %r, %lane, 4;
     mul.lo.u32 %t, %t, 40;
     mad.lo.u32 %t, %r, 8, %t;
@@ -210,7 +212,7 @@ SKIP_STORE:
 MAIN_DONE:
     // accumulators -> Cs[64][132] (f32): row wm*32 + mi*16 + lane/4 (+8), col wn*32 + ni*8 + 2*(lane%4)
     shr.u32 %t, %lane, 2;
-    mad.lo.u32 %t, %wm, 32, %t;
+    mad.lo.u32 %t, %wm, {{WM}}, %t;
     and.b32 %r, %lane, 3;
     shl.b32 %r, %r, 1;
     mad.lo.u32 %r, %wn, 32, %r;
@@ -233,7 +235,7 @@ EPI_LOOP:
 {{EPILOGUE}}
 EPI_NEXT:
     add.u32 %e, %e, 256;
-    setp.lt.u32 %p, %e, 8192;
+    setp.lt.u32 %p, %e, {{EPI_N}};
     @%p bra EPI_LOOP;
     ret;
 }

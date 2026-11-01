@@ -1,9 +1,9 @@
 // MatMulId routing (one 1024-thread block): groups the t * r rows by expert.
 // Writes to scratch (u32): off[E+1] (exclusive prefix of the per-expert row counts),
-// ts[E+1] at E+1 (exclusive prefix of the per-expert 64-row tile counts), and the row-id
+// ts[E+1] at E+1 (exclusive prefix of the per-expert tile counts, 2^tsh-row tiles), and the row-id
 // list at 2(E+1) (rows of expert e at off[e] .. off[e+1], in no particular order).
 // An id outside [0, E) raises the error flag and the row is dropped.
-// Params: [rows = t * r, E]
+// Params: [rows = t * r, E, tsh]
 .shared .align 4 .b32 cnt[{{MAX_E}}];
 .shared .align 4 .b32 cur[{{MAX_E}}];
 
@@ -13,13 +13,14 @@
 {
     .reg .pred %p, %q;
     .reg .b32 %tx, %lane, %rows, %ne, %i, %ex, %t, %u, %one, %sc, %scnt, %stl, %lo, %hi;
-    .reg .b32 %cs, %ts, %ic, %it, %pos, %tp, %shc, %sht;
+    .reg .b32 %cs, %ts, %ic, %it, %pos, %tp, %shc, %sht, %tsh, %tm1;
     .reg .b64 %ad, %g_ts, %g_list;
 {{PTRS}}
     mov.u32 %tx, %tid.x;
     and.b32 %lane, %tx, 31;
     ld.param.u32 %rows, [P];
     ld.param.u32 %ne, [P+4];
+    ld.param.u32 %tsh, [P+8];
     mov.u32 %sc, cnt;
     mov.u32 %u, cur;
     add.u32 %t, %ne, 1;
@@ -28,6 +29,8 @@
     mul.wide.u32 %ad, %t, 8;
     add.s64 %g_list, %g_scratch, %ad;
     mov.u32 %one, 1;
+    shl.b32 %tm1, %one, %tsh;
+    sub.u32 %tm1, %tm1, 1;
 
     mov.u32 %i, %tx;
 ZERO:
@@ -74,8 +77,8 @@ SUM:
     mad.lo.u32 %t, %i, 4, %sc;
     ld.shared.u32 %t, [%t];
     add.u32 %scnt, %scnt, %t;
-    add.u32 %t, %t, 63;
-    shr.u32 %t, %t, 6;
+    add.u32 %t, %t, %tm1;
+    shr.u32 %t, %t, %tsh;
     add.u32 %stl, %stl, %t;
     add.u32 %i, %i, 1;
     bra SUM;
@@ -120,8 +123,8 @@ WRITE:
     mad.lo.u32 %t, %i, 4, %u;
     st.shared.u32 [%t], %pos;
     add.u32 %pos, %pos, %cs;
-    add.u32 %cs, %cs, 63;
-    shr.u32 %cs, %cs, 6;
+    add.u32 %cs, %cs, %tm1;
+    shr.u32 %cs, %cs, %tsh;
     add.u32 %tp, %tp, %cs;
     add.u32 %i, %i, 1;
     bra WRITE;

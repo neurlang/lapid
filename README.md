@@ -18,14 +18,9 @@
 
 ## How it compares
 
-| | Every GPU | One build, no SDKs | Pure Rust | Made for inference |
-|---|:---:|:---:|:---:|:---:|
-| ONNX Runtime | ⚠️ | ❌ | ❌ | ✅ |
-| llama.cpp | ✅ | ❌ | ❌ | ✅ |
-| Candle | ⚠️ | ❌ | ✅ | ✅ |
-| Burn | ✅ | ⚠️ | ✅ | ❌ |
-| Tract | ❌ | ✅ | ✅ | ✅ |
-| **Lapid** | ✅ | ✅ | ✅ | ✅ |
+- **vs ONNX Runtime**: fast on every GPU, not only NVIDIA, and a small Rust library you can change.
+- **vs llama.cpp**: one build for all GPUs, no SDKs to install.
+- **vs Candle, Burn, Tract**: more GPUs, made for inference, and runs on both CPU and GPU.
 
 ## Quick start
 
