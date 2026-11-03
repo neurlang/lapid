@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use lapid_tensor::{DeviceBuffer, DeviceData, Error, Result};
+use lapid_tensor::{DeviceBuffer, DeviceData, Error, HostData, Result};
 
 use crate::context::Ctx;
 use crate::driver::{self, CUdeviceptr, CUevent, CUstream, Driver};
@@ -56,12 +56,22 @@ impl Pool {
 }
 
 /// A device allocation. Dropping it returns the memory to the device's pool.
+///
+/// Or a *mapped* view of host bytes (`CudaBuffer::map`): the device address is the host
+/// address (pageable memory access through the host page tables), the `HostData` is kept
+/// alive, nothing is ever freed, and kernels never write it (`execute` refuses it as an
+/// output).
 pub struct CudaBuffer {
     ptr: CUdeviceptr,
     len: usize,
     class: usize,
     ctx: Arc<Ctx>,
+    host: Option<HostData>,
 }
+
+/// Alignment `cuMemAlloc` guarantees and kernels may assume (vector loads); `.lapid`
+/// tensor data is 256-byte aligned in a page-aligned mmap.
+const MAP_ALIGN: usize = 256;
 
 impl CudaBuffer {
     pub(crate) fn alloc(ctx: &Arc<Ctx>, len: usize) -> Result<CudaBuffer> {
@@ -71,6 +81,7 @@ impl CudaBuffer {
                 len: 0,
                 class: 0,
                 ctx: ctx.clone(),
+                host: None,
             });
         }
         let class = size_class(len);
@@ -109,7 +120,29 @@ impl CudaBuffer {
             len,
             class,
             ctx: ctx.clone(),
+            host: None,
         })
+    }
+
+    /// Zero-copy view of `host` when the device reads pageable host memory in place and
+    /// the bytes are non-empty and 256-byte aligned; `None` otherwise (upload instead).
+    pub(crate) fn map(ctx: &Arc<Ctx>, host: &HostData) -> Option<CudaBuffer> {
+        let b = host.bytes();
+        let addr = b.as_ptr() as usize;
+        if !ctx.host_access || b.is_empty() || !addr.is_multiple_of(MAP_ALIGN) {
+            return None;
+        }
+        Some(CudaBuffer { ptr: addr as CUdeviceptr, len: b.len(), class: 0, ctx: ctx.clone(), host: Some(host.clone()) })
+    }
+
+    /// True for a zero-copy view of host memory (device address = host address).
+    pub fn is_mapped(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// The borrowed host bytes of a mapped buffer.
+    pub(crate) fn mapped_bytes(&self) -> Option<&[u8]> {
+        self.host.as_ref().map(HostData::bytes)
     }
 
     /// Device address.
@@ -128,7 +161,8 @@ impl CudaBuffer {
 
 impl Drop for CudaBuffer {
     fn drop(&mut self) {
-        if self.class == 0 {
+        // Zero-sized and mapped buffers own no device memory.
+        if self.class == 0 || self.host.is_some() {
             return;
         }
         if let Ok(mut pool) = self.ctx.pool.lock()
@@ -181,6 +215,13 @@ pub(crate) struct Staging {
     half: usize,
     events: [CUevent; 2],
     pending: [bool; 2],
+    /// Half the next chunk goes to (alternates across calls, so back-to-back uploads overlap).
+    next: usize,
+    /// Pinned ring for small uploads (`upload_small`), its bytes in use and the event that
+    /// marks the end of its copies when it wraps.
+    ring: *mut u8,
+    ring_used: usize,
+    ring_event: CUevent,
 }
 
 // SAFETY: the pinned host pointer and events are only used by the owner (behind the
@@ -188,22 +229,56 @@ pub(crate) struct Staging {
 unsafe impl Send for Staging {}
 
 /// Bytes per staging half.
-const STAGING_HALF: usize = 4 << 20;
+const STAGING_HALF: usize = 16 << 20;
+/// Bytes of the small-upload ring.
+const RING: usize = 1 << 20;
+/// Largest upload through the ring (never waited for: host leaves of a decode step).
+pub(crate) const SMALL_UPLOAD: usize = 64 << 10;
+
+/// Host threads of one large staging copy (one memcpy stream reaches ~20 GB/s).
+const COPY_THREADS: usize = 4;
+
+/// `src` to `dst` (`src.len()` writable bytes), split over threads when large.
+///
+/// # Safety
+/// `dst` is valid for `src.len()` bytes and does not overlap `src`.
+unsafe fn copy_parallel(src: &[u8], dst: *mut u8) {
+    let part = src.len().div_ceil(COPY_THREADS).next_multiple_of(4096);
+    if src.len() < (2 << 20) || part >= src.len() {
+        // SAFETY: caller contract.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
+        return;
+    }
+    let dst = dst as usize;
+    std::thread::scope(|s| {
+        for (i, c) in src.chunks(part).enumerate() {
+            s.spawn(move || {
+                // SAFETY: disjoint sub-ranges of the caller's valid destination.
+                unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), (dst + i * part) as *mut u8, c.len()) };
+            });
+        }
+    });
+}
 
 impl Staging {
     pub fn new(drv: &Driver) -> Result<Staging> {
         let mut host: *mut c_void = std::ptr::null_mut();
         // SAFETY: allocates page-locked host memory owned by this struct.
         drv.check("cuMemAllocHost", unsafe {
-            (drv.cuMemAllocHost_v2)(&mut host, 2 * STAGING_HALF)
+            (drv.cuMemAllocHost_v2)(&mut host, 2 * STAGING_HALF + RING)
         })?;
-        let mut events = [std::ptr::null_mut(); 2];
-        for e in &mut events {
+        let mut events = [std::ptr::null_mut(); 3];
+        for (i, e) in events.iter_mut().enumerate() {
             // SAFETY: creates an event owned by this struct.
             let r = unsafe { (drv.cuEventCreate)(e, driver::EVENT_DISABLE_TIMING) };
             if r != driver::CUDA_SUCCESS {
-                // SAFETY: freeing what we just allocated.
-                unsafe { (drv.cuMemFreeHost)(host) };
+                // SAFETY: freeing what we just created / allocated.
+                unsafe {
+                    for e in &events[..i] {
+                        (drv.cuEventDestroy_v2)(*e);
+                    }
+                    (drv.cuMemFreeHost)(host);
+                }
                 return Err(Error::new(
                     "cuda",
                     format!("cuEventCreate: {}", drv.error_text(r)),
@@ -213,8 +288,13 @@ impl Staging {
         Ok(Staging {
             host: host as *mut u8,
             half: STAGING_HALF,
-            events,
+            events: [events[0], events[1]],
             pending: [false; 2],
+            next: 0,
+            // SAFETY: the ring is the tail of the allocation.
+            ring: unsafe { (host as *mut u8).add(2 * STAGING_HALF) },
+            ring_used: 0,
+            ring_event: events[2],
         })
     }
 
@@ -224,8 +304,37 @@ impl Staging {
             for e in self.events {
                 (drv.cuEventDestroy_v2)(e);
             }
+            (drv.cuEventDestroy_v2)(self.ring_event);
             (drv.cuMemFreeHost)(self.host as *mut c_void);
         }
+    }
+
+    /// Copy `src` (at most `SMALL_UPLOAD` bytes) to device address `dst` through the ring:
+    /// returns once `src` is in pinned memory, the device copy completes in stream order.
+    /// Waits only when the ring wraps (for every copy issued from it so far).
+    pub fn upload_small(&mut self, drv: &Driver, stream: CUstream, dst: CUdeviceptr, src: &[u8]) -> Result<()> {
+        debug_assert!(src.len() <= SMALL_UPLOAD);
+        let len = src.len().next_multiple_of(256);
+        if self.ring_used + len > RING {
+            // SAFETY: event + stream owned by us.
+            unsafe {
+                drv.check("cuEventRecord", (drv.cuEventRecord)(self.ring_event, stream))?;
+                drv.check("cuEventSynchronize", (drv.cuEventSynchronize)(self.ring_event))?;
+            }
+            self.ring_used = 0;
+        }
+        // SAFETY: bytes ring_used.. of the ring are not read by any pending copy (the ring
+        // was drained when it last wrapped) and `len <= RING - ring_used`.
+        unsafe {
+            let h = self.ring.add(self.ring_used);
+            std::ptr::copy_nonoverlapping(src.as_ptr(), h, src.len());
+            drv.check(
+                "cuMemcpyHtoDAsync",
+                (drv.cuMemcpyHtoDAsync_v2)(dst, h as *const c_void, src.len(), stream),
+            )?;
+        }
+        self.ring_used += len;
+        Ok(())
     }
 
     fn wait(&mut self, drv: &Driver, slot: usize) -> Result<()> {
@@ -239,21 +348,25 @@ impl Staging {
         Ok(())
     }
 
-    /// Copy `src` to device address `dst` through the staging halves; waits for the end.
+    /// Copy `src` to device address `dst` through the staging halves. With `wait`, returns
+    /// when the copy is complete; else when `src` is in staging memory (the device side
+    /// completes in stream order, before any later launch or copy on `stream`).
     pub fn upload(
         &mut self,
         drv: &Driver,
         stream: CUstream,
         dst: CUdeviceptr,
         src: &[u8],
+        wait: bool,
     ) -> Result<()> {
         for (i, chunk) in src.chunks(self.half).enumerate() {
-            let slot = i % 2;
+            let slot = self.next;
+            self.next ^= 1;
             self.wait(drv, slot)?;
             // SAFETY: the slot is idle (its last copy completed) and has `half` bytes.
             unsafe {
                 let h = self.host.add(slot * self.half);
-                std::ptr::copy_nonoverlapping(chunk.as_ptr(), h, chunk.len());
+                copy_parallel(chunk, h);
                 let d = dst + (i * self.half) as u64;
                 drv.check(
                     "cuMemcpyHtoDAsync",
@@ -266,8 +379,11 @@ impl Staging {
             }
             self.pending[slot] = true;
         }
-        self.wait(drv, 0)?;
-        self.wait(drv, 1)
+        if wait {
+            self.wait(drv, 0)?;
+            self.wait(drv, 1)?;
+        }
+        Ok(())
     }
 
     /// Copy `out.len()` bytes from device address `src` into `out`; waits for the end.

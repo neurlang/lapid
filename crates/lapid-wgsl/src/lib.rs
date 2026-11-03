@@ -291,6 +291,8 @@ pub fn plan(kernel: &Kernel, caps: &Caps) -> Result<Plan> {
         Kernel::MatMulId(s, d) => moe::plan(s, d, caps),
         Kernel::GatedDeltaNet(s, d) => delta::plan(s, d, caps),
         Kernel::RmsNorm(s, d) => rows::plan_rms_norm(s, d, caps),
+        // opt-in kernel (`CompileOptions::native_sinkhorn`): never lowered for this backend
+        Kernel::Sinkhorn(_) => Err(Error::new("unsupported", "wgsl: no native sinkhorn kernel")),
     }
 }
 
@@ -388,6 +390,15 @@ pub fn grid_threads(n: u64, caps: &Caps) -> [u32; 3] {
 pub fn check_plain(d: DType, what: &str) -> Result<()> {
     if d.is_quant() {
         return Err(Error::new("unsupported_dtype", format!("{what}: quantized dtype {} not allowed here", d.name())));
+    }
+    Ok(())
+}
+
+/// Quantized weight dtypes the WGSL kernels implement: MXFP4 is not (CPU and CUDA only), and
+/// is rejected at plan time instead of producing a shader without its loaders.
+pub fn check_quant_supported(d: DType, what: &str) -> Result<()> {
+    if d == DType::Mxfp4 {
+        return Err(Error::new("unsupported_dtype", format!("{what}: {} is not supported by the WGSL backends", d.name())));
     }
     Ok(())
 }

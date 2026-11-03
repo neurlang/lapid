@@ -81,7 +81,7 @@ pub(crate) fn bytes(d: DType, v: &[f32]) -> Vec<u8> {
             .flat_map(|x| bf16::from_f32(*x).to_le_bytes())
             .collect(),
         DType::I32 => v.iter().flat_map(|x| (*x as i32).to_le_bytes()).collect(),
-        DType::Int8 | DType::Int4 | DType::Q4K | DType::Q5K | DType::Q6K => panic!("use quant()"),
+        DType::Int8 | DType::Int4 | DType::Q4K | DType::Q5K | DType::Q6K | DType::Mxfp4 => panic!("use quant()"),
     }
 }
 
@@ -344,6 +344,7 @@ fn all_keys() -> Vec<Key> {
         keys.push(Key::GatherAxis(Arc::new(GatherAxisSpec { dtype: t })));
         keys.push(Key::TopK(Arc::new(TopKSpec { in_dtype: t }), true));
         keys.push(Key::TopK(Arc::new(TopKSpec { in_dtype: t }), false));
+        keys.push(Key::TopKSmall(Arc::new(TopKSpec { in_dtype: t })));
     }
     keys.push(Key::TopKMerge);
     for s in [mat_spec(F32, Q6K, true, vec![], None), mat_spec(F16, Int4, true, vec![], None)] {
@@ -370,11 +371,16 @@ fn all_keys() -> Vec<Key> {
         in_dtype: DType::F16,
         out_dtype: DType::F32,
     })));
+    keys.push(Key::Sinkhorn(4));
+    keys.push(Key::Sinkhorn(8));
     for rms in [false, true] {
-        keys.push(Key::LayerNorm(
-            Arc::new(LayerNormSpec { in_dtype: DType::F32, param_dtype: DType::F32, out_dtype: DType::F16 }),
-            rms,
-        ));
+        for wide in [false, true] {
+            keys.push(Key::LayerNorm(
+                Arc::new(LayerNormSpec { in_dtype: DType::F32, param_dtype: DType::F32, out_dtype: DType::F16 }),
+                rms,
+                wide,
+            ));
+        }
     }
     for causal in [false, true] {
         for mask in [None, Some(DType::F32)] {
@@ -685,3 +691,4 @@ fn softmax_and_layer_norm() {
         );
     }
 }
+

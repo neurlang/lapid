@@ -16,12 +16,14 @@ mod gdn;
 mod gemv;
 mod index;
 mod kquant;
+mod mxfp4;
 mod matmul;
 mod mma;
 mod moe;
 mod ptx;
 mod reduce;
 mod rows;
+mod sinkhorn;
 mod template;
 
 use std::sync::Arc;
@@ -56,8 +58,9 @@ pub(crate) enum Key {
     Gemv(Arc<MatMulSpec>, bool, bool, u32),
     Gather(Arc<GatherSpec>),
     Softmax(Arc<SoftmaxSpec>),
-    /// Layer norm; `true` = RMS norm (inputs [x, w]).
-    LayerNorm(Arc<LayerNormSpec>, bool),
+    /// Layer norm; `true` = RMS norm (inputs [x, w]); last flag: 1024-thread blocks (few
+    /// long rows).
+    LayerNorm(Arc<LayerNormSpec>, bool, bool),
     /// Few queries, split over key chunks; `true` = one chunk, writes the output directly
     /// (no merge stage); head dim baked in (<= 256).
     /// Last field: queries per block (they share the K / V loads).
@@ -73,6 +76,8 @@ pub(crate) enum Key {
     TopK(Arc<TopKSpec>, bool),
     /// Merge stage of the split argmax (`TopK(_, true)` over several blocks per row).
     TopKMerge,
+    /// Top-k (k > 1) of short rows: rank per column by one scan of the row in shared memory.
+    TopKSmall(Arc<TopKSpec>),
     /// MatMulId as GEMV rows (few tokens): `Gemv` with per-row expert pointers.
     GemvId(Arc<MatMulSpec>, bool, bool, u32),
     /// MatMulId routing stage (rows grouped by expert into scratch).
@@ -82,6 +87,8 @@ pub(crate) enum Key {
     GemmMmaId(Arc<MatMulSpec>, bool, bool, bool),
     /// Gated delta rule; Dk baked in.
     Gdn(Arc<GatedDeltaNetSpec>, u32),
+    /// Sinkhorn normalization of n x n matrices; n baked in.
+    Sinkhorn(u32),
 }
 
 impl Key {
@@ -92,11 +99,11 @@ impl Key {
             Key::Reduce(s, _) => s.in_dtypes.len(),
             Key::Gemm(s) | Key::GemmMma(s, ..) | Key::Gemv(s, ..) => 2 + s.extra_dtypes.len(),
             Key::Gather(_) | Key::GatherAxis(_) => 2,
-            Key::TopK(..) | Key::TopKMerge => 1,
+            Key::TopK(..) | Key::TopKMerge | Key::TopKSmall(_) => 1,
             Key::GemvId(..) | Key::MoeRoute | Key::GemmMmaId(..) => 3,
             Key::Gdn(..) => 6,
-            Key::Softmax(_) => 1,
-            Key::LayerNorm(_, rms) => 3 - *rms as usize,
+            Key::Softmax(_) | Key::Sinkhorn(_) => 1,
+            Key::LayerNorm(_, rms, _) => 3 - *rms as usize,
             Key::AttnSplit(s, ..) | Key::AttnMerge(s) | Key::AttnMma(s, ..) => {
                 3 + s.mask_dtype.is_some() as usize
             }
@@ -159,18 +166,19 @@ impl Key {
             Key::Gemv(..) => "gemv",
             Key::Gather(_) => "gather",
             Key::Softmax(_) => "softmax",
-            Key::LayerNorm(_, false) => "layer_norm",
-            Key::LayerNorm(_, true) => "rms_norm",
+            Key::LayerNorm(_, false, _) => "layer_norm",
+            Key::LayerNorm(_, true, _) => "rms_norm",
             Key::AttnSplit(..) => "attention_split",
             Key::AttnMerge(_) => "attention_merge",
             Key::AttnMma(..) => "attention_mma",
             Key::GatherAxis(_) => "gather_axis",
-            Key::TopK(..) => "topk",
+            Key::TopK(..) | Key::TopKSmall(_) => "topk",
             Key::TopKMerge => "topk_merge",
             Key::GemvId(..) => "gemv_id",
             Key::MoeRoute => "moe_route",
             Key::GemmMmaId(..) => "gemm_mma_id",
             Key::Gdn(..) => "gated_delta_net",
+            Key::Sinkhorn(_) => "sinkhorn",
         }
     }
 }
@@ -223,6 +231,7 @@ pub(crate) fn plan(kernel: &Kernel, caps: &Caps) -> Result<Plan> {
         Kernel::TopK(s, d) => index::plan_topk(s, d, caps),
         Kernel::MatMulId(s, d) => moe::plan(s, d, caps),
         Kernel::GatedDeltaNet(s, d) => gdn::plan(s, d, caps),
+        Kernel::Sinkhorn(d) => sinkhorn::plan(d, caps),
     }?;
     let mut stage = Some(&p);
     while let Some(s) = stage {
@@ -255,13 +264,15 @@ pub(crate) fn source(key: &Key, _caps: &Caps) -> String {
         Key::Gdn(s, dk) => gdn::source(s, *dk as usize),
         Key::Gather(s) => rows::source_gather(s),
         Key::Softmax(s) => rows::source_softmax(s),
-        Key::LayerNorm(s, rms) => rows::source_layer_norm(s, *rms),
+        Key::LayerNorm(s, rms, wide) => rows::source_layer_norm(s, *rms, *wide),
         Key::AttnSplit(s, direct, d, qb) => attention::source_split(s, *direct, *d, *qb),
         Key::AttnMerge(s) => attention::source_merge(s),
         Key::AttnMma(s, d, vec, precise) => flash::source(s, *d, *vec, *precise),
         Key::GatherAxis(s) => index::source_gather_axis(s),
         Key::TopK(s, k1) => index::source_topk(s, *k1),
         Key::TopKMerge => index::source_topk_merge(),
+        Key::TopKSmall(s) => index::source_topk_small(s),
+        Key::Sinkhorn(n) => sinkhorn::source(*n),
     }
 }
 

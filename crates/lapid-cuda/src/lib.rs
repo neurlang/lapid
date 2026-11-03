@@ -14,7 +14,7 @@
 //! - `LAPID_DEBUG=1` writes every kernel to `$LAPID_KERNEL_DIR` (default `<tmp>/lapid-kernels`)
 //!   and prints the JIT info log; JIT errors always carry the log and numbered source.
 //! - `LAPID_PROFILE=1` times every launch with events and prints per-kernel totals when the
-//!   backend is dropped (`CudaBackend::profile_report`).
+//!   backend is dropped (`=2`: per kernel and launch shape). See `CudaBackend::profile_report`.
 //! - `LAPID_CUDA_NO_MMA=1` forces the scalar (non-tensor-core) kernels (testing).
 //! - `LAPID_CUDA_FAST_ATTENTION=1` rounds f32 q/k/v to f16 in the tensor-core flash attention
 //!   (default: hi/lo f16 splits, ~f32 accuracy, about 2.5x the attention time).
@@ -39,9 +39,13 @@ mod matmul_attn_tests;
 mod memory;
 mod module;
 #[cfg(test)]
+mod mxfp4_tests;
+#[cfg(test)]
 mod r5_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod write_tests;
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -101,6 +105,9 @@ impl CudaBackend {
         }
         if self.ctx.integrated {
             v.push("unified memory".to_string());
+        }
+        if self.ctx.host_access {
+            v.push("host page tables".to_string());
         }
         v.push(format!("PTX {}.{}", c.ptx_isa / 10, c.ptx_isa % 10));
         v.join(", ")
@@ -175,6 +182,10 @@ impl Backend for CudaBackend {
         self.ctx.name.clone()
     }
 
+    fn compile_options(&self) -> lapid_compiler::CompileOptions {
+        lapid_compiler::CompileOptions { native_sinkhorn: true, ..Default::default() }
+    }
+
     fn alloc(&self, bytes: usize) -> Result<DeviceData> {
         Ok(Arc::new(CudaBuffer::alloc(&self.ctx, bytes)?))
     }
@@ -187,8 +198,31 @@ impl Backend for CudaBackend {
         Ok(Arc::new(buf))
     }
 
+    fn map_host(&self, host: &lapid_tensor::HostData) -> Result<Option<DeviceData>> {
+        Ok(CudaBuffer::map(&self.ctx, host).map(|b| Arc::new(b) as DeviceData))
+    }
+
+    fn write(&self, buf: &DeviceData, offset: usize, bytes: &[u8]) -> Result<()> {
+        let b = as_cuda(buf, &self.ctx)?;
+        if b.is_mapped() {
+            return Err(Error::new("invalid_argument", "write into a read-only mapped buffer"));
+        }
+        if offset.checked_add(bytes.len()).is_none_or(|end| end > b.len_bytes()) {
+            return Err(Error::new("invalid_argument", format!("write of {} bytes at {offset} outside a {}-byte buffer", bytes.len(), b.len_bytes())));
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        // The host copies `bytes` into pinned staging memory and the copy engine moves
+        // them: the device never reads (possibly file-backed) pageable memory in place.
+        self.lock()?.write(&self.ctx, b, offset, bytes)
+    }
+
     fn download(&self, buf: &DeviceData) -> Result<Vec<u8>> {
         let b = as_cuda(buf, &self.ctx)?;
+        if let Some(bytes) = b.mapped_bytes() {
+            return Ok(bytes.to_vec());
+        }
         let mut out = vec![0u8; b.len_bytes()];
         if !out.is_empty() {
             self.lock()?.download(&self.ctx, b, &mut out)?;

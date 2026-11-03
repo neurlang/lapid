@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
-use lapid_compiler::{Backend, BufferSource, CompileOptions};
+use lapid_compiler::{Backend, BufferSource};
 use lapid_tensor::{DType, DeviceData, Error, Op, Result, Tensor, bail};
 
 mod cache;
@@ -29,6 +29,19 @@ use pool::Pool;
 /// (they only hold caches / free lists).
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What `Runtime::host_leaf` resolved a host leaf to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostLeaf {
+    /// A file-backed weight uploaded once and kept.
+    Pinned,
+    /// A weight read in place from its mapping by the CPU.
+    Mapped,
+    /// A weight read in place by a GPU: lock its pages in memory around every execute.
+    MappedGpu,
+    /// Other host data (transient upload cache).
+    Transient,
 }
 
 /// A graph keyed and planned, ready to run.
@@ -154,7 +167,7 @@ impl Runtime {
             Some((p, _)) => p,
             None => {
                 let owned: Vec<Tensor> = outputs.iter().map(|t| (*t).clone()).collect();
-                let schedule = lapid_compiler::compile(&owned, &CompileOptions::default())?;
+                let schedule = lapid_compiler::compile(&owned, &self.backend.compile_options())?;
                 if debug {
                     crate::log::emit(&format!(
                         "[lapid] {}: compiled {} launches, {} buffers, {} temp slots in {:.3} ms\n{}",
@@ -235,8 +248,33 @@ impl Runtime {
     }
 
     fn resolve_host(&self, h: &lapid_tensor::HostData) -> Result<DeviceData> {
-        let pinned = crate::file::is_file_backed(h.key());
-        self.cache.get_or_upload(h, &*self.backend, pinned)
+        let (d, kind) = self.host_leaf(h)?;
+        if kind == HostLeaf::MappedGpu {
+            // Outside an eval nothing can keep the pages locked until the GPU reads them.
+            crate::residency::populate_many(&crate::residency::read_slices(h));
+        }
+        Ok(d)
+    }
+
+    /// Device buffer of a (shared) host leaf and what it is. Weights are mapped in place
+    /// under `Residency::Mmap` when the backend can, else uploaded once and pinned; other
+    /// host data goes through the transient upload cache.
+    fn host_leaf(&self, h: &lapid_tensor::HostData) -> Result<(DeviceData, HostLeaf)> {
+        match crate::file::weight_residency(h.key()) {
+            Some(r) => {
+                if r == crate::Residency::Mmap
+                    && !h.is_empty()
+                    && let Some(d) = self.backend.map_host(h)?
+                {
+                    // A GPU must not page-fault on the mapping (slow, and wrong data on
+                    // some drivers): the host reads in and locks the pages around execute.
+                    let gpu = self.backend.name() != "cpu";
+                    return Ok((d, if gpu { HostLeaf::MappedGpu } else { HostLeaf::Mapped }));
+                }
+                Ok((self.cache.get_or_upload(h, &*self.backend, true)?, HostLeaf::Pinned))
+            }
+            None => Ok((self.cache.get_or_upload(h, &*self.backend, false)?, HostLeaf::Transient)),
+        }
     }
 
     fn resolve_device(&self, d: &DeviceData) -> Result<DeviceData> {
@@ -269,6 +307,8 @@ impl Runtime {
             }
         }
         let mut buffers = Vec::with_capacity(plan.bufs.len());
+        // Mapped weights to populate before a GPU executes (not memoized: every eval).
+        let mut populate: Vec<&[u8]> = Vec::new();
         for (id, b) in plan.bufs.iter().enumerate() {
             let buf = match &b.src {
                 PlanSrc::Leaf(i) => {
@@ -287,10 +327,15 @@ impl Runtime {
                                     if b.is_empty() { self.backend.upload(&[0u8; 4])? } else { self.backend.upload(b)? }
                                 }
                                 LeafRef::Host(h) => {
-                                    let pinned = crate::file::is_file_backed(h.key());
-                                    let d = self.cache.get_or_upload(h, &*self.backend, pinned)?;
-                                    if pinned && let Some(m) = memo.as_deref_mut() && let Some(e) = m.get_mut(*i) {
-                                        *e = Some((h.clone(), d.clone()));
+                                    let (d, kind) = self.host_leaf(h)?;
+                                    match kind {
+                                        HostLeaf::Pinned | HostLeaf::Mapped => {
+                                            if let Some(m) = memo.as_deref_mut() && let Some(e) = m.get_mut(*i) {
+                                                *e = Some((h.clone(), d.clone()));
+                                            }
+                                        }
+                                        HostLeaf::MappedGpu => populate.extend(crate::residency::read_slices(h)),
+                                        HostLeaf::Transient => {}
                                     }
                                     d
                                 }
@@ -311,6 +356,11 @@ impl Runtime {
             buffers.push(buf);
         }
         drop(memo);
+        // Locked until the launches completed (dropped at the end of this function).
+        let _pinned = (!populate.is_empty()).then(|| {
+            let _p = tracing::trace_span!("eval.pin").entered();
+            crate::residency::pin_many(&populate)
+        });
         let t_resolve = t0.elapsed();
         drop(resolve_span);
         let _exec = tracing::trace_span!("eval.execute").entered();
@@ -334,12 +384,23 @@ impl Runtime {
         Ok((buffers, t_resolve, t_exec))
     }
 
+    pub(crate) fn alloc(&self, shape: &[usize], dtype: DType) -> Result<Tensor> {
+        let bytes = storage_bytes(shape, dtype)?;
+        Ok(Tensor::from_device(self.backend.alloc(bytes.max(4))?, shape, dtype))
+    }
+
+    pub(crate) fn write(&self, t: &Tensor, offset: usize, bytes: &[u8]) -> Result<()> {
+        match t.op() {
+            Op::Device(d) if self.owns(d) => self.backend.write(d, offset, bytes),
+            _ => bail!("invalid_argument", "write: not a device tensor of this {} device", self.backend.name()),
+        }
+    }
+
     /// Upload a host leaf now (cached), or realize anything else on this device.
     pub(crate) fn upload(&self, t: &Tensor) -> Result<Tensor> {
         match t.op() {
             Op::Host(h) => {
-                let pinned = crate::file::is_file_backed(h.key());
-                let buf = self.cache.get_or_upload(h, &*self.backend, pinned)?;
+                let buf = self.resolve_host(h)?;
                 Ok(Tensor::from_device(buf, t.shape(), t.dtype()))
             }
             Op::Device(d) if self.owns(d) => Ok(t.clone()),
@@ -428,12 +489,15 @@ impl Runtime {
 
 /// Storage size of `t`, validated so quantized shapes never panic.
 fn expected_bytes(t: &Tensor) -> Result<usize> {
-    let dt = t.dtype();
+    storage_bytes(t.shape(), t.dtype())
+}
+
+fn storage_bytes(shape: &[usize], dt: DType) -> Result<usize> {
     let block = dt.quant_format().map_or(DType::QUANT_GROUP, |f| f.block_elems());
-    if dt.is_quant() && (!(2..=3).contains(&t.rank()) || t.shape()[t.rank() - 1] % block != 0) {
-        bail!("shape_mismatch", "quantized {} tensor has invalid shape {:?}", dt.name(), t.shape());
+    if dt.is_quant() && (!(2..=3).contains(&shape.len()) || !shape[shape.len() - 1].is_multiple_of(block)) {
+        bail!("shape_mismatch", "quantized {} tensor has invalid shape {:?}", dt.name(), shape);
     }
-    Ok(dt.storage_bytes(t.shape()))
+    Ok(dt.storage_bytes(shape))
 }
 
 /// Download a buffer owned by another backend through a live runtime of that backend.

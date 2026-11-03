@@ -154,6 +154,16 @@ pub(crate) fn io_binds(n: usize) -> Vec<Bind> {
 }
 
 pub(crate) fn plan(kernel: &Kernel) -> Result<Plan> {
+    // MXFP4 weights have no Metal kernels (CPU / CUDA only).
+    let weights = match kernel {
+        Kernel::MatMul(s, _) => Some(s.b_dtype),
+        Kernel::Gather(s, _) => Some(s.table_dtype),
+        Kernel::MatMulId(s, _) => Some(s.w_dtype),
+        _ => None,
+    };
+    if weights == Some(DType::Mxfp4) {
+        return Err(Error::new("unsupported_dtype", "metal: mxfp4 weights are not supported"));
+    }
     match kernel {
         Kernel::Elementwise(s, d) => elementwise::plan(s, d).map(Plan::single),
         Kernel::Reduce(s, d) => reduce::plan(s, d).map(Plan::single),
@@ -167,6 +177,8 @@ pub(crate) fn plan(kernel: &Kernel) -> Result<Plan> {
         Kernel::MatMulId(s, d) => matmul_id::plan_matmul_id(s, d),
         Kernel::GatedDeltaNet(s, d) => matmul_id::plan_delta_net(s, d),
         Kernel::RmsNorm(s, d) => rows::plan_rms_norm(s, d).map(Plan::single),
+        // opt-in kernel (`CompileOptions::native_sinkhorn`): never lowered for this backend
+        Kernel::Sinkhorn(_) => Err(Error::new("unsupported", "metal: no native sinkhorn kernel")),
     }
 }
 

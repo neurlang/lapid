@@ -24,7 +24,7 @@ use lapid_tensor::fxhash::{FxHashMap, FxHasher};
 use lapid_tensor::walk::{MARK_MAX, Marker};
 use lapid_tensor::{DeviceData, HostData, Op, Tensor};
 
-use super::predict::{Line, Sample};
+use super::predict::{AltLines, Line, Sample};
 
 /// Max exact plans cached over all structures.
 const MAX_PLANS: usize = 512;
@@ -119,6 +119,7 @@ fn op_code(op: &Op) -> u64 {
         Op::MatMulId => 24,
         Op::GatedDeltaNet { .. } => 25,
         Op::RmsNorm { .. } => 26,
+        Op::Sinkhorn { .. } => 27,
     }
 }
 
@@ -260,6 +261,7 @@ impl GraphKey {
                         dims.push(*start as u64);
                     }
                     Op::GatedDeltaNet { scale } => w.push(scale.to_bits() as u64),
+                    Op::Sinkhorn { iters, eps } => w.extend([*iters as u64, eps.to_bits() as u64]),
                     Op::Where | Op::Reshape | Op::Expand | Op::Contiguous | Op::Gather | Op::Softmax | Op::MatMulId => {}
                 }
             }
@@ -357,6 +359,7 @@ struct Entry {
     /// Exactly compiled plans by (dims hash, dims) (most recent last).
     exact: VecDeque<(u64, Vec<u64>, Arc<Plan>)>,
     line: Option<Line>,
+    alt: AltLines,
 }
 
 /// How a plan was obtained.
@@ -380,6 +383,8 @@ pub(crate) struct PlanCache {
 
 /// Exact plans kept per structure (repeated runs over the same lengths hit them).
 const MAX_EXACT: usize = 128;
+/// Exact plans a structure keeps when the cache is full before whole structures go.
+const KEEP_EXACT: usize = 8;
 
 impl PlanCache {
     /// An exact plan for `key`, else one predicted from earlier compiles of its structure.
@@ -391,7 +396,10 @@ impl PlanCache {
         if predict_disabled() {
             return None;
         }
-        let p = e.line.as_mut()?.predict(&key.dims)?;
+        let p = match e.line.as_mut().and_then(|l| l.predict(&key.dims)) {
+            Some(p) => p,
+            None => e.alt.predict(&key.dims)?,
+        };
         Some((p, Lookup::Predicted))
     }
 
@@ -401,11 +409,21 @@ impl PlanCache {
             return;
         }
         let found = self.map.get(&key.hash).is_some_and(|v| v.iter().any(|e| e.words == key.words));
+        // Over the plan budget, a structure with many exact plans (a decode step compiles
+        // new dims every step) drops its oldest first: evicting whole structures would
+        // throw away the lines that predict the next steps.
+        if self.count >= MAX_PLANS
+            && let Some(e) = self.map.get_mut(&key.hash).and_then(|v| v.iter_mut().find(|e| e.words == key.words))
+            && e.exact.len() > KEEP_EXACT
+        {
+            e.exact.pop_front();
+            self.count -= 1;
+        }
         while (self.count >= MAX_PLANS || (!found && self.words + key.words.len() > MAX_KEY_WORDS)) && self.evict_one() {}
         let found = self.map.get(&key.hash).is_some_and(|v| v.iter().any(|e| e.words == key.words));
         if !found {
             self.words += key.words.len();
-            self.map.entry(key.hash).or_default().push(Entry { words: key.words.clone(), exact: VecDeque::new(), line: None });
+            self.map.entry(key.hash).or_default().push(Entry { words: key.words.clone(), exact: VecDeque::new(), line: None, alt: AltLines::default() });
             self.order.push_back(key.hash);
         }
         let Some(e) = self.map.get_mut(&key.hash).and_then(|v| v.iter_mut().find(|e| e.words == key.words)) else {
@@ -417,7 +435,9 @@ impl PlanCache {
         }
         self.count += 1;
         e.exact.push_back((key.dims_hash, key.dims.clone(), plan.clone()));
-        e.line = Some(Line::record(e.line.take(), Sample::new(key.dims.clone(), plan)));
+        let s = Sample::new(key.dims.clone(), plan);
+        e.alt.record(&s);
+        e.line = Some(Line::record(e.line.take(), s));
     }
 
     /// Drop the oldest structure. Returns false when empty.

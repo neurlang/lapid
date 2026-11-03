@@ -46,6 +46,8 @@ pub(crate) enum Timing<'a> {
 #[derive(Default)]
 pub(crate) struct Profile {
     pub enabled: bool,
+    /// `LAPID_PROFILE=2`: totals per kernel and launch shape (grid, block, params).
+    pub shapes: bool,
     /// kernel name → (launches, ms)
     by_name: HashMap<String, (usize, f64)>,
     /// kernel kind → (launches, ms), drained by `take_profile`
@@ -131,11 +133,12 @@ struct Bind<'a> {
     flag: u64,
 }
 
-/// Launches in the first captured graph chunk of an execute, and in every later one.
-const FIRST_CHUNK: usize = 16;
+/// Launches of a graph-captured execute issued directly before the first captured chunk
+/// (the GPU starts at once instead of after a capture + graph update), and per chunk.
+const DIRECT: usize = 4;
 const CHUNK: usize = 64;
 
-/// (first, later) chunk sizes; `LAPID_CUDA_CHUNK=first,later` overrides (experiments).
+/// (direct launches, chunk size); `LAPID_CUDA_CHUNK=direct,chunk` overrides (experiments).
 fn chunk_sizes() -> (usize, usize) {
     static V: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -145,7 +148,7 @@ fn chunk_sizes() -> (usize, usize) {
                 let (a, b) = v.split_once(',')?;
                 Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
             })
-            .unwrap_or((FIRST_CHUNK, CHUNK))
+            .unwrap_or((DIRECT, CHUNK))
     })
 }
 
@@ -169,6 +172,7 @@ impl Exec {
         })?;
         let prof = Profile {
             enabled: profiling_enabled(),
+            shapes: std::env::var("LAPID_PROFILE").is_ok_and(|v| v == "2"),
             ..Profile::default()
         };
         let use_graphs = graph::enabled(ctx.drv);
@@ -220,10 +224,24 @@ impl Exec {
             .ok_or_else(|| Error::new("cuda", "staging buffer missing"))
     }
 
+    /// Fill `dst` with `bytes`. Small ones (host leaves of a decode step) return once the
+    /// bytes are in pinned memory (the copy completes in stream order, before any later
+    /// launch or download); larger ones wait for the copy.
     pub fn upload(&mut self, ctx: &Ctx, dst: &CudaBuffer, bytes: &[u8]) -> Result<()> {
         ctx.bind()?;
         let stream = self.stream;
-        self.staging(ctx)?.upload(ctx.drv, stream, dst.ptr(), bytes)
+        if bytes.len() <= crate::memory::SMALL_UPLOAD {
+            return self.staging(ctx)?.upload_small(ctx.drv, stream, dst.ptr(), bytes);
+        }
+        self.staging(ctx)?.upload(ctx.drv, stream, dst.ptr(), bytes, true)
+    }
+
+    /// Copy `bytes` to `dst` at byte `offset` (in range: checked by the caller); returns
+    /// once `bytes` is in staging memory, the device copy completes in stream order.
+    pub fn write(&mut self, ctx: &Ctx, dst: &CudaBuffer, offset: usize, bytes: &[u8]) -> Result<()> {
+        ctx.bind()?;
+        let stream = self.stream;
+        self.staging(ctx)?.upload(ctx.drv, stream, dst.ptr() + offset as u64, bytes, false)
     }
 
     pub fn download(&mut self, ctx: &Ctx, src: &CudaBuffer, out: &mut [u8]) -> Result<()> {
@@ -293,10 +311,13 @@ impl Exec {
         let host_t0 = std::time::Instant::now();
         ctx.bind()?;
         let drv = ctx.drv;
-        let ptrs: Vec<u64> = buffers
-            .iter()
-            .map(|d| as_cuda(d, ctx).map(|b| b.ptr()))
-            .collect::<Result<_>>()?;
+        let mut ptrs: Vec<u64> = Vec::with_capacity(buffers.len());
+        let mut mapped: Vec<bool> = Vec::with_capacity(buffers.len());
+        for d in buffers {
+            let b = as_cuda(d, ctx)?;
+            ptrs.push(b.ptr());
+            mapped.push(b.mapped_bytes().is_some());
+        }
 
         // plan every stage first (validates the whole schedule before anything runs)
         let mut items: Vec<Item> = Vec::with_capacity(launches.len());
@@ -333,6 +354,12 @@ impl Exec {
                     format!("launch {li}: buffer id {id} out of range"),
                 ));
             }
+            if mapped[l.output] {
+                return Err(Error::new(
+                    "read_only_buffer",
+                    format!("launch {li}: output buffer {} is mapped host memory (read-only)", l.output),
+                ));
+            }
             scratch_bytes = scratch_bytes.max(plan.scratch);
             loop {
                 let next = plan.next.take();
@@ -367,16 +394,26 @@ impl Exec {
         // small multi-launch executes go through a captured graph (not when timing: events
         // between launches would be captured too)
         // Long executes are captured in chunks, each launched as soon as it is captured, so
-        // the GPU runs chunk i while the host captures chunk i + 1 (the first chunk is short
-        // to start the GPU early).
+        // the GPU runs chunk i while the host captures chunk i + 1; the first few launches
+        // are issued directly, so the GPU starts while the first chunk is captured.
         let capture = self.use_graphs && !timed && items.len() >= 2;
+        // trace: GPU span of the execute (first launch start to last launch end)
+        let span = trace_enabled() && capture;
+        if span {
+            self.ensure_events(ctx, 2)?;
+        }
         let mut kernels = Vec::with_capacity(items.len());
         let bind = Bind { ptrs: &ptrs, scratch, flag };
         if capture {
-            let mut start = 0;
+            let (direct, len) = chunk_sizes();
+            let mut start = if items.len() - direct.min(items.len()) < 2 { items.len() } else { direct };
+            if span {
+                // SAFETY: event + stream owned by us.
+                drv.check("cuEventRecord", unsafe { (drv.cuEventRecord)(self.events[0], self.stream) })?;
+            }
+            self.issue(ctx, modules, &items[..start], &bind, false, &mut kernels)?;
             while start < items.len() {
-                let len = if start == 0 { chunk_sizes().0 } else { chunk_sizes().1 };
-                let end = (start + len).min(items.len());
+                let end = (start + len.max(1)).min(items.len());
                 let end = if items.len() - end < 2 { items.len() } else { end };
                 let chunk = &items[start..end];
                 let k0 = kernels.len();
@@ -400,6 +437,10 @@ impl Exec {
                 update_ms += t.elapsed().as_secs_f64() * 1e3;
                 start = end;
             }
+            if span {
+                // SAFETY: as above.
+                drv.check("cuEventRecord", unsafe { (drv.cuEventRecord)(self.events[1], self.stream) })?;
+            }
         } else {
             self.issue(ctx, modules, &items, &bind, timed, &mut kernels)?;
         }
@@ -412,8 +453,13 @@ impl Exec {
             )
         })?;
         if trace_enabled() {
+            let mut gpu = 0f32;
+            if span {
+                // SAFETY: both events were recorded on our (now idle) stream.
+                drv.check("cuEventElapsedTime", unsafe { (drv.cuEventElapsedTime)(&mut gpu, self.events[0], self.events[1]) })?;
+            }
             eprintln!(
-                "[lapid-cuda] execute: {} launches, host {host_ms:.3} ms, wait {:.3} ms, graph {capture} (plan {plan_ms:.3}, graph update+launch {update_ms:.3}; graphs updated/instantiated/rejected {:?})",
+                "[lapid-cuda] execute: {} launches, host {host_ms:.3} ms, wait {:.3} ms, gpu span {gpu:.3} ms, graph {capture} (plan {plan_ms:.3}, graph update+launch {update_ms:.3}; graphs updated/instantiated/rejected {:?})",
                 items.len(),
                 sync_t0.elapsed().as_secs_f64() * 1e3,
                 self.graphs.stats
@@ -437,7 +483,15 @@ impl Exec {
             }
             if self.prof.enabled {
                 for ((it, k), &t) in items.iter().zip(&kernels).zip(&ms) {
-                    self.prof.add(&k.name, it.plan.key.label(), t);
+                    if self.prof.shapes {
+                        let name = format!(
+                            "{} grid {:?} block {} params {:?}",
+                            k.name, it.plan.grid, it.plan.block, it.plan.params
+                        );
+                        self.prof.add(&name, it.plan.key.label(), t);
+                    } else {
+                        self.prof.add(&k.name, it.plan.key.label(), t);
+                    }
                 }
                 self.prof.host_ms += host_ms;
                 self.prof.executes += 1;

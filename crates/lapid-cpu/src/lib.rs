@@ -23,6 +23,7 @@ mod kquant;
 mod math;
 mod matmul;
 mod moe;
+mod mxfp4;
 mod par;
 mod qmat;
 mod reduce;
@@ -244,6 +245,24 @@ impl Backend for CpuBackend {
 
     fn upload(&self, bytes: &[u8]) -> Result<DeviceData> {
         Ok(Arc::new(CpuBuffer::from_bytes(bytes)?))
+    }
+
+    fn map_host(&self, host: &lapid_tensor::HostData) -> Result<Option<DeviceData>> {
+        Ok(CpuBuffer::map(host).map(|b| Arc::new(b) as DeviceData))
+    }
+
+    fn write(&self, buf: &DeviceData, offset: usize, bytes: &[u8]) -> Result<()> {
+        let b = as_cpu(buf)?;
+        if b.is_mapped() {
+            return Err(Error::new("invalid_argument", "write into a read-only mapped buffer"));
+        }
+        if offset.checked_add(bytes.len()).is_none_or(|end| end > b.len()) {
+            return Err(Error::new("invalid_argument", format!("write of {} bytes at {offset} outside a {}-byte buffer", bytes.len(), b.len())));
+        }
+        // SAFETY: in range (checked), our own heap allocation (not mapped); execute is
+        // synchronous, so no kernel reads or writes it now (caller contract).
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.as_ptr().add(offset), bytes.len()) };
+        Ok(())
     }
 
     fn download(&self, buf: &DeviceData) -> Result<Vec<u8>> {
@@ -486,6 +505,8 @@ fn run_launch(ctx: &Ctx, ws: &mut Workspace, l: &Launch, bufs: &[&CpuBuffer], co
             let extra = delta::Extra { state: xdst(copies.state, Some(5))?, o: xdst(copies.o, None)? };
             delta::gated_delta_net(ctx, dims, &inputs, &out_buf.dst(spec.out_dtype)?, &extra)
         }
+        // opt-in kernel (`CompileOptions::native_sinkhorn`): the CPU runs the decomposition
+        Kernel::Sinkhorn(_) => Err(Error::new("unsupported", "cpu: no native sinkhorn kernel")),
         Kernel::Attention(spec, dims) => {
             expect(3 + spec.mask_dtype.is_some() as usize)?;
             let inputs = AttnInputs {
