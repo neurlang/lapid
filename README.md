@@ -1,5 +1,9 @@
 <div align="center">
 
+<a href="https://github.com/thewh1teagle/lapid">
+  <img src="docs/assets/banner.webp" alt="Lapid: one Rust engine for LLMs, speech to text, text to speech and vision" width="100%">
+</a>
+
 # 🔥 Lapid
 
 **Fast ML inference on every device. Pure Rust.**
