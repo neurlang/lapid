@@ -119,6 +119,18 @@ typedef int32_t lapid_reduce_op;
 
 #define LAPID_DTYPE_MXFP4 9
 
+// ggml IQ2_XXS super-blocks (2.06 bpw).
+#define LAPID_DTYPE_IQ2_XXS 10
+
+// ggml IQ2_S super-blocks (2.56 bpw).
+#define LAPID_DTYPE_IQ2_S 11
+
+// ggml IQ3_XXS super-blocks (3.06 bpw).
+#define LAPID_DTYPE_IQ3_XXS 12
+
+// ggml IQ2_XS super-blocks (2.31 bpw).
+#define LAPID_DTYPE_IQ2_XS 13
+
 #define LAPID_UNARY_NEG 0
 
 #define LAPID_UNARY_EXP 1
