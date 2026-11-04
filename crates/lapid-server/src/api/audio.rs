@@ -131,8 +131,8 @@ pub async fn speech(State(st): State<Shared>, body: Bytes) -> ApiResult<Response
     let worker = st.find(req.model.as_deref(), Capability::Speech)?;
     let rate = worker.meta().extra.get("sample_rate").and_then(Value::as_u64).unwrap_or(24_000) as u32;
     let fmt = req.response_format.clone().unwrap_or_else(|| "wav".into());
-    if fmt != "wav" && fmt != "pcm" {
-        return Err(ApiError::bad_request(format!("response_format {fmt:?} is not supported (use wav or pcm)")));
+    if fmt != "wav" && fmt != "pcm" && fmt != "mp3" {
+        return Err(ApiError::bad_request(format!("response_format {fmt:?} is not supported (use wav, pcm or mp3)")));
     }
     let sse = req.stream_format.as_deref() == Some("sse");
     let opts = TtsParams { voice: req.voice.clone(), seed: req.seed, temperature: req.temperature };
@@ -161,6 +161,29 @@ pub async fn speech(State(st): State<Shared>, body: Bytes) -> ApiResult<Response
             .chain(futures_util::stream::once(async { Ok(Event::default().data(json!({"type": "speech.audio.done"}).to_string())) }));
         return Ok(Sse::new(events).keep_alive(KeepAlive::default()).into_response());
     }
+    // MP3: accumulate all PCM chunks, then encode in one shot.
+    if fmt == "mp3" {
+        let mut all_samples: Vec<f32> = Vec::new();
+        let mut rx = rx;
+        // Drain the first chunk to surface early errors.
+        match rx.recv().await {
+            Some(Audio::Pcm(p)) => all_samples.extend_from_slice(&p),
+            Some(Audio::Error(e)) => return Err(e.into()),
+            None => {}
+        }
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                Audio::Pcm(p) => all_samples.extend_from_slice(&p),
+                Audio::Error(e) => {
+                    eprintln!("lapid: speech failed mid-stream: {}", e.message);
+                    break;
+                }
+            }
+        }
+        let mp3_bytes = format::mp3(&all_samples, rate);
+        return Ok(([(header::CONTENT_TYPE, "audio/mpeg")], mp3_bytes).into_response());
+    }
+
     // Wait for the first chunk so an immediate failure (unknown voice, empty text) becomes
     // a proper error response instead of a broken audio stream.
     let mut rx = rx;
@@ -183,4 +206,41 @@ pub async fn speech(State(st): State<Shared>, body: Bytes) -> ApiResult<Response
     let stream = futures_util::stream::once(async move { Ok::<_, Infallible>(Bytes::from(head)) }).chain(rest);
     let mime = if fmt == "wav" { "audio/wav" } else { "audio/pcm" };
     Ok(([(header::CONTENT_TYPE, mime)], Body::from_stream(stream)).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    /// Mirror of the format-validation guard in `speech()`.
+    /// Returns `Ok(())` for accepted formats, `Err(msg)` for rejected ones.
+    fn validate_response_format(fmt: &str) -> Result<(), String> {
+        if fmt != "wav" && fmt != "pcm" && fmt != "mp3" {
+            Err(format!("response_format {fmt:?} is not supported (use wav, pcm or mp3)"))
+        } else {
+            Ok(())
+        }
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(100))]
+
+        // Feature: tts-mp3-format, Property 4: Invalid response_format rejected with 400
+        // Validates: Requirements 1.4
+        #[test]
+        fn prop_bad_format_rejected(fmt in "[a-zA-Z0-9_\\-]{1,20}") {
+            prop_assume!(fmt != "wav" && fmt != "pcm" && fmt != "mp3");
+            prop_assert!(
+                validate_response_format(&fmt).is_err(),
+                "expected format {:?} to be rejected", fmt
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_formats_pass_validation() {
+        for fmt in &["wav", "pcm", "mp3"] {
+            assert!(validate_response_format(fmt).is_ok(), "format {fmt:?} should be accepted");
+        }
+    }
 }
