@@ -40,6 +40,9 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 rust-embed = { version = "8", features = ["debug-embed"] }
 mime_guess = "2"
 base64 = "0.22"
+shine-rs = "0.1"
+puremp3 = "0.1"
+proptest = "1"
 lapid-server = { path = "crates/lapid-server", default-features = false }
 
 # CUDA driver (libcuda / nvcuda.dll) is loaded at runtime; libloading is pure Rust.

@@ -29,3 +29,8 @@ rust-embed = { workspace = true }
 flate2 = { workspace = true }
 mime_guess = { workspace = true }
 base64 = { workspace = true }
+shine-rs = { workspace = true }
+
+[dev-dependencies]
+puremp3 = { workspace = true }
+proptest = { workspace = true }
