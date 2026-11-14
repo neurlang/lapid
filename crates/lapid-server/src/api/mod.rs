@@ -51,6 +51,15 @@ impl ApiError {
         ApiError { status: StatusCode::NOT_FOUND, kind: "invalid_request_error", code: code.into(), message: message.into() }
     }
 
+    pub fn internal(message: impl Into<String>) -> ApiError {
+        ApiError {
+            status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            kind: "internal_error",
+            code: "internal_error".into(),
+            message: message.into(),
+        }
+    }
+
     pub fn body(&self) -> Value {
         json!({"error": {"message": self.message, "type": self.kind, "code": self.code, "param": null}})
     }
@@ -62,7 +71,7 @@ impl From<lapid::Error> for ApiError {
             "invalid_argument" | "unsupported" | "unsupported_dtype" | "wav" | "audio" | "tokenizer" => {
                 (StatusCode::BAD_REQUEST, "invalid_request_error")
             }
-            "not_found" => (StatusCode::NOT_FOUND, "invalid_request_error"),
+            "not_found" | "internal_error" => (StatusCode::NOT_FOUND, "invalid_request_error"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
         };
         ApiError { status, kind, code: e.code.to_string(), message: e.message }
