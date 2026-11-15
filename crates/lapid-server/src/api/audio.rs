@@ -161,27 +161,88 @@ pub async fn speech(State(st): State<Shared>, body: Bytes) -> ApiResult<Response
             .chain(futures_util::stream::once(async { Ok(Event::default().data(json!({"type": "speech.audio.done"}).to_string())) }));
         return Ok(Sse::new(events).keep_alive(KeepAlive::default()).into_response());
     }
-    // MP3: accumulate all PCM chunks, then encode in one shot.
     if fmt == "mp3" {
-        let mut all_samples: Vec<f32> = Vec::new();
         let mut rx = rx;
-        // Drain the first chunk to surface early errors.
-        match rx.recv().await {
-            Some(Audio::Pcm(p)) => all_samples.extend_from_slice(&p),
+
+        // Drain first chunk → early error as HTTP error.
+        let first = match rx.recv().await {
+            Some(Audio::Pcm(p)) => p,
             Some(Audio::Error(e)) => return Err(e.into()),
-            None => {}
+            None => Vec::new(),
+        };
+
+        // Check, that encoder for given rate even constructs — without cross thread transfer.
+        // (optional: if we want early 500 for unsupported rate)
+        if let Err(e) = format::Mp3StreamEncoder::new(rate) {
+            return Err(ApiError::internal(format!("mp3 encoder init: {e}")));
         }
-        while let Some(chunk) = rx.recv().await {
-            match chunk {
-                Audio::Pcm(p) => all_samples.extend_from_slice(&p),
-                Audio::Error(e) => {
-                    eprintln!("lapid: speech failed mid-stream: {}", e.message);
-                    break;
+
+        let (tx, out_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+
+        // Encoder made HERE, inside blocking thread. Across the boundary goes just
+        // `rate` (Send), `first` (Vec<f32>, Send) and `rx` (Send).
+        tokio::task::spawn_blocking(move || {
+            let mut enc = match format::Mp3StreamEncoder::new(rate) {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(std::io::Error::other(
+                        format!("mp3 encoder init: {e}"),
+                    )));
+                    return;
+                }
+            };
+
+            // First chunk
+            match enc.push(&first) {
+                Ok(bytes) if !bytes.is_empty() => {
+                    if tx.blocking_send(Ok(Bytes::from(bytes))).is_err() {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(std::io::Error::other(
+                        format!("mp3 encode: {e}"),
+                    )));
+                    return;
                 }
             }
-        }
-        let mp3_bytes = format::mp3(&all_samples, rate);
-        return Ok(([(header::CONTENT_TYPE, "audio/mpeg")], mp3_bytes).into_response());
+
+            loop {
+                match rx.blocking_recv() {
+                    Some(Audio::Pcm(p)) => match enc.push(&p) {
+                        Ok(bytes) if !bytes.is_empty() => {
+                            if tx.blocking_send(Ok(Bytes::from(bytes))).is_err() {
+                                return; // klient disconnected
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("lapid: mp3 encode failed mid-stream: {e}");
+                            let _ = tx.blocking_send(Ok(Bytes::from(enc.finish().unwrap_or_default())));
+                            return;
+                        }
+                    },
+                    Some(Audio::Error(e)) => {
+                        eprintln!("lapid: speech failed mid-stream: {}", e.message);
+                        let _ = tx.blocking_send(Ok(Bytes::from(enc.finish().unwrap_or_default())));
+                        return;
+                    }
+                    None => {
+                        let tail = enc.finish().unwrap_or_default();
+                        if !tail.is_empty() {
+                            let _ = tx.blocking_send(Ok(Bytes::from(tail)));
+                        }
+                        return;
+                    }
+                }
+            }
+        });
+
+        let stream = futures_util::stream::unfold(out_rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        return Ok(([(header::CONTENT_TYPE, "audio/mpeg")], Body::from_stream(stream)).into_response());
     }
 
     // Wait for the first chunk so an immediate failure (unknown voice, empty text) becomes

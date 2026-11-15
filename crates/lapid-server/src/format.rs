@@ -86,6 +86,42 @@ pub fn mp3(samples: &[f32], sample_rate: u32) -> Vec<u8> {
         .expect("MP3 encoding failed on validated PCM input")
 }
 
+pub struct Mp3StreamEncoder {
+    inner: shine_rs::mp3_encoder::Mp3Encoder,
+}
+
+impl Mp3StreamEncoder {
+    pub fn new(sample_rate: u32) -> Result<Self, shine_rs::error::EncoderError> {
+        let config = shine_rs::mp3_encoder::Mp3EncoderConfig::new()
+            .sample_rate(sample_rate)
+            .bitrate(128)
+            .channels(1)
+            .stereo_mode(shine_rs::mp3_encoder::StereoMode::Mono);
+        Ok(Self { inner: shine_rs::mp3_encoder::Mp3Encoder::new(config)? })
+    }
+
+    /// Feed f32 PCM chunk, return concatenated MP3 frames ready so far (may be empty).
+    pub fn push(&mut self, samples: &[f32]) -> Result<Vec<u8>, shine_rs::error::EncoderError> {
+        let pcm_i16: Vec<i16> = samples
+            .iter()
+            .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0).round() as i16)
+            .collect();
+        let frames = self.inner.encode_interleaved(&pcm_i16)?;
+        // frames: Vec<Vec<u8>> — zreťazíme do jedného bufferu
+        let mut out = Vec::with_capacity(frames.iter().map(Vec::len).sum());
+        for f in frames {
+            out.extend_from_slice(&f);
+        }
+        Ok(out)
+    }
+
+    /// Flush the last partial frame.
+    pub fn finish(&mut self) -> Result<Vec<u8>, shine_rs::error::EncoderError> {
+        self.inner.finish()
+    }
+}
+
+
 /// Decode MP3 bytes to (f32 samples, sample_rate). Test-only.
 #[cfg(test)]
 pub fn decode_mp3(bytes: &[u8]) -> (Vec<f32>, u32) {
@@ -493,6 +529,24 @@ mod tests {
         eprintln!("orig rms={:.4}, dec rms={:.4}, dec len={}", rms(&samples), rms(&decoded), decoded.len());
         assert_eq!(rate, 24000);
     }
+
+    #[test]
+    fn mp3_streaming_matches_one_shot() {
+        let samples: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.01).sin() * 0.5).collect();
+        let one_shot = mp3(&samples, 24_000);
+
+        let mut enc = Mp3StreamEncoder::new(24_000).expect("init");
+        let mut streamed = Vec::new();
+        for chunk in samples.chunks(512) {
+            streamed.extend(enc.push(chunk).expect("push"));
+        }
+        streamed.extend(enc.finish().expect("finish"));
+
+        let (a, _) = decode_mp3(&one_shot);
+        let (b, _) = decode_mp3(&streamed);
+        assert!((a.len() as i64 - b.len() as i64).abs() < 2000);
+    }
+
 
     // ── Helper ──────────────────────────────────────────────────────────────
 
