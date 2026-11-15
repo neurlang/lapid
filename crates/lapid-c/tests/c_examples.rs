@@ -3,31 +3,43 @@
 //! C is only used here; the crate itself never compiles C.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn crate_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// `target/<profile>`: this test binary lives in `target/<profile>/deps`.
-fn profile_dir() -> PathBuf {
-    let exe = std::env::current_exe().expect("test executable path");
-    exe.parent().and_then(Path::parent).expect("target/<profile>/deps").to_path_buf()
-}
-
 /// `cargo test` builds only the test harness, not the staticlib / cdylib outputs: build
-/// them with the same cargo, target directory and profile. Returns `target/<profile>`.
+/// them with the same cargo and ask it where they went (the layout under `target/` has
+/// changed between cargo versions). Returns the directory holding `liblapid.*`.
 fn build_libs() -> PathBuf {
-    let dir = profile_dir();
-    let target = dir.parent().expect("target dir");
     let mut cmd = Command::new(env!("CARGO"));
-    cmd.args(["build", "-p", "lapid-c", "--lib"]).env("CARGO_TARGET_DIR", target);
-    if dir.file_name().is_some_and(|n| n == "release") {
+    cmd.args(["build", "-p", "lapid-c", "--lib", "--message-format=json"])
+        .current_dir(crate_dir())
+        .stderr(Stdio::inherit());
+    if !cfg!(debug_assertions) {
         cmd.arg("--release");
     }
-    let status = cmd.status().expect("run cargo build");
-    assert!(status.success(), "cargo build -p lapid-c failed");
-    dir
+    let out = cmd.output().expect("run cargo build");
+    assert!(out.status.success(), "cargo build -p lapid-c failed");
+
+    let mut dir = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if msg["reason"].as_str() != Some("compiler-artifact") {
+            continue;
+        }
+        let is_c_lib = msg["target"]["crate_types"]
+            .as_array()
+            .is_some_and(|t| t.iter().any(|c| c.as_str() == Some("staticlib")));
+        if !is_c_lib {
+            continue;
+        }
+        if let Some(first) = msg["filenames"][0].as_str() {
+            dir = Path::new(first).parent().map(Path::to_path_buf);
+        }
+    }
+    dir.expect("cargo did not report the lapid-c library artifacts")
 }
 
 fn c_compiler() -> Option<String> {

@@ -35,7 +35,11 @@ fn row_sum(row: usize, t: usize) -> f64 {
 }
 
 fn dir() -> PathBuf {
-    std::env::var_os("LAPID_MMAP_BENCH_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+    let d = std::env::var_os("LAPID_MMAP_BENCH_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
+    std::fs::create_dir_all(&d).expect("create test dir");
+    d
 }
 
 /// Write `n` f32 tensors `w{t}` of `[rows, COLS]`, one at a time.
@@ -66,8 +70,16 @@ mod os {
         fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int;
         fn mincore(addr: *mut c_void, len: usize, vec: *mut u8) -> c_int;
         fn getpagesize() -> c_int;
+        fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: c_int,
+            flags: c_int,
+            fd: c_int,
+            off: i64,
+        ) -> *mut c_void;
+        fn munmap(addr: *mut c_void, len: usize) -> c_int;
     }
-
 
     /// Drop the file's pages from the page cache (they must not be mapped / dirty).
     pub fn evict(path: &Path) {
@@ -89,6 +101,47 @@ mod os {
         let r = unsafe { mincore(lo as *mut c_void, hi - lo, v.as_mut_ptr()) };
         assert_eq!(r, 0, "mincore");
         v.iter().filter(|&&b| b & 1 != 0).count() as f64 / v.len() as f64
+    }
+
+    /// Residency of `path` through a throwaway mapping; with `touch`, first read the first
+    /// and last byte (what the kernel alone pulls in for two page faults).
+    pub fn file_resident(path: &Path, touch: bool) -> f64 {
+        let f = std::fs::File::open(path).expect("open");
+        let len = f.metadata().expect("stat").len() as usize;
+        // SAFETY: read-only shared mapping, unmapped below. 1 = PROT_READ, 1 = MAP_SHARED.
+        let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 1, f.as_raw_fd(), 0) };
+        assert_ne!(p as isize, -1, "mmap");
+        // SAFETY: the live mapping of `len` bytes.
+        let s = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+        if touch {
+            std::hint::black_box((s[0], s[len - 1]));
+        }
+        let r = resident(s);
+        // SAFETY: unmapping what was mapped above; `s` is not used afterwards.
+        unsafe { munmap(p, len) };
+        r
+    }
+
+    /// Evict, retrying (DONTNEED skips pages under writeback); true once the file is cold.
+    fn evict_retry(path: &Path) -> bool {
+        for _ in 0..5 {
+            evict(path);
+            if file_resident(path, false) < 0.05 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// How much of the file the kernel alone makes resident for two touched bytes from a
+    /// cold start; `None` if the page cache cannot be evicted here (tmpfs, ...).
+    pub fn kernel_baseline(path: &Path) -> Option<f64> {
+        if !evict_retry(path) {
+            return None;
+        }
+        let b = file_resident(path, true);
+        evict_retry(path).then_some(b)
     }
 }
 
@@ -139,7 +192,7 @@ fn mmap_reads_cold_pages_in_place() {
     lapid::set_residency(Residency::Mmap);
     for dev in devices() {
         #[cfg(target_os = "linux")]
-        os::evict(&path);
+        let baseline = os::kernel_baseline(&path);
         let f = LapidFile::open(&path).expect("open");
         assert_eq!(f.residency(), Residency::Mmap);
         let w = f.get("w1").expect("w1");
@@ -157,15 +210,34 @@ fn mmap_reads_cold_pages_in_place() {
         }
         check_row_sums(&dev, &w, rows, 1);
         // Elementwise over the mapping, full readback.
-        let y = dev.to_vec_f32(&w.mul_scalar(2.0).expect("mul")).expect("eval");
-        assert_eq!(&y[..COLS], &row_values(0, 1).iter().map(|v| v * 2.0).collect::<Vec<_>>()[..]);
+        let y = dev
+            .to_vec_f32(&w.mul_scalar(2.0).expect("mul"))
+            .expect("eval");
+        assert_eq!(
+            &y[..COLS],
+            &row_values(0, 1).iter().map(|v| v * 2.0).collect::<Vec<_>>()[..]
+        );
         #[cfg(target_os = "linux")]
         {
             let warm = os::resident(host_bytes(&w));
-            eprintln!("{}: resident before eval {:.1}%, after {:.1}%", dev.name(), cold * 100.0, warm * 100.0);
+            eprintln!(
+                "{}: resident before eval {:.1}%, after {:.1}%",
+                dev.name(),
+                cold * 100.0,
+                warm * 100.0
+            );
             // The data was read through the file mapping (page cache filled by the reads).
             if mapped {
-                assert!(cold < 0.5 && warm > 0.99, "cold {cold}, warm {warm}");
+                assert!(warm > 0.99, "warm {warm}");
+                match baseline {
+                    Some(b) if b < 0.5 => assert!(
+                        cold <= b + 0.1,
+                        "cold {cold}: open/get read more than the kernel baseline {b:.2}"
+                    ),
+                    _ => eprintln!(
+                        "cold check skipped: not evictable, or the kernel prefetches the whole file ({baseline:?})"
+                    ),
+                }
             }
         }
         // Hints are harmless on mapped weights.
