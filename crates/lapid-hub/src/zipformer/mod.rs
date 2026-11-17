@@ -28,6 +28,7 @@
 
 pub mod config;
 pub mod convert;
+mod gguf;
 pub(crate) mod model;
 pub mod stream;
 pub mod tokens;

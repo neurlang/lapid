@@ -1,6 +1,7 @@
 //! Exported icefall Zipformer2 transducer -> `.lapid` through the generic engine.
 //!
-//! Source: a directory (or HF repo) written by `tools/reference/zipformer_ref.py export`:
+//! Source: a GGUF file (`general.architecture = "zipformer2"`, see [`super::gguf`]) or a directory
+//! (or HF repo) written by `tools/reference/zipformer_ref.py export`:
 //! `config.json` (`"model_type": "zipformer2_transducer"`, icefall's hyper-parameters, default
 //! chunk / left context), `model.safetensors` (icefall names, kept), `tokens.txt` and
 //! optionally `bpe.model` (stored as blobs). Load-time transforms baked in:
@@ -17,12 +18,14 @@
 use lapid::{Error, Result, bail};
 use lapid_convert::assets::HfFiles;
 use lapid_convert::engine::{ConvertHooks, ConvertSpec, Emit, HfExtras, SourceKind, TensorSource};
+use lapid_convert::gguf::GgufFile;
 use lapid_convert::mapping::RoleRule;
 use lapid_convert::policy::Role;
 use lapid_convert::writer::read_json;
 use serde_json::{Map, Value, json};
 
 use super::config::{BPE_BLOB, TOKENS_BLOB, ZipformerConfig};
+use super::gguf::{GGUF_NAMES, config_from_gguf};
 use super::model::decoder::dense_group_conv;
 
 /// `config.json` `model_type` of an exported model.
@@ -32,9 +35,9 @@ pub static CONVERT: ConvertSpec = ConvertSpec {
     architecture: "zipformer",
     license: "unknown",
     hf_model_types: &[MODEL_TYPE],
-    gguf_architectures: &[],
+    gguf_architectures: &["zipformer2"],
     hf_names: &[],
-    gguf_names: &[],
+    gguf_names: GGUF_NAMES,
     roles: &[
         RoleRule::new("*chunkwise_conv_scale", Role::Param),
         RoleRule::new("*log_scale", Role::Param),
@@ -74,6 +77,16 @@ impl ConvertHooks for Hooks {
         metadata.insert("license".into(), json!(license));
         metadata.insert("components".into(), json!({"zipformer": {"architecture": MODEL_TYPE, "config": "zipformer", "license": license, "tensor_prefix": ""}}));
         Ok(HfExtras { blobs, metadata, ..HfExtras::default() })
+    }
+
+    /// The `stt.*` metadata of the GGUF export (non-streaming keys and the frontend are checked).
+    fn gguf_config(&self, f: &GgufFile) -> Result<Value> {
+        Ok(config_from_gguf(f)?.to_json())
+    }
+
+    /// `tokens.txt` rebuilt from `tokenizer.ggml.tokens`; name and license from `general.*`.
+    fn gguf_extras(&self, f: &GgufFile, cfg: &mut Value) -> Result<HfExtras> {
+        super::gguf::extras(f, &ZipformerConfig::from_json(cfg)?)
     }
 
     fn expected(&self, cfg: &Value) -> Result<Vec<String>> {
