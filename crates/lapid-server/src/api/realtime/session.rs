@@ -249,12 +249,12 @@ impl Downsampler24to16 {
     /// the recognizer sees the correct last samples plus a short trailing quiet, which is
     /// harmless (and often helps VAD fire the endpoint).
     pub fn flush(&mut self) -> Result<Vec<f32>, lapid::Error> {
-        let silence = vec![0.0f32; 512];
-        let frames = silence.len();
-        let input = InterleavedSlice::new(&silence, 1, frames)
+        // Enough zeros to push the sinc window fully through. rubato exposes the
+        // delay; pad generously to be safe.
+        let zeros = vec![0.0f32; 4096];
+        let input = InterleavedSlice::new(&zeros, 1, zeros.len())
             .map_err(|e| lapid::Error::new("resample", format!("{e}")))?;
-        let out = self
-            .inner
+        let out = self.inner
             .process(&input, None)
             .map_err(|e| lapid::Error::new("resample", format!("{e}")))?;
         Ok(out.take_data())
@@ -805,8 +805,8 @@ mod tests {
 
         let bad = s.handle_text(&up(json!({"transcription": {"delay": "fast"}}))).await;
         assert_eq!((field(&bad[0], "error")["code"].as_str(), field(&bad[0], "error")["event_id"].as_str()), (Some("invalid_value"), Some("u1")));
-let rate = s.handle_text(&up(json!({"format": {"type": "audio/pcm", "rate": 22050}}))).await;
-assert_eq!(field(&rate[0], "error")["code"], "unsupported_audio_format");
+        let rate = s.handle_text(&up(json!({"format": {"type": "audio/pcm", "rate": 22050}}))).await;
+        assert_eq!(field(&rate[0], "error")["code"], "unsupported_audio_format");
         let unknown = s.handle_text(&up(json!({"transcription": {"model": "nope"}}))).await;
         assert_eq!(field(&unknown[0], "error")["code"], "model_not_found");
         let still = s.handle_text(&up(json!({"transcription": {"language": "sk", "delay": "fast"}}))).await;
