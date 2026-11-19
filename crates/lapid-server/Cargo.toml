@@ -30,6 +30,8 @@ flate2 = { workspace = true }
 mime_guess = { workspace = true }
 base64 = { workspace = true }
 shine-rs = { workspace = true }
+rubato = "5.1.0"
+audioadapter-buffers = "5.2.0"
 
 [dev-dependencies]
 puremp3 = { workspace = true }

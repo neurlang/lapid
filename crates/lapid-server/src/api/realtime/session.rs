@@ -17,8 +17,15 @@ use serde_json::{Value, json};
 
 use super::events::{ClientEvent, ErrorBody, EventError, FormatConfig, ServerEvent, SessionUpdate, TurnDetection, parse};
 
-/// The only input rate: 16-bit little-endian mono PCM at 16 kHz.
+use audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Fft, Resampler, FixedSync};
+
+/// The rate recognizers operate at: 16-bit little-endian mono PCM at 16 kHz. Input audio
+/// arriving at 24 kHz is downsampled to this rate before it reaches the recognizer.
 pub const SAMPLE_RATE: u32 = 16_000;
+
+/// The (only) supported non-native input rate.
+pub const INPUT_RATE_24K: u32 = 24_000;
 
 /// Recognizers of one model.
 pub trait Backend: Send + Sync {
@@ -206,6 +213,54 @@ impl<H> Turns<H> {
     }
 }
 
+/// 24 kHz → 16 kHz downsampler (ratio 3:2). Buffers internally so callers pass chunks of any size.
+///
+/// Uses `rubato`'s sinc-interpolation resampler, which has only a sinc-window of latency
+/// (a few ms) rather than a full chunk, so it stays roughly proportional to input length.
+pub struct Downsampler24to16 {
+    inner: Fft<f32>,
+}
+
+impl Downsampler24to16 {
+    pub fn new() -> Self {
+        // `chunk_size` only sizes rubato's internal working buffer; input length is free.
+        let inner = Fft::<f32>::new(24_000, 16_000, 1024, 1, FixedSync::Both)
+            .expect("24 kHz -> 16 kHz resampler parameters are valid");
+        Self { inner }
+    }
+
+    /// Resample `input` (24 kHz) to 16 kHz. Returns 0 samples on the first few calls until the
+    /// sinc window is primed.
+    pub fn process(&mut self, input: Vec<f32>) -> Result<Vec<f32>, lapid::Error> {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+        let frames = input.len();               // mono => frames == samples
+        let input = InterleavedSlice::new(&input, 1, frames)
+            .map_err(|e| lapid::Error::new("resample", format!("{e}")))?;
+        let out = self
+            .inner
+            .process(&input, None)
+            .map_err(|e| lapid::Error::new("resample", format!("{e}")))?;
+        Ok(out.take_data())                     // InterleavedOwned<f32> -> Vec<f32>
+    }
+
+    /// Feed trailing silence to flush the sinc window; the returned tail ends in silence but
+    /// the recognizer sees the correct last samples plus a short trailing quiet, which is
+    /// harmless (and often helps VAD fire the endpoint).
+    pub fn flush(&mut self) -> Result<Vec<f32>, lapid::Error> {
+        let silence = vec![0.0f32; 512];
+        let frames = silence.len();
+        let input = InterleavedSlice::new(&silence, 1, frames)
+            .map_err(|e| lapid::Error::new("resample", format!("{e}")))?;
+        let out = self
+            .inner
+            .process(&input, None)
+            .map_err(|e| lapid::Error::new("resample", format!("{e}")))?;
+        Ok(out.take_data())
+    }
+}
+
 /// One connection's session.
 pub struct Session<M: Models> {
     models: M,
@@ -213,20 +268,33 @@ pub struct Session<M: Models> {
     settings: Settings,
     session_id: String,
     turns: Turns<<M::Backend as Backend>::Handle>,
+    /// Native input rate; `SAMPLE_RATE` or `INPUT_RATE_24K`.
+    input_rate: u32,
+    /// `Some` iff `input_rate != SAMPLE_RATE` (i.e. the client is sending 24 kHz audio).
+    resampler: Option<Downsampler24to16>,
 }
 
 fn no_model() -> EventError {
     EventError::invalid("no_model", "no model is selected: set audio.input.transcription.model in session.update")
 }
 
-fn check_format(f: &FormatConfig) -> Result<(), EventError> {
+fn check_format(f: &FormatConfig) -> Result<u32, EventError> {
     if let Some(k) = f.kind.as_deref().filter(|k| *k != "audio/pcm") {
-        return Err(EventError::invalid("unsupported_audio_format", format!("input audio format {k:?} is not supported: send \"audio/pcm\" (16-bit little-endian mono)")));
+        return Err(EventError::invalid(
+            "unsupported_audio_format",
+            format!("input audio format {k:?} is not supported: send \"audio/pcm\" (16-bit little-endian mono)"),
+        ));
     }
-    if let Some(r) = f.rate.filter(|r| *r != SAMPLE_RATE) {
-        return Err(EventError::invalid("unsupported_audio_format", format!("sample rate {r} is not supported: send {SAMPLE_RATE} Hz audio")));
+    let rate = f.rate.unwrap_or(SAMPLE_RATE);
+    if !matches!(rate, SAMPLE_RATE | INPUT_RATE_24K) {
+        return Err(EventError::invalid(
+            "unsupported_audio_format",
+            format!(
+                "sample rate {rate} is not supported: send {SAMPLE_RATE} Hz or {INPUT_RATE_24K} Hz audio"
+            ),
+        ));
     }
-    Ok(())
+    Ok(rate)
 }
 
 fn parse_language(l: &str) -> Result<Option<String>, EventError> {
@@ -250,8 +318,6 @@ fn parse_vad(td: &TurnDetection) -> Result<Vad, EventError> {
 }
 
 impl<M: Models> Session<M> {
-    /// A session on `model` (`None` = the default model if there is one, else the client chooses
-    /// in `session.update`); `prefix` makes this connection's ids unique.
     pub fn new(models: M, prefix: String, model: Option<&str>) -> Result<Session<M>, EventError> {
         let backend = match model {
             Some(m) => Some(models.resolve(Some(m))?),
@@ -263,6 +329,8 @@ impl<M: Models> Session<M> {
             settings: Settings::default(),
             session_id: format!("sess_{prefix}"),
             turns: Turns { ids: Ids { prefix, n: 0 }, live: None, last_item: None, carry: None },
+            input_rate: SAMPLE_RATE,
+            resampler: None,
         })
     }
 
@@ -314,17 +382,26 @@ impl<M: Models> Session<M> {
     /// Validate the whole update, then apply it.
     fn update(&mut self, upd: SessionUpdate) -> Result<(), EventError> {
         if upd.kind.as_deref().is_some_and(|k| k != "transcription") {
-            return Err(EventError::invalid("invalid_value", "only transcription sessions are supported (\"type\": \"transcription\")"));
+            return Err(EventError::invalid(
+                "invalid_value",
+                "only transcription sessions are supported (\"type\": \"transcription\")",
+            ));
         }
         let mut next = self.settings.clone();
         let mut model = None;
+        let mut new_rate = self.input_rate;
         if let Some(input) = upd.audio.and_then(|a| a.input) {
             if let Some(f) = &input.format {
-                check_format(f)?;
+                new_rate = check_format(f)?;
             }
             if let Some(t) = &input.transcription {
                 if let Some(d) = &t.delay {
-                    next.delay = Delay::parse(d).ok_or_else(|| EventError::invalid("invalid_value", format!("delay {d:?} is not one of minimal, low, medium, high, xhigh")))?;
+                    next.delay = Delay::parse(d).ok_or_else(|| {
+                        EventError::invalid(
+                            "invalid_value",
+                            format!("delay {d:?} is not one of minimal, low, medium, high, xhigh"),
+                        )
+                    })?;
                 }
                 if let Some(l) = &t.language {
                     next.language = parse_language(l)?;
@@ -342,12 +419,29 @@ impl<M: Models> Session<M> {
                 Some(Some(td)) => next.vad = Some(parse_vad(&td)?),
             }
         }
-        if self.turns.live.is_some() && (next.delay != self.settings.delay || next.vad != self.settings.vad || model.is_some()) {
-            return Err(EventError::invalid("session_busy", "delay, turn detection and model cannot change while audio is buffered: commit or clear the input buffer first"));
+        if self.turns.live.is_some()
+            && (next.delay != self.settings.delay
+                || next.vad != self.settings.vad
+                || model.is_some()
+                || new_rate != self.input_rate)
+        {
+            return Err(EventError::invalid(
+                "session_busy",
+                "delay, turn detection, model and input format cannot change while audio is buffered: \
+                 commit or clear the input buffer first",
+            ));
         }
         self.settings = next;
         if model.is_some() {
             self.backend = model;
+        }
+        if new_rate != self.input_rate {
+            self.input_rate = new_rate;
+            self.resampler = if new_rate == SAMPLE_RATE {
+                None
+            } else {
+                Some(Downsampler24to16::new())
+            };
         }
         Ok(())
     }
@@ -357,14 +451,30 @@ impl<M: Models> Session<M> {
         if samples.is_empty() {
             return Ok(Vec::new());
         }
+        // Downsample if the client is sending 24 kHz audio.
+        let samples = match &mut self.resampler {
+            Some(rs) => rs.process(samples).map_err(|e| backend_error(&e))?,
+            None => samples,
+        };
+        if samples.is_empty() {
+            // Resampler is priming its sinc window; nothing to feed the recognizer yet.
+            return Ok(Vec::new());
+        }
         let backend = self.backend.as_ref().map(|b| &b.0).ok_or_else(no_model)?;
         let vad = self.settings.vad.is_some();
         if self.turns.live.is_none() {
-            let handle = backend.open(self.settings.params()).await.map_err(|e| backend_error(&e))?;
+            let handle = backend
+                .open(self.settings.params())
+                .await
+                .map_err(|e| backend_error(&e))?;
             let item = (!vad).then(|| self.turns.new_item());
             self.turns.live = Some(Live { handle, item, samples: 0 });
         }
-        let live = self.turns.live.as_mut().ok_or_else(|| EventError::server("internal_error", "the stream is missing"))?;
+        let live = self
+            .turns
+            .live
+            .as_mut()
+            .ok_or_else(|| EventError::server("internal_error", "the stream is missing"))?;
         live.samples += samples.len() as u64;
         Ok(match backend.accept(&live.handle, samples).await {
             Ok(updates) => self.turns.apply(vad, updates),
@@ -375,12 +485,51 @@ impl<M: Models> Session<M> {
     async fn commit(&mut self) -> Result<Vec<ServerEvent>, EventError> {
         let backend = self.backend.as_ref().map(|b| &b.0).ok_or_else(no_model)?;
         let vad = self.settings.vad.is_some();
-        let Some(live) = self.turns.live.as_ref() else {
-            return Err(EventError::invalid("input_audio_buffer_commit_empty", "Error committing input audio buffer: the buffer is empty."));
-        };
         let mut out = Vec::new();
+
+        // Flush the resampler's sinc tail into the recognizer *before* finishing, so the last
+        // few milliseconds of audio aren't dropped. May open the stream if the resampler had
+        // buffered everything so far (e.g. a sub-sinc-window turn).
+        if let Some(rs) = &mut self.resampler {
+            let flushed = rs.flush().map_err(|e| backend_error(&e))?;
+            if !flushed.is_empty() {
+                if self.turns.live.is_none() {
+                    let handle = backend
+                        .open(self.settings.params())
+                        .await
+                        .map_err(|e| backend_error(&e))?;
+                    let item = (!vad).then(|| self.turns.new_item());
+                    self.turns.live = Some(Live { handle, item, samples: 0 });
+                }
+                let live = self
+                    .turns
+                    .live
+                    .as_mut()
+                    .ok_or_else(|| EventError::server("internal_error", "the stream is missing"))?;
+                live.samples += flushed.len() as u64;
+                let result = backend.accept(&live.handle, flushed).await;
+                match result {
+                    Ok(updates) => out.extend(self.turns.apply(vad, updates)),
+                    Err(e) => {
+                        out.extend(self.turns.abort(backend_error(&e)));
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+
+        let Some(live) = self.turns.live.as_ref() else {
+            return Err(EventError::invalid(
+                "input_audio_buffer_commit_empty",
+                "Error committing input audio buffer: the buffer is empty.",
+            ));
+        };
         if !vad && let Some(item) = &live.item {
-            out.push(ServerEvent::Committed { event_id: self.turns.ids.event(), item_id: item.id.clone(), previous_item_id: self.turns.last_item.clone() });
+            out.push(ServerEvent::Committed {
+                event_id: self.turns.ids.event(),
+                item_id: item.id.clone(),
+                previous_item_id: self.turns.last_item.clone(),
+            });
         }
         match backend.finish(&live.handle).await {
             Ok(updates) => out.extend(self.turns.apply(vad, updates)),
@@ -389,7 +538,6 @@ impl<M: Models> Session<M> {
                 return Ok(out);
             }
         }
-        // An item the recognizer never closed completes with what was sent.
         if let Some(live) = self.turns.live.as_mut()
             && let Some(item) = live.item.take()
         {
@@ -398,12 +546,20 @@ impl<M: Models> Session<M> {
             self.turns.last_item = Some(item.id);
         }
         self.turns.live = None;
+        // Fresh resampler for the next turn — the tail we just flushed belongs to the
+        // stream we just closed.
+        if self.resampler.is_some() {
+            self.resampler = Some(Downsampler24to16::new());
+        }
         Ok(out)
     }
 
     fn clear(&mut self) -> Vec<ServerEvent> {
         self.turns.live = None;
         self.turns.carry = None;
+        if self.resampler.is_some() {
+            self.resampler = Some(Downsampler24to16::new());
+        }
         vec![ServerEvent::Cleared { event_id: self.turns.ids.event() }]
     }
 }
@@ -649,8 +805,8 @@ mod tests {
 
         let bad = s.handle_text(&up(json!({"transcription": {"delay": "fast"}}))).await;
         assert_eq!((field(&bad[0], "error")["code"].as_str(), field(&bad[0], "error")["event_id"].as_str()), (Some("invalid_value"), Some("u1")));
-        let rate = s.handle_text(&up(json!({"format": {"type": "audio/pcm", "rate": 24000}}))).await;
-        assert_eq!(field(&rate[0], "error")["code"], "unsupported_audio_format");
+let rate = s.handle_text(&up(json!({"format": {"type": "audio/pcm", "rate": 22050}}))).await;
+assert_eq!(field(&rate[0], "error")["code"], "unsupported_audio_format");
         let unknown = s.handle_text(&up(json!({"transcription": {"model": "nope"}}))).await;
         assert_eq!(field(&unknown[0], "error")["code"], "model_not_found");
         let still = s.handle_text(&up(json!({"transcription": {"language": "sk", "delay": "fast"}}))).await;
@@ -688,5 +844,39 @@ mod tests {
             let e = s.handle_text(&json!({"type": "session.update", "session": session}).to_string()).await;
             assert_eq!(field(&e[0], "error")["code"], "invalid_value");
         }
+    }
+
+    #[tokio::test]
+    async fn accepts_24khz_and_downsamples() {
+        let fake = Fake::default();
+        fake.script.lock().expect("script").finish = [vec![upd("Ahoj", true, 0)]].into();
+        let mut s = session(&fake);
+        let up = json!({
+            "type": "session.update",
+            "session": {"audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}}}},
+        });
+        let applied = s.handle_text(&up.to_string()).await;
+        assert_eq!(kinds(&applied), ["session.updated"]);
+
+        // 720 samples @ 24 kHz => ~480 samples @ 16 kHz (plus sinc tail flushed on commit).
+        s.handle_text(&append(720)).await;
+        let end = s.handle_text(&cmd("input_audio_buffer.commit")).await;
+
+        let total: usize = fake.script.lock().expect("script").fed.iter().sum();
+        assert!(total >= 480, "expected >= 480 samples at 16 kHz, got {total}");
+        assert!(total <= 720, "expected <= 720 samples at 16 kHz, got {total}");
+        assert_eq!(field(end.last().expect("completed"), "transcript"), "Ahoj");
+    }
+
+    #[tokio::test]
+    async fn rate_cannot_change_while_audio_is_buffered() {
+        let fake = Fake::default();
+        let mut s = session(&fake);
+        s.handle_text(&append(100)).await;
+        let up = json!({
+            "type": "session.update",
+            "session": {"audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}}}},
+        });
+        assert_eq!(field(&s.handle_text(&up.to_string()).await[0], "error")["code"], "session_busy");
     }
 }
