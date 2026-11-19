@@ -132,6 +132,15 @@ fn build() -> Value {
                     "temperature": {"type": "number"}
                 }})),
                 "responses": ok("Audio", "audio/wav", json!({"type": "string", "format": "binary"}))
+            }},
+            "/v1/realtime": {"get": {
+                "summary": "Realtime transcription (WebSocket)", "tags": ["Audio"],
+                "description": "Upgrade to a WebSocket speaking the transcription-session subset of the OpenAI Realtime API: session.update, input_audio_buffer.append / commit / clear in; session.created / updated, input_audio_buffer.committed / cleared, conversation.item.input_audio_transcription.delta / completed / failed and error out. Audio is base64 16-bit little-endian mono PCM at 16 kHz. See docs/REALTIME.md.",
+                "parameters": [
+                    {"name": "intent", "in": "query", "schema": {"type": "string", "enum": ["transcription"]}},
+                    {"name": "model", "in": "query", "schema": {"type": "string"}, "description": "A model that can stream (default: the only one); session.update may also set it"}
+                ],
+                "responses": {"101": {"description": "Switching protocols"}, "400": {"description": "Not a WebSocket upgrade, or an unsupported intent"}, "404": {"description": "No such model with streaming transcription"}}
             }}
         }
     })

@@ -4,6 +4,7 @@ mod audio;
 mod chat;
 mod misc;
 mod openapi;
+mod realtime;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -158,6 +159,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/audio/transcriptions", post(audio::transcriptions))
         .route("/v1/audio/translations", post(audio::translations))
         .route("/v1/audio/speech", post(audio::speech))
+        .route("/v1/realtime", get(realtime::realtime))
         .fallback(crate::assets::serve_asset)
         .layer(DefaultBodyLimit::max(512 << 20))
         .layer(compress)

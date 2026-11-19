@@ -9,16 +9,17 @@
 //! (`lapid serve`, `lapid run`, [`crate::load`]). Registry entry: [`asr_entry`] or
 //! [`audio_entry`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use lapid::{Device, Result, bail};
+use lapid::{Device, Error, Result, bail};
 use lapid_convert::engine::ConvertSpec;
 use lapid_nn::Precision;
 use lapid_verify::{Activations, Descriptor};
 use serde_json::{Map, Value, json};
 
 use super::registry::ModelEntry;
-use super::serve::{AnyModel, AsrParams, Capability, LoadOptions, ModelMeta, TranscriptOut};
+use super::serve::{AnyModel, AsrParams, AsrStream, Capability, LoadOptions, ModelMeta, StreamParams, StreamUpdate, TranscriptOut};
 
 /// One reference sample: a directory with `result.json`, `activations.safetensors` and the
 /// audio it names.
@@ -176,15 +177,30 @@ pub trait AudioDef: Sized + 'static {
 
 /// Speech recognition for serving.
 pub trait AsrModel {
+    /// Whether [`open_stream`](Self::open_stream) is implemented (marks the served model as
+    /// able to stream in its metadata).
+    const STREAMING: bool = false;
+
     /// Transcribe mono samples at the model's sample rate.
     fn recognize(&self, samples: &[f32], opts: &AsrParams) -> Result<TranscriptOut>;
+
+    /// An incremental recognizer over 16 kHz mono audio.
+    fn open_stream(&self, _params: &StreamParams) -> Result<Box<dyn AsrStream>> {
+        Err(Error::new("unsupported", "this model does not support streaming transcription"))
+    }
 }
+
+/// Streams one served recognizer keeps open at a time.
+const MAX_STREAMS: usize = 64;
 
 /// [`AnyModel`] adapter of a speech recognizer (input: 16 kHz mono, resampled as needed).
 pub struct AsrServed<M> {
     pub model: M,
     pub meta: ModelMeta,
     rate: u32,
+    /// Open streams by id; they live and die on the model's worker thread.
+    streams: HashMap<u64, Box<dyn AsrStream>>,
+    next_stream: u64,
 }
 
 impl<M: AudioDef + AsrModel> AsrServed<M> {
@@ -192,7 +208,14 @@ impl<M: AudioDef + AsrModel> AsrServed<M> {
         let rate = model.sample_rate();
         meta.capabilities = vec![Capability::Transcription];
         meta.extra.insert("sample_rate".into(), json!(rate));
-        AsrServed { model, meta, rate }
+        if M::STREAMING {
+            meta.extra.insert("streaming".into(), json!(true));
+        }
+        AsrServed { model, meta, rate, streams: HashMap::new(), next_stream: 0 }
+    }
+
+    fn stream(&mut self, id: u64) -> Result<&mut Box<dyn AsrStream>> {
+        self.streams.get_mut(&id).ok_or_else(|| Error::new("not_found", format!("stream {id} is not open")))
     }
 }
 
@@ -210,6 +233,28 @@ impl<M: AudioDef + AsrModel> AnyModel for AsrServed<M> {
             return self.model.recognize(samples_16k, opts);
         }
         self.model.recognize(&crate::audio::resample(samples_16k, 16_000, self.rate), opts)
+    }
+
+    fn stream_open(&mut self, params: &StreamParams) -> Result<u64> {
+        if self.streams.len() >= MAX_STREAMS {
+            return Err(Error::new("too_many_streams", format!("{MAX_STREAMS} streams are already open on this model")));
+        }
+        let stream = self.model.open_stream(params)?;
+        self.next_stream += 1;
+        self.streams.insert(self.next_stream, stream);
+        Ok(self.next_stream)
+    }
+
+    fn stream_accept(&mut self, id: u64, samples_16k: &[f32]) -> Result<Vec<StreamUpdate>> {
+        self.stream(id)?.accept(samples_16k)
+    }
+
+    fn stream_finish(&mut self, id: u64) -> Result<Vec<StreamUpdate>> {
+        self.stream(id)?.finish()
+    }
+
+    fn stream_close(&mut self, id: u64) {
+        self.streams.remove(&id);
     }
 }
 

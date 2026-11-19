@@ -7,6 +7,7 @@
 //! without locking) and `lapid run`.
 
 pub mod llm;
+pub mod stream;
 pub mod text;
 
 use std::path::Path;
@@ -15,6 +16,8 @@ use std::time::Instant;
 use lapid::{Device, Error, LapidFile, Result, bail};
 use serde::Serialize;
 use serde_json::Value;
+
+pub use stream::{AsrStream, Delay, StreamParams, StreamUpdate};
 
 use super::resolve::resolve;
 
@@ -286,6 +289,25 @@ pub trait AnyModel {
     fn transcribe(&mut self, _samples_16k: &[f32], _opts: &AsrParams) -> Result<TranscriptOut> {
         Err(unsupported("transcription"))
     }
+
+    /// Open a streaming recognizer over 16 kHz mono audio and return its id. The model keeps
+    /// the stream (on this thread) until [`stream_close`](Self::stream_close).
+    fn stream_open(&mut self, _params: &StreamParams) -> Result<u64> {
+        Err(unsupported("streaming transcription"))
+    }
+
+    /// Feed samples to stream `id`.
+    fn stream_accept(&mut self, _id: u64, _samples_16k: &[f32]) -> Result<Vec<StreamUpdate>> {
+        Err(unsupported("streaming transcription"))
+    }
+
+    /// Flush stream `id` and close its open segment.
+    fn stream_finish(&mut self, _id: u64) -> Result<Vec<StreamUpdate>> {
+        Err(unsupported("streaming transcription"))
+    }
+
+    /// Drop stream `id` (unknown ids are ignored).
+    fn stream_close(&mut self, _id: u64) {}
 
     /// Stream PCM chunks (mono f32 at `meta().extra["sample_rate"]`); `out` returns false to stop.
     fn speak(&mut self, _text: &str, _opts: &TtsParams, _out: &mut dyn FnMut(&[f32]) -> bool) -> Result<()> {
