@@ -16,7 +16,7 @@ use lapid_nn::audio::Fbank;
 use super::stream::greedy;
 use super::{StreamOptions, Zipformer};
 use crate::runtime::audio::{AsrModel, AudioDef, BenchRun, Check, EndToEnd, Row, Sample, Stages, find_path};
-use crate::runtime::serve::{AsrParams, AsrSegment, TranscriptOut};
+use crate::runtime::serve::{AsrParams, AsrSegment, AsrStream, StreamParams, TranscriptOut};
 use crate::runtime::transducer::{GreedyDecoder, Transducer};
 
 /// Tolerance of our fbank against lhotse (f64 vs f32 math).
@@ -196,6 +196,12 @@ impl AudioDef for Zipformer {
 }
 
 impl AsrModel for Zipformer {
+    const STREAMING: bool = true;
+
+    fn open_stream(&self, params: &StreamParams) -> Result<Box<dyn AsrStream>> {
+        self.open_asr_stream(params)
+    }
+
     /// One stream over the whole signal; segments at sherpa-onnx endpoints.
     fn recognize(&self, samples: &[f32], _: &AsrParams) -> Result<TranscriptOut> {
         let mut s = self.stream(&StreamOptions::default())?;

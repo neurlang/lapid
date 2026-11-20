@@ -29,7 +29,7 @@ lapid-convert = { path = "crates/lapid-convert", default-features = false }
 lapid-verify = { path = "crates/lapid-verify" }
 
 # HTTP server (lapid-server; its `download` feature lists HF repos for `-hf`). Pure Rust: compression uses miniz_oxide (gzip) and brotli.
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "multipart", "query", "tokio", "tracing"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "multipart", "query", "tokio", "tracing", "ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-std", "io-util"] }
 tokio-stream = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

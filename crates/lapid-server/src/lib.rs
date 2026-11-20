@@ -7,7 +7,7 @@
 //!
 //! Endpoints: `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/completions`,
 //! `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`,
-//! `POST /v1/audio/speech`, `GET /health`, `GET /api/info`, and the web UI on every other path.
+//! `POST /v1/audio/speech`, `GET /v1/realtime` (WebSocket: streaming transcription), `GET /health`, `GET /api/info`, and the web UI on every other path.
 
 pub mod api;
 mod assets;

@@ -7,9 +7,10 @@ use std::sync::Arc;
 use lapid::Result;
 use serde::Serialize;
 
-use super::ZipformerModel;
 use super::config::OUTPUT_FRAME_SECONDS;
+use super::{Zipformer, ZipformerModel};
 use crate::runtime::endpoint::EndpointConfig;
+use crate::runtime::serve::{AsrStream, Delay, StreamParams, StreamUpdate};
 use crate::runtime::transducer::{ChunkOutput, GreedyOptions, StreamStats, Transducer, TransducerStream};
 
 /// Streaming configuration.
@@ -170,5 +171,69 @@ impl ZipformerStream {
         self.seg_tokens.clear();
         self.seg_times.clear();
         (self.seg_start, self.trailing) = (frames, 0);
+    }
+}
+
+/// Chunk and left context (50 Hz encoder frames) a [`Delay`] level streams with: the chunk sizes
+/// icefall trains the model with (16 = 320 ms, 32 = 640 ms, 64 = 1.28 s), paired with its
+/// decoding defaults. Longer chunks give the encoder more context per step; the model has no
+/// level beyond its largest trained chunk, so `High` and `XHigh` clamp to `Medium`.
+pub(crate) fn delay_plan(delay: Delay) -> (usize, usize) {
+    match delay {
+        Delay::Minimal => (16, 128),
+        Delay::Low => (32, 128),
+        Delay::Medium | Delay::High | Delay::XHigh => (64, 256),
+    }
+}
+
+/// [`AsrStream`] of a [`ZipformerStream`]: one segment, or one per endpoint.
+struct ZipformerAsr(ZipformerStream);
+
+fn update(r: StreamResult) -> StreamUpdate {
+    StreamUpdate { segment: r.segment, text: r.text, is_final: r.is_final, start: r.start }
+}
+
+impl AsrStream for ZipformerAsr {
+    fn accept(&mut self, samples_16k: &[f32]) -> Result<Vec<StreamUpdate>> {
+        Ok(self.0.accept_waveform(samples_16k)?.into_iter().map(update).collect())
+    }
+
+    fn finish(&mut self) -> Result<Vec<StreamUpdate>> {
+        Ok(self.0.input_finished()?.into_iter().map(update).collect())
+    }
+}
+
+impl Zipformer {
+    /// A stream for serving at `params.delay`; a model whose geometry cannot run that plan
+    /// (see `ZipformerConfig::check_stream`) streams at its own defaults.
+    pub(crate) fn open_asr_stream(&self, params: &StreamParams) -> Result<Box<dyn AsrStream>> {
+        let (chunk, left) = delay_plan(params.delay);
+        let plan = self.config().check_stream(chunk, left).is_ok().then_some((chunk, left));
+        let opts = StreamOptions { chunk_size: plan.map(|p| p.0), left_context_frames: plan.map(|p| p.1), endpoint: params.endpoint };
+        Ok(Box::new(ZipformerAsr(self.stream(&opts)?)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zipformer::config::tests::medium;
+
+    #[test]
+    fn every_delay_level_has_a_valid_plan() {
+        let cfg = medium();
+        for d in Delay::ALL {
+            let (chunk, left) = delay_plan(d);
+            cfg.check_stream(chunk, left).unwrap_or_else(|e| panic!("{}: {}", d.name(), e.message));
+        }
+        // latency never decreases with the level
+        let chunks: Vec<usize> = Delay::ALL.iter().map(|d| delay_plan(*d).0).collect();
+        assert!(chunks.windows(2).all(|w| w[0] <= w[1]), "{chunks:?}");
+    }
+
+    #[test]
+    fn results_become_updates() {
+        let r = StreamResult { segment: 2, text: "ahoj".into(), tokens: vec![5], timestamps: vec![0.4], start: 1.5, is_final: true };
+        assert_eq!(update(r), StreamUpdate { segment: 2, text: "ahoj".into(), is_final: true, start: 1.5 });
     }
 }
